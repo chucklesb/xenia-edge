@@ -19,10 +19,6 @@
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/ui/imgui_host_notification.h"
 
-DECLARE_bool(clear_memory_page_state);
-DECLARE_bool(readback_memexport);
-DECLARE_bool(readback_memexport_fast);
-DECLARE_string(readback_resolve);
 DECLARE_bool(guest_display_refresh_cap);
 DECLARE_string(occlusion_query);
 
@@ -37,8 +33,6 @@ ImGuiPerformanceDialog::ImGuiPerformanceDialog(
   LoadCurrentSettings();
 
   // Initialize highlight positions to match current selections
-  resolve_highlight_ = readback_resolve_mode_;
-  memexport_highlight_ = readback_memexport_mode_;
   occlusion_query_highlight_ = occlusion_query_mode_;
 }
 
@@ -63,30 +57,12 @@ void ImGuiPerformanceDialog::LoadCurrentSettings() {
   } else {
     occlusion_query_mode_ = 0;  // Default to "fake"
   }
+  occlusion_query_viz_ = cvars::occlusion_query_viz;
 
-  // Load Readback Resolve setting (0=none, 1=some, 2=fast, 3=full)
-  const std::string& resolve_mode = cvars::readback_resolve;
-  if (resolve_mode == "none") {
-    readback_resolve_mode_ = 0;
-  } else if (resolve_mode == "some") {
-    readback_resolve_mode_ = 1;
-  } else if (resolve_mode == "full") {
-    readback_resolve_mode_ = 3;
-  } else {
-    readback_resolve_mode_ = 2;  // Default to "fast"
-  }
-
-  // Load Readback Memexport setting (0=none, 1=fast, 2=full)
-  if (!cvars::readback_memexport) {
-    readback_memexport_mode_ = 0;
-  } else if (cvars::readback_memexport_fast) {
-    readback_memexport_mode_ = 1;
-  } else {
-    readback_memexport_mode_ = 2;
-  }
-
-  // Load Clear Memory Page State setting
-  clear_memory_page_state_ = cvars::clear_memory_page_state;
+  // Load Memory Export settings
+  memexport_enable_ = cvars::memexport_enable;
+  memexport_await_pixel_exports_ = cvars::memexport_await_pixel_exports;
+  memexport_await_vertex_exports_ = cvars::memexport_await_vertex_exports;
 
   // Load Frame Rate Limit (FPS, 0 = unlimited)
   framerate_limit_ = static_cast<int>(cvars::framerate_limit);
@@ -98,69 +74,28 @@ void ImGuiPerformanceDialog::ShowNotification(const std::string& title,
   new HostNotificationWindow(imgui_drawer(), title, description, 0);
 }
 
-void ImGuiPerformanceDialog::OnReadbackResolveChanged(int value) {
-  auto emulator = emulator_window_->emulator();
-  if (!emulator) {
-    return;
-  }
-
-  auto graphics_system = emulator->graphics_system();
-  if (!graphics_system) {
-    return;
-  }
-
-  auto command_processor = graphics_system->command_processor();
-  if (!command_processor) {
-    return;
-  }
-
-  gpu::ReadbackResolveMode mode;
-  switch (value) {
-    case 0:
-      mode = gpu::ReadbackResolveMode::kDisabled;
-      break;
-    case 1:
-      mode = gpu::ReadbackResolveMode::kSome;
-      break;
-    case 3:
-      mode = gpu::ReadbackResolveMode::kFull;
-      break;
-    default:
-      mode = gpu::ReadbackResolveMode::kFast;
-      break;
-  }
-
-  command_processor->SetReadbackResolveMode(mode);
-
-  const char* mode_names[] = {"None", "Some", "Fast", "Full"};
-  ShowNotification("Readback Resolve", mode_names[value]);
+void ImGuiPerformanceDialog::OnMemexportEnableChanged(bool enabled) {
+  gpu::SaveGPUSetting(gpu::GPUSetting::MemexportEnable, enabled);
+  config::SaveGameConfigSetting(emulator_window_->emulator(), "GPU",
+                                "memexport_enable", enabled);
+  ShowNotification("Memory Export", enabled ? "Enabled" : "Disabled");
 }
 
-void ImGuiPerformanceDialog::OnReadbackMemexportChanged(int value) {
-  bool memexport_enabled = true;
-  bool memexport_fast = true;
-
-  switch (value) {
-    case 0:
-      memexport_enabled = false;
-      break;
-    case 1:
-      memexport_fast = true;
-      break;
-    case 2:
-      memexport_fast = false;
-      break;
-  }
-
-  gpu::SaveGPUSetting(gpu::GPUSetting::ReadbackMemexport, memexport_enabled);
-  gpu::SaveGPUSetting(gpu::GPUSetting::ReadbackMemexportFast, memexport_fast);
+void ImGuiPerformanceDialog::OnMemexportAwaitPixelExportsChanged(bool enabled) {
+  gpu::SaveGPUSetting(gpu::GPUSetting::MemexportAwaitPixelExports, enabled);
   config::SaveGameConfigSetting(emulator_window_->emulator(), "GPU",
-                                "readback_memexport", memexport_enabled);
-  config::SaveGameConfigSetting(emulator_window_->emulator(), "GPU",
-                                "readback_memexport_fast", memexport_fast);
+                                "memexport_await_pixel_exports", enabled);
+  ShowNotification("Memexport Pixel Export Wait",
+                   enabled ? "Enabled" : "Disabled");
+}
 
-  const char* mode_names[] = {"None", "Fast", "Full"};
-  ShowNotification("Readback Memexport", mode_names[value]);
+void ImGuiPerformanceDialog::OnMemexportAwaitVertexExportsChanged(
+    bool enabled) {
+  gpu::SaveGPUSetting(gpu::GPUSetting::MemexportAwaitVertexExports, enabled);
+  config::SaveGameConfigSetting(emulator_window_->emulator(), "GPU",
+                                "memexport_await_vertex_exports", enabled);
+  ShowNotification("Memexport Vertex Export Wait",
+                   enabled ? "Enabled" : "Disabled");
 }
 
 void ImGuiPerformanceDialog::OnEmulatedDisplayUncappedChanged(bool uncapped) {
@@ -208,11 +143,11 @@ void ImGuiPerformanceDialog::OnOcclusionQueryChanged(int value) {
   ShowNotification("Occlusion Query Mode", mode_names[static_cast<int>(mode)]);
 }
 
-void ImGuiPerformanceDialog::OnClearMemoryPageStateChanged(bool enabled) {
-  gpu::SaveGPUSetting(gpu::GPUSetting::ClearMemoryPageState, enabled);
+void ImGuiPerformanceDialog::OnOcclusionQueryVIZChanged(bool enabled) {
+  gpu::SaveGPUSetting(gpu::GPUSetting::OcclusionQueryVIZ, enabled);
   config::SaveGameConfigSetting(emulator_window_->emulator(), "GPU",
-                                "clear_memory_page_state", enabled);
-  ShowNotification("Clear Memory Page State", enabled ? "Enabled" : "Disabled");
+                                "occlusion_query_viz", enabled);
+  ShowNotification("VIZ Queries", enabled ? "Enabled" : "Disabled");
 }
 
 void ImGuiPerformanceDialog::OnFramerateLimitChanged(int value) {
@@ -263,77 +198,28 @@ void ImGuiPerformanceDialog::OnDraw(ImGuiIO& io) {
     // Colors - highlight uses lighter green for non-selected options
     ImVec4 highlight_color = ImVec4(0.1f, 0.6f, 0.1f, 1.0f);
 
-    // Readback Resolve section
     ImGui::PushStyleColor(ImGuiCol_Text, xbox_green);
-    ImGui::Text("Readback Resolve");
-    ImGui::PopStyleColor();
-
-    ImGui::Indent(10);
-    ImGui::PushID("resolve");
-    const char* resolve_labels[] = {"None", "Some", "Fast", "Full"};
-    for (int i = 0; i < 4; i++) {
-      bool is_selected = (readback_resolve_mode_ == i);
-      bool is_highlighted = (resolve_highlight_ == i);
-
-      if (is_highlighted && !is_selected) {
-        ImGui::PushStyleColor(ImGuiCol_Text, highlight_color);
-      }
-
-      if (ImGui::RadioButton(resolve_labels[i], is_selected)) {
-        if (!is_selected) {
-          readback_resolve_mode_ = i;
-          resolve_highlight_ = i;
-          OnReadbackResolveChanged(i);
-        }
-      }
-
-      if (is_highlighted && !is_selected) {
-        ImGui::PopStyleColor();
-      }
-
-      if (i < 3) {
-        ImGui::SameLine();
-      }
-    }
-    ImGui::PopID();
-    ImGui::Unindent(10);
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    // Readback Memexport section
-    ImGui::PushStyleColor(ImGuiCol_Text, xbox_green);
-    ImGui::Text("Readback Memexport");
+    ImGui::Text("Memory Export");
     ImGui::PopStyleColor();
 
     ImGui::Indent(10);
     ImGui::PushID("memexport");
-    const char* memexport_labels[] = {"None", "Fast", "Full"};
-    for (int i = 0; i < 3; i++) {
-      bool is_selected = (readback_memexport_mode_ == i);
-      bool is_highlighted = (memexport_highlight_ == i);
-
-      if (is_highlighted && !is_selected) {
-        ImGui::PushStyleColor(ImGuiCol_Text, highlight_color);
-      }
-
-      if (ImGui::RadioButton(memexport_labels[i], is_selected)) {
-        if (!is_selected) {
-          readback_memexport_mode_ = i;
-          memexport_highlight_ = i;
-          OnReadbackMemexportChanged(i);
-        }
-      }
-
-      if (is_highlighted && !is_selected) {
-        ImGui::PopStyleColor();
-      }
-
-      if (i < 2) {
-        ImGui::SameLine();
-      }
+    if (ImGui::Checkbox("Make exported data visible to the CPU",
+                        &memexport_enable_)) {
+      OnMemexportEnableChanged(memexport_enable_);
     }
+    // Nothing reaches guest RAM to be awaited when export output stays
+    // device-local.
+    ImGui::BeginDisabled(!memexport_enable_);
+    if (ImGui::Checkbox("Wait for pixel shader exports (stall GPU)",
+                        &memexport_await_pixel_exports_)) {
+      OnMemexportAwaitPixelExportsChanged(memexport_await_pixel_exports_);
+    }
+    if (ImGui::Checkbox("Wait for vertex shader exports (slower)",
+                        &memexport_await_vertex_exports_)) {
+      OnMemexportAwaitVertexExportsChanged(memexport_await_vertex_exports_);
+    }
+    ImGui::EndDisabled();
     ImGui::PopID();
     ImGui::Unindent(10);
 
@@ -363,6 +249,13 @@ void ImGuiPerformanceDialog::OnDraw(ImGuiIO& io) {
           OnOcclusionQueryChanged(i);
         }
       }
+      if (is_selected) {
+        // Gamepad nav otherwise starts on the first item, and the A press
+        // that opened the dialog activates it. Starting on the current mode
+        // makes that stray activation a no-op, since the handler above only
+        // fires on a change.
+        ImGui::SetItemDefaultFocus();
+      }
 
       if (is_highlighted && !is_selected) {
         ImGui::PopStyleColor();
@@ -371,6 +264,10 @@ void ImGuiPerformanceDialog::OnDraw(ImGuiIO& io) {
       if (i < 3) {
         ImGui::SameLine();
       }
+    }
+    if (ImGui::Checkbox("Skip draws hidden by VIZ queries",
+                        &occlusion_query_viz_)) {
+      OnOcclusionQueryVIZChanged(occlusion_query_viz_);
     }
     ImGui::PopID();
     ImGui::Unindent(10);
@@ -398,24 +295,6 @@ void ImGuiPerformanceDialog::OnDraw(ImGuiIO& io) {
     ImGui::SameLine();
     if (ImGui::Button("Set##framerate_limit")) {
       OnFramerateLimitChanged(framerate_limit_);
-    }
-
-    ImGui::Unindent(10);
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    // Other section
-    ImGui::PushStyleColor(ImGuiCol_Text, xbox_green);
-    ImGui::Text("Other");
-    ImGui::PopStyleColor();
-
-    ImGui::Indent(10);
-
-    if (ImGui::Checkbox("Clear memory page state on GPU cache invalidation",
-                        &clear_memory_page_state_)) {
-      OnClearMemoryPageStateChanged(clear_memory_page_state_);
     }
 
     ImGui::Unindent(10);

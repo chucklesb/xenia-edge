@@ -17,9 +17,6 @@
 [submodule "third_party/rapidjson"]
 	path = third_party/rapidjson
 	url = https://github.com/Tencent/rapidjson.git
-[submodule "third_party/aes_128"]
-	path = third_party/aes_128
-	url = https://github.com/openluopworld/aes_128.git
 [submodule "third_party/capstone"]
 	path = third_party/capstone
 	url = https://github.com/capstone-engine/capstone.git
@@ -116,7 +113,7 @@
 [submodule "third_party/wxWidgets"]
 	path = third_party/wxWidgets
 	url = https://github.com/wxWidgets/wxWidgets.git
-	branch = v3.3.2
+	branch = master
 [submodule "third_party/MoltenVK"]
 	path = third_party/MoltenVK
 	url = https://github.com/KhronosGroup/MoltenVK.git
@@ -134,3 +131,6 @@
 	path = third_party/mesa
 	url = https://gitlab.freedesktop.org/has207/mesa.git
 	ignore = dirty
+[submodule "third_party/mbedtls"]
+	path = third_party/mbedtls
+	url = https://github.com/Mbed-TLS/mbedtls.git

@@ -14,6 +14,7 @@
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xboxkrnl/cert_monitor.h"
 #include "xenia/kernel/xboxkrnl/debug_monitor.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 
 DEFINE_string(cl, "", "Specify additional command-line provided to guest.",
@@ -76,6 +77,10 @@ XboxkrnlModule::XboxkrnlModule(Emulator* emulator, KernelState* kernel_state)
   Register##n##Exports(export_resolver_, kernel_state_);
 #include "xboxkrnl_module_export_groups.inc"
 #undef XE_MODULE_EXPORT_GROUP
+
+  // A call to an address with no code goes to the title's exception handlers.
+  kernel_state->processor()->set_code_fault_hook(&DispatchCodeFetchFault);
+  kernel_state->processor()->set_data_fault_hook(&DispatchDataFault);
 
   // KeDebugMonitorData (?*)
   // Set to a valid value when a remote debugger is attached.
@@ -258,7 +263,11 @@ void XboxkrnlModule::RegisterExportTable(
   export_resolver->RegisterTable("xboxkrnl.exe", &xboxkrnl_exports);
 }
 
-XboxkrnlModule::~XboxkrnlModule() = default;
+XboxkrnlModule::~XboxkrnlModule() { xeMmForgetSegmentArrays(); }
+
+XboxkrnlModule* GetXboxkrnlModule() {
+  return kernel_state()->GetKernelModule<XboxkrnlModule>("xboxkrnl.exe").get();
+}
 
 }  // namespace xboxkrnl
 }  // namespace kernel

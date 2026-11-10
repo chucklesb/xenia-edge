@@ -65,7 +65,6 @@ class ImGuiDebugDialog : public ImGuiGamepadDialog {
                           double value, bool clear_gpu_caches = false);
 
   void ApplyAnisoOverride(int32_t value);
-  void ApplyOQSaturation(double value);
   void ApplyOQLowerThreshold();
   void ApplyOQUpperThreshold();
   void ApplyLogLevel();
@@ -81,20 +80,20 @@ class ImGuiDebugDialog : public ImGuiGamepadDialog {
   bool gpu_allow_invalid_fetch_constants_;
   bool gpu_3d_to_2d_texture_;
   bool half_pixel_offset_;
+  bool force_depth_clamp_;
   bool submit_on_primary_buffer_end_;
   int32_t occlusion_query_fake_lower_threshold_;
   int32_t occlusion_query_fake_upper_threshold_;
-  double occlusion_query_saturation_;
   // Presentation / Display
   bool present_letterbox_;
   // Resolution Scaling / Resolve
+  bool readback_resolve_;
   bool draw_resolution_scaled_texture_offsets_;
   bool readback_resolve_half_pixel_offset_;
   bool resolve_resolution_scale_fill_half_pixel_offset_;
   // Shader / Driver Workarounds
   bool use_fuzzy_alpha_epsilon_;
   bool precise_interpolation_;
-  bool dxbc_switch_;
   // EDRAM / Draw Heuristics
   bool execute_unclipped_draw_vs_on_cpu_;
   bool execute_unclipped_draw_vs_on_cpu_for_psi_render_backend_;
@@ -112,12 +111,20 @@ class ImGuiDebugDialog : public ImGuiGamepadDialog {
   bool force_convert_quad_lists_to_triangle_lists_;
   bool force_convert_line_loops_to_strips_;
   // Memory / Boot Hacks
+  bool clear_memory_page_state_;
   bool scribble_heap_;
   int32_t scribble_heap_value_;
   // Diagnostics / Logging
   int32_t log_level_;
   uint32_t log_mask_;
+  bool log_high_frequency_kernel_calls_;
   bool occlusion_query_log_;
+  bool log_draws_;
+  bool log_resolves_;
+  bool log_transfers_;
+  bool log_samplers_;
+  bool log_texture_loads_;
+  bool trace_gpu_stream_;
   bool gpu_debug_markers_;
   bool disassemble_pm4_;
   bool log_guest_driven_gpu_register_written_values_;

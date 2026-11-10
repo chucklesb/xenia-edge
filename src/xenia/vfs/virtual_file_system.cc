@@ -31,7 +31,10 @@ VirtualFileSystem::~VirtualFileSystem() {
 }
 
 void VirtualFileSystem::Clear() {
-  devices_.clear();
+  // Newest first so a device reading through another's file goes before it.
+  while (!devices_.empty()) {
+    devices_.pop_back();
+  }
   symlinks_.clear();
 }
 
@@ -66,9 +69,9 @@ Device* VirtualFileSystem::GetDevice(const std::string_view path) {
 bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
                                              const std::string_view target) {
   auto global_lock = global_critical_region_.Acquire();
-  auto it = std::find_if(
-      symlinks_.cbegin(), symlinks_.cend(),
-      [&](const auto& s) { return xe::utf8::equal_case(path, s.first); });
+  auto it = std::ranges::find_if(std::as_const(symlinks_), [&](const auto& s) {
+    return xe::utf8::equal_case(path, s.first);
+  });
   if (it != symlinks_.end()) {
     XELOGE("Trying to re-register already registered symbolic link: {} => {}",
            path, target);
@@ -83,9 +86,9 @@ bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
 
 bool VirtualFileSystem::UnregisterSymbolicLink(const std::string_view path) {
   auto global_lock = global_critical_region_.Acquire();
-  auto it = std::find_if(
-      symlinks_.cbegin(), symlinks_.cend(),
-      [&](const auto& s) { return xe::utf8::equal_case(path, s.first); });
+  auto it = std::ranges::find_if(std::as_const(symlinks_), [&](const auto& s) {
+    return xe::utf8::equal_case(path, s.first);
+  });
   if (it == symlinks_.end()) {
     return false;
   }
@@ -96,18 +99,20 @@ bool VirtualFileSystem::UnregisterSymbolicLink(const std::string_view path) {
 }
 
 bool VirtualFileSystem::IsSymbolicLinkRegistered(const std::string_view path) {
-  auto it = std::find_if(
-      symlinks_.cbegin(), symlinks_.cend(),
-      [&](const auto& s) { return xe::utf8::equal_case(path, s.first); });
+  auto global_lock = global_critical_region_.Acquire();
+  auto it = std::ranges::find_if(std::as_const(symlinks_), [&](const auto& s) {
+    return xe::utf8::equal_case(path, s.first);
+  });
 
   return it != symlinks_.cend();
 }
 
 bool VirtualFileSystem::FindSymbolicLink(const std::string_view path,
                                          std::string& target) {
-  auto it = std::find_if(
-      symlinks_.cbegin(), symlinks_.cend(),
-      [&](const auto& s) { return xe::utf8::starts_with_case(path, s.first); });
+  auto global_lock = global_critical_region_.Acquire();
+  auto it = std::ranges::find_if(std::as_const(symlinks_), [&](const auto& s) {
+    return xe::utf8::starts_with_case(path, s.first);
+  });
   if (it == symlinks_.cend()) {
     return false;
   }
@@ -121,7 +126,7 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path,
   bool was_resolved = false;
   while (true) {
     auto it =
-        std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
+        std::ranges::find_if(std::as_const(symlinks_), [&](const auto& s) {
           return xe::utf8::starts_with_case(result, s.first);
         });
     if (it == symlinks_.cend()) {
@@ -130,11 +135,37 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path,
     // Found symlink!
     auto target_path = (*it).second;
     auto relative_path = result.substr((*it).first.size());
-    result = target_path + relative_path;
+    result = xe::utf8::fix_guest_path_separators(target_path + relative_path);
     was_resolved = true;
   }
   return was_resolved;
 }
+
+namespace {
+
+// A mount path matches only on a whole path component. Without this a device
+// mounted at ...\Content also swallows ...\Content_Eng.
+bool MountPathMatches(const std::string_view path,
+                      const std::string_view mount_path) {
+  if (mount_path.empty()) {
+    return false;
+  }
+  const char last = mount_path.back();
+  // Links name a \Device\Content\N\ root without the trailing separator.
+  if (last == '\\' && path.size() + 1 == mount_path.size()) {
+    return xe::utf8::equal_case(path, mount_path.substr(0, path.size()));
+  }
+  if (!xe::utf8::starts_with_case(path, mount_path)) {
+    return false;
+  }
+  // Mounts ending in a delimiter already sit on a component boundary.
+  if (last == '\\' || last == ':') {
+    return true;
+  }
+  return path.size() == mount_path.size() || path[mount_path.size()] == '\\';
+}
+
+}  // namespace
 
 Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
   auto global_lock = global_critical_region_.Acquire();
@@ -148,12 +179,17 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     normalized_path = resolved_path;
   }
 
-  // Find the device.
-  auto it =
-      std::find_if(devices_.cbegin(), devices_.cend(), [&](const auto& d) {
-        return xe::utf8::starts_with_case(normalized_path, d->mount_path());
-      });
-  if (it == devices_.cend()) {
+  // Find the device with the longest matching mount path. Devices nest, e.g.
+  // \Device\Harddisk0\Partition1\Content lives inside \Device\Harddisk0, so the
+  // most specific mount must win regardless of registration order.
+  Device* device = nullptr;
+  for (const auto& d : devices_) {
+    if (MountPathMatches(normalized_path, d->mount_path()) &&
+        (!device || d->mount_path().size() > device->mount_path().size())) {
+      device = d.get();
+    }
+  }
+  if (!device) {
     // Supress logging the error for ShaderDumpxe:\CompareBackEnds as this is
     // not an actual problem nor something we care about.
     if (path != "ShaderDumpxe:\\CompareBackEnds") {
@@ -162,38 +198,74 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     return nullptr;
   }
 
-  const auto& device = *it;
-  auto relative_path = normalized_path.substr(device->mount_path().size());
+  auto relative_path = normalized_path.substr(
+      std::min(normalized_path.size(), device->mount_path().size()));
   return device->ResolvePath(relative_path);
+}
+
+X_STATUS VirtualFileSystem::RenameEntry(Entry* entry,
+                                        const std::string_view target_path,
+                                        bool replace_existing) {
+  // One lock, so the new folder can't go away before the entry moves into it.
+  auto global_lock = global_critical_region_.Acquire();
+  return entry->Rename(ResolvePath(xe::utf8::find_base_guest_path(target_path)),
+                       xe::utf8::find_name_from_guest_path(target_path),
+                       replace_existing);
+}
+
+Entry* VirtualFileSystem::ResolveMountRoot(const std::string_view path) {
+  auto global_lock = global_critical_region_.Acquire();
+  auto normalized_path(xe::utf8::canonicalize_guest_path(path));
+  std::string resolved_path;
+  if (ResolveSymbolicLink(normalized_path, resolved_path)) {
+    normalized_path = resolved_path;
+  }
+  for (const auto& d : devices_) {
+    std::string_view mount_path = d->mount_path();
+    if (!mount_path.empty() && mount_path.back() == '\\') {
+      mount_path.remove_suffix(1);
+    }
+    if (xe::utf8::equal_case(normalized_path, mount_path)) {
+      return d->ResolvePath("");
+    }
+  }
+  return nullptr;
 }
 
 Entry* VirtualFileSystem::CreatePath(const std::string_view path,
                                      uint32_t attributes) {
-  // Create all required directories recursively.
   auto path_parts = xe::utf8::split_path(path);
   if (path_parts.empty()) {
     return nullptr;
   }
-  auto partial_path = std::string(path_parts[0]);
-  auto partial_entry = ResolvePath(partial_path);
-  if (!partial_entry) {
+
+  // A device mount spans several path components, not just the first.
+  Entry* parent_entry = nullptr;
+  size_t next_part = path_parts.size();
+  while (next_part > 0) {
+    const auto& part = path_parts[next_part - 1];
+    const size_t prefix_length =
+        static_cast<size_t>(part.data() + part.size() - path.data());
+    parent_entry = ResolvePath(path.substr(0, prefix_length));
+    if (parent_entry) {
+      break;
+    }
+    --next_part;
+  }
+  if (!parent_entry) {
     return nullptr;
   }
-  auto parent_entry = partial_entry;
-  for (size_t i = 1; i < path_parts.size() - 1; ++i) {
-    partial_path = xe::utf8::join_guest_paths(partial_path, path_parts[i]);
-    auto child_entry = ResolvePath(partial_path);
-    if (!child_entry) {
-      child_entry =
-          parent_entry->CreateEntry(path_parts[i], kFileAttributeDirectory);
-    }
+
+  for (size_t i = next_part; i < path_parts.size(); ++i) {
+    const bool is_last = i == path_parts.size() - 1;
+    auto child_entry = parent_entry->CreateEntry(
+        path_parts[i], is_last ? attributes : kFileAttributeDirectory);
     if (!child_entry) {
       return nullptr;
     }
     parent_entry = child_entry;
   }
-  return parent_entry->CreateEntry(path_parts[path_parts.size() - 1],
-                                   attributes);
+  return parent_entry;
 }
 
 bool VirtualFileSystem::DeletePath(const std::string_view path) {
@@ -245,6 +317,30 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
 
     auto file_name = xe::utf8::find_name_from_guest_path(path);
     entry = parent_entry->GetChild(file_name);
+    // A device mounted on a folder of a host device is what the folder's path
+    // names. A raw partition's stand-in in a NullDevice stays what it is.
+    if (!root_entry && dynamic_cast<HostPathEntry*>(parent_entry)) {
+      if (Entry* mount_root = ResolveMountRoot(path)) {
+        // Replacing it would delete the whole device.
+        if (creation_disposition == FileDisposition::kSuperscede ||
+            creation_disposition == FileDisposition::kOverwrite ||
+            creation_disposition == FileDisposition::kOverwriteIf) {
+          *out_action = FileAction::kDoesNotExist;
+          return X_STATUS_ACCESS_DENIED;
+        }
+        entry = mount_root;
+      }
+    }
+  } else if (path.empty() && root_entry) {
+    // An empty relative path is the root entry itself. Replacing it would
+    // delete what the root handle still refers to.
+    if (creation_disposition == FileDisposition::kSuperscede ||
+        creation_disposition == FileDisposition::kOverwrite ||
+        creation_disposition == FileDisposition::kOverwriteIf) {
+      *out_action = FileAction::kDoesNotExist;
+      return X_STATUS_ACCESS_DENIED;
+    }
+    entry = root_entry;
   } else {
     entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
   }
@@ -254,8 +350,9 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
       return X_STATUS_FILE_IS_A_DIRECTORY;
     }
 
-    // If the entry does not exist on the host then remove the cached entry
-    if (parent_entry) {
+    // If the entry does not exist on the host then remove the cached entry. A
+    // device mounted there has its own folder.
+    if (parent_entry && entry->device() == parent_entry->device()) {
       const xe::vfs::HostPathEntry* host_path =
           dynamic_cast<const xe::vfs::HostPathEntry*>(parent_entry);
 
@@ -333,11 +430,13 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
         break;
       case FileDisposition::kOverwrite:
       case FileDisposition::kOverwriteIf:
-        // Overwrite (we do by delete + recreate).
-        if (!entry->Delete()) {
-          return X_STATUS_ACCESS_DENIED;
+        // In place where the entry can, otherwise by delete + recreate.
+        if (!entry->Overwrite()) {
+          if (!entry->Delete()) {
+            return X_STATUS_ACCESS_DENIED;
+          }
+          entry = nullptr;
         }
-        entry = nullptr;
         *out_action = FileAction::kOverwritten;
         break;
     }
@@ -359,10 +458,9 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
   return result;
 }
 
-X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
-                                               std::filesystem::path base_path,
-                                               std::atomic<uint64_t>& progress,
-                                               bool extract_to_root) {
+X_STATUS VirtualFileSystem::ExtractContentFile(
+    Entry* entry, std::filesystem::path base_path,
+    std::atomic<uint64_t>& progress) {
   // Allocate a buffer when needed.
   size_t buffer_size = 0;
   uint8_t* buffer = nullptr;
@@ -371,10 +469,6 @@ X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
 
   auto dest_name =
       base_path / xe::to_path(utf8::fix_path_separators(entry->path()));
-
-  if (extract_to_root) {
-    dest_name = base_path / xe::to_path(entry->name());
-  }
 
   if (entry->attributes() & kFileAttributeDirectory) {
     std::error_code error_code;
@@ -472,7 +566,7 @@ void VirtualFileSystem::ExtractContentHeader(Device* device,
       return;
     }
   }
-  auto header_filename = base_path.filename().string() + ".header";
+  auto header_filename = base_path.filename().concat(".header");
   auto header_path = base_path.parent_path() / header_filename;
   xe::filesystem::CreateEmptyFile(header_path);
 
@@ -482,7 +576,7 @@ void VirtualFileSystem::ExtractContentHeader(Device* device,
         xcontent_device->content_header();
     uint32_t license_mask = xcontent_device->license_mask();
 
-    data.set_file_name(base_path.filename().string());
+    data.set_file_name(xe::path_to_utf8(base_path.filename()));
     fwrite(&data, 1, sizeof(kernel::xam::XCONTENT_AGGREGATE_DATA), file);
     fwrite(&license_mask, 1, sizeof(license_mask), file);
     fclose(file);

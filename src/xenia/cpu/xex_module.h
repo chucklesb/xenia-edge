@@ -27,9 +27,14 @@ class KernelState;
 namespace xe {
 namespace cpu {
 
+constexpr fourcc_t kXEX0Signature = make_fourcc("XEX0");
+constexpr fourcc_t kXEXQSignature = make_fourcc("XEX?");
+constexpr fourcc_t kXEXHSignature = make_fourcc("XEX-");
+constexpr fourcc_t kXEX25Signature = make_fourcc("XEX%");
 constexpr fourcc_t kXEX1Signature = make_fourcc("XEX1");
 constexpr fourcc_t kXEX2Signature = make_fourcc("XEX2");
 constexpr fourcc_t kElfSignature = make_fourcc(0x7F, 'E', 'L', 'F');
+constexpr fourcc_t kXBESignature = make_fourcc("XBEH");
 
 class Runtime;
 struct InfoCacheFlags {
@@ -126,6 +131,10 @@ class XexModule : public xe::cpu::Module {
   };
   enum XexFormat {
     kFormatUnknown,
+    kFormatXex0,
+    kFormatXexQ,   // ?
+    kFormatXexH,   // -
+    kFormatXex25,  // %
     kFormatXex1,
     kFormatXex2,
   };
@@ -161,6 +170,11 @@ class XexModule : public xe::cpu::Module {
   const std::vector<ImportLibrary>* import_libraries() const {
     return &import_libs_;
   }
+  // The modules it imports from that failed to load, whose imports are left
+  // unresolved.
+  const std::vector<std::string>& missing_import_libraries() const {
+    return missing_import_libs_;
+  }
 
   const xex2_opt_execution_info* opt_execution_info() const {
     xex2_opt_execution_info* retval = nullptr;
@@ -180,6 +194,9 @@ class XexModule : public xe::cpu::Module {
 
   const uint32_t base_address() const { return base_address_; }
   const bool is_dev_kit() const { return is_dev_kit_; }
+
+  // Section type of the image page containing `address`.
+  bool GetPageSectionType(uint32_t address, xex2_section_type* out_type) const;
 
   // Gets an optional header. Returns NULL if not found.
   // Special case: if key & 0xFF == 0x00, this function will return the value,
@@ -222,14 +239,9 @@ class XexModule : public xe::cpu::Module {
     return (xex_header()->module_flags & XEX_MODULE_TITLE) != 0;
   }
 
-  bool is_valid_executable() const {
-    assert_not_zero(base_address_);
-    if (!base_address_) {
-      return false;
-    }
-    uint8_t* buffer = memory()->TranslateVirtual(base_address_);
-    return *(uint32_t*)buffer == 0x905A4D;
-  }
+  bool is_valid_executable() const;
+  // A module of resources alone has no code, nor a PE image.
+  bool has_code() const;
 
   bool is_patch() const {
     assert_not_null(xex_header());
@@ -244,18 +256,28 @@ class XexModule : public xe::cpu::Module {
   InfoCacheFlags* GetInstructionAddressFlags(uint32_t guest_addr);
 
   virtual void Precompile() override;
+  // Compiles everything early precompilation discovers, if enabled.
+  void PrecompileDiscoveredFunctions();
+  // Compiles the CRT static initializers and their callees. Call after all
+  // code patching and before the entry point runs.
+  void PrecompileStaticInitializers();
 
  protected:
   std::unique_ptr<Function> CreateFunction(uint32_t address) override;
 
  private:
   void PrecompileKnownFunctions();
-  void PrecompileDiscoveredFunctions();
+  std::vector<uint32_t> FindStaticInitializers() const;
+  bool IsCodeAddress(uint32_t address) const {
+    return !(address & 3) && address >= low_address_ && address < high_address_;
+  }
   std::vector<uint32_t> PreanalyzeCode();
   friend struct XexInfoCache;
   void ReadSecurityInfo();
 
   int ReadImage(const void* xex_addr, size_t xex_length, const uint8_t* key);
+  bool AllocImage(uint32_t size);
+  void ReleaseImage();
   int ReadImageUncompressed(const void* xex_addr, size_t xex_length);
   int ReadImageBasicCompressed(const void* xex_addr, size_t xex_length);
   int ReadImageCompressed(const void* xex_addr, size_t xex_length);
@@ -274,6 +296,7 @@ class XexModule : public xe::cpu::Module {
 
   std::vector<ImportLibrary>
       import_libs_;  // pre-loaded import libraries for ease of use
+  std::vector<std::string> missing_import_libs_;
   std::vector<PESection> pe_sections_;
 
   // XEX_HEADER_ALTERNATE_TITLE_IDS loaded into a safe std::vector
@@ -281,6 +304,7 @@ class XexModule : public xe::cpu::Module {
 
   uint8_t session_key_[0x10];
   bool is_dev_kit_ = false;
+  bool image_allocated_ = false;  // Image memory at base_address_ is ours?
 
   bool loaded_ = false;         // Loaded into memory?
   bool finished_load_ = false;  // PE/imports/symbols/etc all loaded?
@@ -296,6 +320,9 @@ class XexModule : public xe::cpu::Module {
   std::string image_sha_str_;
   XexInfoCache info_cache_;
 };
+
+// Decrypts a retail XEX2 image key, which only the hypervisor can on a console.
+void DecryptXex2ImageKey(const uint8_t* encrypted_key, uint8_t* key);
 
 }  // namespace cpu
 }  // namespace xe

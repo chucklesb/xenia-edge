@@ -11,39 +11,13 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"Αναζήτηση του αρχείου?"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   %zu ήδη εγκατεστημένα"
 
-#: src/xenia/ui/game_list_panel_wx.cc:1240
-msgid " (%zu discs)"
-msgstr " (%zu δίσκοι)"
-
 #: src/xenia/ui/install_progress_dialog_wx.cc:185
 msgid " - %s (%08X)"
 msgstr " — %s (%08X)"
-
-#: src/xenia/ui/game_config_dialog_wx.cc:285
-msgid "%08X - Config Overrides"
-msgstr ""
-
-#: src/xenia/ui/patches_dialog_wx.cc:37
-msgid "%s (%08X)"
-msgstr "%s (%08X)"
-
-#: src/xenia/ui/game_config_dialog_wx.cc:286
-msgid "%s (%08X) - Config Overrides"
-msgstr "%s (%08X) — Παρακάμψεις ρυθμίσεων"
 
 #: src/xenia/app/emulator_window.cc:1995
 msgid "%s (Slot %d)"
@@ -71,8 +45,8 @@ msgid "&Configuration"
 msgstr "Διαμόρφωση(&C)"
 
 #: src/xenia/app/emulator_window.cc:898
-msgid "&Controllers"
-msgstr "Χειριστήρια(&C)"
+msgid "C&ontrollers"
+msgstr "Χειριστήρια(&O)"
 
 #: src/xenia/app/emulator_window.cc:786
 msgid "&File"
@@ -113,10 +87,6 @@ msgstr "Προβολή(&V)"
 #: src/xenia/app/emulator_window.cc:867
 msgid "&Volume"
 msgstr "Ένταση(&V)"
-
-#: src/xenia/ui/game_scan_progress_dialog_wx.cc:276
-msgid "(Installed) "
-msgstr "(Εγκατεστημένο) "
 
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:62
 msgid "(unknown title)"
@@ -190,14 +160,6 @@ msgstr "Αργεντινή"
 #: src/xenia/ui/profile_editor_dialog_wx.cc:68
 msgid "Armenia"
 msgstr "Αρμενία"
-
-#: src/xenia/ui/quick_settings_dialog_wx.cc:252
-msgid "Audio"
-msgstr "Ήχος"
-
-#: src/xenia/ui/quick_settings_dialog_wx.cc:258
-msgid "Audio Backend:"
-msgstr "Σύστημα ήχου:"
 
 #: src/xenia/app/emulator_window.cc:2402
 msgid "Auto (%s)"
@@ -312,10 +274,6 @@ msgstr "Συμβατότητα"
 msgid "Complete"
 msgstr "Ολοκληρώθηκε"
 
-#: src/xenia/ui/game_list_panel_wx.cc:1028
-msgid "Config Overrides..."
-msgstr "Παρακάμψεις ρυθμίσεων…"
-
 #: src/xenia/ui/advanced_settings_dialog_wx.cc:104
 #: src/xenia/ui/advanced_settings_dialog_wx.cc:419
 msgid "Configuration Manager"
@@ -364,22 +322,9 @@ msgstr "Κροατία"
 msgid "Czech Republic"
 msgstr "Τσεχική Δημοκρατία"
 
-#: src/xenia/ui/game_list_panel_wx.cc:990
-msgid "DLC"
-msgstr "DLC"
-
 #: src/xenia/app/emulator_window.cc:335
 msgid "Dance Pad"
 msgstr "Πατάκι Χορού"
-
-#: src/xenia/ui/game_list_panel_wx.cc:690
-#: src/xenia/ui/game_list_panel_wx.cc:693
-msgid "Default"
-msgstr "Προεπιλογή"
-
-#: src/xenia/ui/quick_settings_dialog_wx.cc:263
-msgid "Default Volume:"
-msgstr "Προεπιλεγμένη ένταση:"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:90
 msgid "Denmark"
@@ -420,14 +365,6 @@ msgstr "Έξοδος(&X)"
 msgid "Ecuador"
 msgstr "Εκουαδόρ"
 
-#: src/xenia/ui/game_list_panel_wx.cc:648
-msgid "Edit Discs"
-msgstr "Επεξεργασία δίσκων"
-
-#: src/xenia/ui/game_list_panel_wx.cc:937
-msgid "Edit Discs..."
-msgstr "Επεξεργασία δίσκων…"
-
 #: src/xenia/app/emulator_window.cc:2053
 msgid "Edit..."
 msgstr "Επεξεργασία…"
@@ -456,43 +393,9 @@ msgstr "Αγγλικά"
 msgid "Enter gamertag for new profile:"
 msgstr "Εισαγάγετε gamertag για το νέο προφίλ:"
 
-#: src/xenia/ui/game_list_panel_wx.cc:754
-msgid "Enter new label:"
-msgstr "Εισαγάγετε νέα ετικέτα:"
-
-#: src/xenia/ui/game_config_dialog_wx.cc:435
-msgid "Error"
-msgstr "Σφάλμα"
-
 #: src/xenia/ui/profile_editor_dialog_wx.cc:94
 msgid "Estonia"
 msgstr "Εσθονία"
-
-#: src/xenia/app/emulator_window.cc:2421
-msgid ""
-"Experimental fork of Xenia Canary.\n"
-"\n"
-"https://github.com/has207/xenia-edge\n"
-"\n"
-"Branch: %s\n"
-"Commit: %s\n"
-"Build Date: %s\n"
-"\n"
-"UI font: Inter by Rasmus Andersson (https://rsms.me/inter/, SIL Open Font "
-"License 1.1).\n"
-"Icons by Icons8 (https://icons8.com)."
-msgstr ""
-"Πειραματικό fork του Xenia Canary.\n"
-"\n"
-"https://github.com/has207/xenia-edge\n"
-"\n"
-"Κλάδος: %s\n"
-"Commit: %s\n"
-"Ημερομηνία build: %s\n"
-"\n"
-"Γραμματοσειρά UI: Inter του Rasmus Andersson (https://rsms.me/inter/, SIL "
-"Open Font License 1.1).\n"
-"Εικονίδια από Icons8 (https://icons8.com)."
 
 #: src/xenia/app/emulator_window.cc:887
 msgid "FA&Q..."
@@ -501,14 +404,6 @@ msgstr "FAQ(&Q)…"
 #: src/xenia/ui/patches_dialog_wx.cc:225
 msgid "Failed to save changes."
 msgstr "Αποτυχία αποθήκευσης αλλαγών."
-
-#: src/xenia/ui/game_config_dialog_wx.cc:434
-msgid "Failed to save: %s"
-msgstr "Αποτυχία αποθήκευσης: %s"
-
-#: src/xenia/ui/patches_dialog_wx.cc:214
-msgid "Failed to update patch state."
-msgstr "Αποτυχία ενημέρωσης κατάστασης patch."
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:181
 #: src/xenia/ui/profile_editor_dialog_wx.cc:185
@@ -580,8 +475,8 @@ msgid "Gamepad"
 msgstr "Gamepad"
 
 #: src/xenia/ui/game_list_panel_wx.cc:96
-msgid "Gameplay"
-msgstr "Παίζεται"
+msgid "Gets in game"
+msgstr "Μπαίνει στο παιχνίδι"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:458
 msgid "Gamer Bio:"
@@ -675,10 +570,6 @@ msgstr "Ουγγαρία"
 msgid "Iceland"
 msgstr "Ισλανδία"
 
-#: src/xenia/ui/game_list_panel_wx.cc:302
-msgid "Icon"
-msgstr "Εικονίδιο"
-
 #: src/xenia/ui/profile_editor_dialog_wx.cc:396
 msgid "Icon change is disabled while a title is running."
 msgstr "Η αλλαγή εικονιδίου είναι απενεργοποιημένη ενώ εκτελείται ένας τίτλος."
@@ -714,10 +605,6 @@ msgstr "Διαδρομή εγκατάστασης: "
 #: src/xenia/ui/install_progress_dialog_wx.cc:45
 msgid "Installation Progress"
 msgstr "Πρόοδος εγκατάστασης"
-
-#: src/xenia/ui/game_list_panel_wx.cc:761
-msgid "Invalid Label"
-msgstr "Μη έγκυρη ετικέτα"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:594
 #: src/xenia/ui/profile_editor_dialog_wx.cc:602
@@ -800,15 +687,6 @@ msgstr "Κουβέιτ"
 msgid "Kyrgyzstan"
 msgstr "Κιργιστάν"
 
-#: src/xenia/ui/game_list_panel_wx.cc:691
-#: src/xenia/ui/game_list_panel_wx.cc:695
-msgid "Label"
-msgstr "Ετικέτα"
-
-#: src/xenia/ui/game_list_panel_wx.cc:761
-msgid "Label cannot contain '::'."
-msgstr "Η ετικέτα δεν μπορεί να περιέχει '::'."
-
 #: src/xenia/ui/profile_editor_dialog_wx.cc:464
 #: src/xenia/ui/quick_settings_dialog_wx.cc:311
 msgid "Language:"
@@ -865,7 +743,7 @@ msgstr "Φόρτωση τίτλων…"
 
 #: src/xenia/ui/game_list_panel_wx.cc:98
 msgid "Loads"
-msgstr "Φορτώνει"
+msgstr "Εκκινεί"
 
 #: src/xenia/app/emulator_window.cc:2003
 msgid "Login"
@@ -964,6 +842,14 @@ msgstr "Δεν βρέθηκαν προφίλ"
 msgid "No file path is set for this title."
 msgstr "Δεν έχει οριστεί διαδρομή αρχείου για αυτόν τον τίτλο."
 
+#: src/xenia/ui/game_scan_progress_dialog_wx.cc:376
+msgid "No games found."
+msgstr "Δεν βρέθηκαν παιχνίδια."
+
+#: src/xenia/ui/game_scan_progress_dialog_wx.cc:376
+msgid "No new games found."
+msgstr "Δεν βρέθηκαν νέα παιχνίδια."
+
 #: src/xenia/ui/profile_editor_dialog_wx.cc:178
 #: src/xenia/ui/profile_editor_dialog_wx.cc:184
 #: src/xenia/ui/quick_settings_dialog_wx.cc:279
@@ -1013,10 +899,6 @@ msgstr "Άνοιγμα"
 #: src/xenia/app/emulator_window.cc:951 src/xenia/app/emulator_window.cc:1716
 msgid "Open a title"
 msgstr "Άνοιγμα τίτλου"
-
-#: src/xenia/ui/game_list_panel_wx.cc:949
-msgid "Open containing folder"
-msgstr "Άνοιγμα φακέλου που περιέχει το αρχείο"
 
 #: src/xenia/ui/quick_settings_dialog_wx.cc:285
 msgid "Open using Rosetta"
@@ -1070,7 +952,7 @@ msgstr "Φιλιππίνες"
 
 #: src/xenia/ui/game_list_panel_wx.cc:94
 msgid "Playable"
-msgstr "Παίξιμο"
+msgstr "Παίζεται"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:147
 msgid "Poland"
@@ -1156,14 +1038,6 @@ msgstr "Αφαίρεση από τη λίστα"
 #: src/xenia/ui/game_config_dialog_wx.cc:346
 msgid "Remove this override"
 msgstr "Αφαίρεση αυτής της παράκαμψης"
-
-#: src/xenia/ui/game_list_panel_wx.cc:754
-msgid "Rename Label"
-msgstr "Μετονομασία ετικέτας"
-
-#: src/xenia/ui/game_list_panel_wx.cc:728
-msgid "Rename Label..."
-msgstr "Μετονομασία ετικέτας…"
 
 #: src/xenia/ui/quick_settings_dialog_wx.cc:169
 msgid "Rendering:"
@@ -1319,10 +1193,6 @@ msgstr "Κατάσταση"
 msgid "Status: %s"
 msgstr "Κατάσταση: %s"
 
-#: src/xenia/ui/game_scan_progress_dialog_wx.cc:239
-msgid "Status: Installed"
-msgstr "Κατάσταση: Εγκατεστημένο"
-
 #: src/xenia/app/emulator_window.cc:1713
 msgid "Stop the running title and return to the list"
 msgstr "Διακοπή του τίτλου που εκτελείται και επιστροφή στη λίστα"
@@ -1377,10 +1247,6 @@ msgstr ""
 #: src/xenia/ui/game_list_panel_wx.cc:303
 msgid "Title"
 msgstr "Τίτλος"
-
-#: src/xenia/ui/game_list_panel_wx.cc:985
-msgid "Title Updates"
-msgstr "Ενημερώσεις τίτλου"
 
 #: src/xenia/ui/game_list_panel_wx.cc:597
 msgid "Title not found"
@@ -1541,8 +1407,8 @@ msgstr "τίτλος %08X"
 
 
 #: src/xenia/ui/redist_installer_wx.cc:396
-msgid "dxcompiler.dll and dxil.dll not found, required for Direct3D 12 shaders. Download now (~26 MB)?"
-msgstr "Δεν βρέθηκαν τα dxcompiler.dll και dxil.dll, απαιτούνται για τους shaders του Direct3D 12. Λήψη τώρα (~26 MB);"
+msgid "dxil.dll not found, required for Direct3D 12 shaders. Download now (~26 MB)?"
+msgstr "Δεν βρέθηκε το dxil.dll, απαιτείται για τους shaders του Direct3D 12. Λήψη τώρα (~26 MB);"
 
 #: src/xenia/ui/redist_installer_wx.cc:438
 msgid "D3D12Core.dll not found, required for Shader Model 6.6. Download now (~35 MB) and restart?"
@@ -1587,3 +1453,382 @@ msgstr "Εγκαταστάθηκε το επίπεδο εντοπισμού σφ
 #: src/xenia/ui/redist_installer_wx.cc:746
 msgid "vulkan-1.dll not found, required for the Vulkan graphics backend. Download now (~20 MB)?"
 msgstr "Δεν βρέθηκε το vulkan-1.dll, απαιτείται για το backend γραφικών Vulkan. Λήψη τώρα (~20 MB);"
+
+
+#: src/xenia/ui/game_info_panel_wx.cc:681
+msgid "%s belongs to title %08X."
+msgstr "Το %s ανήκει στον τίτλο %08X."
+
+#: src/xenia/ui/game_info_panel_wx.cc:720
+msgid "%s could not be copied: %s"
+msgstr "Δεν ήταν δυνατή η αντιγραφή του %s: %s"
+
+#: src/xenia/ui/game_info_panel_wx.cc:694
+msgid "%s is a different kind of content."
+msgstr "Το %s είναι διαφορετικό είδος περιεχομένου."
+
+#: src/xenia/ui/game_info_panel_wx.cc:707
+msgid "%s is for a different release of this game."
+msgstr "Το %s ανήκει σε άλλη έκδοση αυτού του παιχνιδιού."
+
+#: src/xenia/ui/game_info_panel_wx.cc:675
+msgid "%s is not a content package."
+msgstr "Το %s δεν είναι πακέτο περιεχομένου."
+
+#: src/xenia/ui/game_list_panel_wx.cc:773
+msgid "(%zu discs)"
+msgstr "(%zu δίσκοι)"
+
+#: src/xenia/ui/game_info_panel_wx.cc:656
+msgid "All Files (*.*)|*.*"
+msgstr "Όλα τα αρχεία (*.*)|*.*"
+
+#: src/xenia/app/emulator_window.cc:439
+msgid "BSD 3-Clause License"
+msgstr "άδεια BSD 3-Clause"
+
+#: src/xenia/app/emulator_window.cc:434
+msgid ""
+"Branch: %s\n"
+"Commit: %s\n"
+"Build Date: %s"
+msgstr ""
+"Κλάδος: %s\n"
+"Commit: %s\n"
+"Ημερομηνία δημιουργίας: %s"
+
+#: src/xenia/ui/game_info_panel_wx.cc:232
+msgid "Close the info pane"
+msgstr "Κλείσιμο του πλαισίου πληροφοριών"
+
+#: src/xenia/ui/game_info_panel_wx.cc:215
+msgid "Configuration"
+msgstr "Διαμόρφωση"
+
+#: src/xenia/ui/game_info_panel_wx.cc:437
+msgid "Details"
+msgstr "Λεπτομέρειες"
+
+#: src/xenia/ui/game_info_panel_wx.cc:560
+msgid "Discs (%zu)"
+msgstr "Δίσκοι (%zu)"
+
+#: src/xenia/ui/game_info_panel_wx.cc:830
+msgid "Enter a name for this version:"
+msgstr "Εισαγάγετε ένα όνομα για αυτήν την έκδοση:"
+
+#: src/xenia/app/emulator_window.cc:3011
+msgid "Experimental fork of Xenia Canary."
+msgstr "Πειραματικό fork του Xenia Canary."
+
+#: src/xenia/ui/game_config_panel_wx.cc:334
+msgid "Failed to save."
+msgstr "Η αποθήκευση απέτυχε."
+
+#: src/xenia/ui/game_info_panel_wx.cc:410
+msgid "Give this version its own name"
+msgstr "Δώστε σε αυτήν την έκδοση δικό της όνομα"
+
+#: src/xenia/app/emulator_window.cc:444
+msgid "Icons by %s"
+msgstr "Εικονίδια από %s"
+
+#: src/xenia/app/emulator_window.cc:444
+msgid "Icons8"
+msgstr "Icons8"
+
+#: src/xenia/ui/game_info_panel_wx.cc:211
+msgid "Info"
+msgstr "Πληροφορίες"
+
+#: src/xenia/ui/game_info_panel_wx.cc:349
+msgid "Installed Content (%zu)"
+msgstr "Εγκατεστημένο περιεχόμενο (%zu)"
+
+#: src/xenia/app/emulator_window.cc:443
+msgid "Inter by Rasmus Andersson"
+msgstr "Inter από τον Rasmus Andersson"
+
+#: src/xenia/app/emulator_window.cc:607
+msgid "Library updated"
+msgstr "Η βιβλιοθήκη ενημερώθηκε"
+
+#: src/xenia/ui/game_info_panel_wx.cc:153
+msgid "Never"
+msgstr "Ποτέ"
+
+#: src/xenia/ui/game_info_panel_wx.cc:391
+msgid "No art"
+msgstr "Χωρίς εικόνα"
+
+#: src/xenia/ui/game_info_panel_wx.cc:472
+msgid "No compatibility report is linked."
+msgstr "Δεν έχει συνδεθεί αναφορά συμβατότητας."
+
+#: src/xenia/ui/game_info_panel_wx.cc:625
+msgid "No patches are bundled for this title."
+msgstr "Δεν περιλαμβάνονται patches για αυτόν τον τίτλο."
+
+#: src/xenia/ui/game_info_panel_wx.cc:361
+msgid "No profile is signed in."
+msgstr "Δεν έχει συνδεθεί κανένα προφίλ."
+
+#: src/xenia/ui/quick_settings_dialog_wx.cc:331
+msgid "Not supported on macOS"
+msgstr "Δεν υποστηρίζεται σε macOS"
+
+#: src/xenia/ui/game_info_panel_wx.cc:607
+msgid "Nothing installed."
+msgstr "Τίποτα εγκατεστημένο."
+
+#: src/xenia/ui/game_info_panel_wx.cc:757
+msgid "Open folder"
+msgstr "Άνοιγμα φακέλου"
+
+#: src/xenia/ui/game_info_panel_wx.cc:830
+msgid "Rename Game"
+msgstr "Μετονομασία παιχνιδιού"
+
+#: src/xenia/ui/game_info_panel_wx.cc:408
+msgid "Rename..."
+msgstr "Μετονομασία..."
+
+#: src/xenia/ui/game_list_panel_wx.cc:130
+msgid "Reverse the sort order"
+msgstr "Αντιστροφή της σειράς ταξινόμησης"
+
+#: src/xenia/ui/game_config_panel_wx.cc:334
+msgid "Saved."
+msgstr "Αποθηκεύτηκε."
+
+#: src/xenia/ui/game_info_panel_wx.cc:359
+msgid "Saves (%zu)"
+msgstr "Αποθηκεύσεις (%zu)"
+
+#: src/xenia/ui/game_info_panel_wx.cc:308
+msgid "Select a game for details."
+msgstr "Επιλέξτε ένα παιχνίδι για λεπτομέρειες."
+
+#: src/xenia/ui/game_info_panel_wx.cc:655
+msgid "Select content packages"
+msgstr "Επιλογή πακέτων περιεχομένου"
+
+#: src/xenia/ui/game_info_panel_wx.cc:728
+msgid "Some packages were not added"
+msgstr "Ορισμένα πακέτα δεν προστέθηκαν"
+
+#: src/xenia/app/emulator_window.cc:599
+msgid ""
+"These games were found in more than one version, and each version now has its own entry in the list. Saves and updates belong to a single version, so they are kept apart.\n"
+"\n"
+"%s"
+msgstr ""
+"Αυτά τα παιχνίδια βρέθηκαν σε περισσότερες από μία εκδόσεις και κάθε έκδοση έχει πλέον τη δική της καταχώριση στη λίστα. Οι αποθηκεύσεις και οι ενημερώσεις ανήκουν σε μία μόνο έκδοση, γι' αυτό διατηρούνται χωριστά.\n"
+"\n"
+"%s"
+
+#: src/xenia/ui/game_info_panel_wx.cc:464
+msgid "This title is not in the compatibility database."
+msgstr "Αυτός ο τίτλος δεν υπάρχει στη βάση δεδομένων συμβατότητας."
+
+#: src/xenia/ui/game_info_panel_wx.cc:344
+msgid "Title Updates (%zu)"
+msgstr "Ενημερώσεις τίτλου (%zu)"
+
+#: src/xenia/app/emulator_window.cc:442
+msgid "UI font: %s (SIL Open Font License 1.1)"
+msgstr "Γραμματοσειρά περιβάλλοντος: %s (SIL Open Font License 1.1)"
+
+#: src/xenia/ui/game_info_panel_wx.cc:399
+msgid "Unknown title"
+msgstr "Άγνωστος τίτλος"
+
+#: src/xenia/ui/game_info_panel_wx.cc:452
+msgid "Version"
+msgstr "Έκδοση"
+
+#: src/xenia/app/emulator_window.cc:438
+msgid "Xenia is distributed under the %s"
+msgstr "Το Xenia διανέμεται υπό την %s"
+
+#: src/xenia/ui/game_info_panel_wx.cc:212
+msgid "Content"
+msgstr "Περιεχόμενο"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "Εναλλακτική Κιθάρα"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "Μπάσο"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"Τα παιχνίδια του αρχικού Xbox εκτελούνται μέσω του XeFu, του εξομοιωτή συμβατότητας με προηγούμενες εκδόσεις του Xbox 360, αλλά από τον φάκελό του λείπει το %s:\n"
+"\n"
+"%s\n"
+"\n"
+"Αντιγράψτε εκεί το xbox.xex και τα αρχεία xefu*.xex από τον φάκελο Compatibility ενός σκληρού δίσκου Xbox 360."
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "Το XeFu δεν βρέθηκε"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"Η εκκίνηση του τίτλου απέτυχε.\n"
+"\n"
+"Δείτε το xenia.log για τεχνικές λεπτομέρειες."
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "Αποτυχία εκκίνησης τίτλου!"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "Μεταφορά δεδομένων"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"Ορισμένα από τα υπάρχοντα δεδομένα σας δεν ήταν δυνατό να μεταφερθούν στο νέο προφίλ. Στοιχεία που απέτυχαν: %u\n"
+"\n"
+"Δείτε το xenia.log για τεχνικές λεπτομέρειες."
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "Τα υπάρχοντα δεδομένα σας μεταφέρθηκαν στο νέο προφίλ."
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"Δεν έχει οριστεί διαδρομή αρχείου για αυτόν τον τίτλο.\n"
+"\n"
+"Αναζήτηση του αρχείου?"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"Το αρχείο δεν βρέθηκε:\n"
+"%s\n"
+"\n"
+"Αναζήτηση του αρχείου?"
+
+#: src/xenia/app/emulator_window.cc:2325
+msgid "Failed to read the system update."
+msgstr "Αποτυχία ανάγνωσης της ενημέρωσης συστήματος."
+
+#: src/xenia/app/emulator_window.cc:2329
+msgid "Failed to write the system files."
+msgstr "Αποτυχία εγγραφής των αρχείων συστήματος."
+
+#: src/xenia/app/emulator_window.cc:2296
+#: src/xenia/app/emulator_window.cc:2319
+#: src/xenia/app/emulator_window.cc:2324
+#: src/xenia/app/emulator_window.cc:2328
+#: src/xenia/app/emulator_window.cc:2333
+msgid "Install System Files"
+msgstr "Εγκατάσταση αρχείων συστήματος"
+
+#: src/xenia/app/emulator_window.cc:2297
+msgid "Installing the system files..."
+msgstr "Γίνεται εγκατάσταση αρχείων συστήματος…"
+
+#: src/xenia/app/emulator_window.cc:2282
+msgid "Select a USB System Update"
+msgstr "Επιλογή ενημέρωσης συστήματος για USB"
+
+#: src/xenia/app/emulator_window.cc:2310
+msgid "System files installed"
+msgstr "Τα αρχεία συστήματος εγκαταστάθηκαν"
+
+#: src/xenia/app/emulator_window.cc:2335
+msgid ""
+"The previous system files couldn't be put back in place. Move their folders back or delete them to install again. They are in:\n"
+"%s"
+msgstr ""
+"Δεν ήταν δυνατή η επαναφορά των προηγούμενων αρχείων συστήματος στη θέση τους. Για να επαναλάβετε την εγκατάσταση, μετακινήστε τους φακέλους τους πίσω ή διαγράψτε τους. Βρίσκονται στον φάκελο:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2311
+msgid ""
+"The system files are installed in:\n"
+"%s"
+msgstr ""
+"Τα αρχεία συστήματος εγκαταστάθηκαν στον φάκελο:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2320
+msgid "This file isn't a USB system update."
+msgstr "Αυτό το αρχείο δεν είναι ενημέρωση συστήματος για USB."
+
+#: src/xenia/app/emulator_window.cc:1035
+msgid "Start Dashboard"
+msgstr "Εκκίνηση πίνακα εργαλείων Xbox"
+
+#: src/xenia/app/emulator_window.cc:1171
+msgid "Download && Install..."
+msgstr "Λήψη και εγκατάσταση…"
+
+#: src/xenia/app/emulator_window.cc:1174
+msgid "Select File..."
+msgstr "Επιλογή αρχείου…"
+
+#: src/xenia/app/emulator_window.cc:2455
+msgid "Downloading the system update..."
+msgstr "Γίνεται λήψη της ενημέρωσης συστήματος…"
+
+#: src/xenia/app/emulator_window.cc:2441
+msgid "System files are already installed. Do you want to replace them?"
+msgstr "Τα αρχεία συστήματος είναι ήδη εγκατεστημένα. Θέλετε να τα αντικαταστήσετε?"
+
+#: src/xenia/app/emulator_window.cc:1178
+msgid "Download Cover Art..."
+msgstr "Λήψη εξωφύλλων…"
+
+#: src/xenia/app/emulator_window.cc:2393
+#: src/xenia/app/emulator_window.cc:2402
+#: src/xenia/app/emulator_window.cc:2430
+msgid "Download Cover Art"
+msgstr "Λήψη εξωφύλλων"
+
+#: src/xenia/app/emulator_window.cc:2394
+msgid "There's no cover art to download."
+msgstr "Δεν υπάρχουν εξώφυλλα για λήψη."
+
+#: src/xenia/app/emulator_window.cc:2403
+msgid "Downloading cover art..."
+msgstr "Γίνεται λήψη εξωφύλλων…"
+
+#: src/xenia/app/emulator_window.cc:2418
+msgid "Covers downloaded: %d"
+msgstr "Εξώφυλλα που λήφθηκαν: %d"
+
+#: src/xenia/app/emulator_window.cc:2422
+msgid "Games whose cover couldn't be downloaded: %d"
+msgstr "Παιχνίδια των οποίων το εξώφυλλο δεν ήταν δυνατό να ληφθεί: %d"
+
+#: src/xenia/app/emulator_window.cc:2427
+msgid "Covers that couldn't be saved: %d"
+msgstr "Εξώφυλλα που δεν ήταν δυνατό να αποθηκευτούν: %d"

@@ -81,15 +81,14 @@ dword_result_t XamContentGetDeviceName_entry(dword_t device_id,
   if (device_info == nullptr) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
-  auto name = std::u16string(device_info->name);
-  if (name_capacity < name.size() + 1) {
-    return X_ERROR_INSUFFICIENT_BUFFER;
-  }
-
   char16_t* name_buffer =
       kernel_memory()->TranslateVirtual<char16_t*>(name_buffer_ptr);
 
-  xe::string_util::copy_and_swap_truncating(name_buffer, name, name_capacity);
+  // xam truncates a name too long for the buffer and pads a short one.
+  const uint32_t capacity = name_capacity;
+  std::fill_n(name_buffer, capacity, u'\0');
+  xe::string_util::copy_and_swap_truncating(name_buffer, device_info->name,
+                                            capacity);
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamContentGetDeviceName, kContent, kImplemented);
@@ -100,8 +99,8 @@ dword_result_t XamContentGetDeviceState_entry(dword_t device_id,
   if (device_info == nullptr) {
     if (overlapped_ptr) {
       kernel_state()->CompleteOverlappedImmediateEx(
-          overlapped_ptr, X_ERROR_FUNCTION_FAILED, X_ERROR_DEVICE_NOT_CONNECTED,
-          0);
+          overlapped_ptr, X_ERROR_FUNCTION_FAILED,
+          X_HRESULT_FROM_WIN32(X_ERROR_DEVICE_NOT_CONNECTED), 0);
       return X_ERROR_IO_PENDING;
     } else {
       return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -116,6 +115,18 @@ dword_result_t XamContentGetDeviceState_entry(dword_t device_id,
   }
 }
 DECLARE_XAM_EXPORT1(XamContentGetDeviceState, kContent, kStub);
+
+// xam reports the first mounted device. The dummy HDD always is, and comes
+// first.
+dword_result_t XamContentGetDefaultDevice_entry(lpdword_t device_id_ptr) {
+  // xam doesn't check and faults on a null pointer.
+  if (!device_id_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  *device_id_ptr = static_cast<uint32_t>(DummyDeviceId::HDD);
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamContentGetDefaultDevice, kContent, kImplemented);
 
 typedef struct {
   xe::be<uint32_t> device_id;
@@ -152,6 +163,48 @@ dword_result_t XamContentGetDeviceData_entry(
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamContentGetDeviceData, kContent, kImplemented);
+
+const std::map<DeviceType, std::u16string_view> XDeviceTypeMap = {
+    {DeviceType::HDD, u"Hard Drive"},
+    {DeviceType::MU, u"Memory Unit"},
+    {DeviceType::System, u"System"},
+    {DeviceType::ODD, u"Optical Drive"},
+    {DeviceType::TransferCable, u"Transfer Cable"},
+    {DeviceType::Sapphire, u"Sapphire"},
+    {DeviceType::USBMASS, u"USB Storage"},
+};
+
+dword_result_t XamContentGetLocalizedDeviceData_entry(
+    dword_t device_id, pointer_t<X_CONTENT_DEVICE_DATA> device_data) {
+  auto device_info = GetDummyDeviceInfo(device_id);
+  if (device_info == nullptr) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  device_data.Zero();
+  device_data->device_id = static_cast<uint32_t>(device_info->device_id);
+  device_data->device_type = static_cast<uint32_t>(device_info->device_type);
+  device_data->total_bytes =
+      device_info->device_type == DeviceType::HDD
+          ? kernel_state()->content_manager()->GetContentTotalSpace()
+          : device_info->total_bytes;
+  device_data->free_bytes =
+      device_info->device_type == DeviceType::HDD
+          ? kernel_state()->content_manager()->GetContentFreeSpace()
+          : device_info->free_bytes;
+  // enforces name by device type
+  const std::u16string_view device_name =
+      XDeviceTypeMap.contains(device_info->device_type)
+          ? XDeviceTypeMap.at(device_info->device_type)
+          : u"Storage Device";
+
+  xe::string_util::copy_and_swap_truncating(
+      device_data->name_chars, device_name,
+      xe::countof(device_data->name_chars));
+
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamContentGetLocalizedDeviceData, kContent, kStub);
 
 dword_result_t XamContentCreateDeviceEnumerator_entry(dword_t content_type,
                                                       dword_t content_flags,

@@ -10,6 +10,8 @@
 #include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/app_manager.h"
+#include "xenia/kernel/xam/xam.h"
 #include "xenia/kernel/xam/xam_private.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_error.h"
 #include "xenia/kernel/xevent.h"
@@ -45,25 +47,20 @@ dword_result_t XMsgSystemProcessCall_entry(dword_t app, dword_t message,
 }
 DECLARE_XAM_EXPORT1(XMsgSystemProcessCall, kNone, kImplemented);
 
-struct XMSGSTARTIOREQUEST_UNKNOWNARG {
-  be<uint32_t> unk_0;
-  be<uint32_t> unk_1;
-};
-
 X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message,
                                  uint32_t overlapped_ptr, uint32_t buffer_ptr,
                                  uint32_t buffer_length,
-                                 XMSGSTARTIOREQUEST_UNKNOWNARG* unknown) {
+                                 X_TASK_ARGS* xam_task_args_ptr) {
   auto result = kernel_state()->app_manager()->DispatchMessageAsync(
-      app, message, buffer_ptr, buffer_length);
+      app, message, buffer_ptr, buffer_length, overlapped_ptr);
   if (result == X_E_NOTFOUND) {
     XELOGE("XMsgStartIORequestEx: app {:08X} undefined", app);
     result = X_E_INVALIDARG;
     XThread::SetLastError(X_ERROR_NOT_FOUND);
-  }
-  if (overlapped_ptr) {
-    kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, result);
-    result = X_ERROR_IO_PENDING;
+    if (overlapped_ptr) {
+      kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, result);
+      result = X_ERROR_IO_PENDING;
+    }
   }
   if (result == X_ERROR_SUCCESS || result == X_ERROR_IO_PENDING) {
     XThread::SetLastError(0);
@@ -74,9 +71,9 @@ X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message,
 dword_result_t XMsgStartIORequestEx_entry(
     dword_t app, dword_t message, pointer_t<XAM_OVERLAPPED> overlapped_ptr,
     dword_t buffer_ptr, dword_t buffer_length,
-    pointer_t<XMSGSTARTIOREQUEST_UNKNOWNARG> unknown_ptr) {
+    pointer_t<X_TASK_ARGS> xam_task_args_ptr) {
   return xeXMsgStartIORequestEx(app, message, overlapped_ptr, buffer_ptr,
-                                buffer_length, unknown_ptr);
+                                buffer_length, xam_task_args_ptr);
 }
 DECLARE_XAM_EXPORT1(XMsgStartIORequestEx, kNone, kImplemented);
 

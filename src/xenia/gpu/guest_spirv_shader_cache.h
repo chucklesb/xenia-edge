@@ -28,7 +28,6 @@ namespace gpu {
 
 class RegisterFile;
 class RenderTargetCache;
-class SpirvShader;
 class SpirvShaderTranslator;
 
 // Built-in geometry shader that expands a guest primitive type the host can't
@@ -39,16 +38,17 @@ enum class PipelineGeometryShader : uint32_t {
   kPointList,
   kRectangleList,
   kQuadList,
+  // Lines expanded to 1 guest pixel wide for resolution-scaled draws.
+  kLineList,
 };
 
 // Guest shader logic shared by the D3D12 (spirv_to_dxil) and Vulkan backends:
 // the SpirvShaderTranslator (built per backend via the Host seam), the
-// SpirvShaderTranslator::Modification derivation, ucode->SPIR-V translation,
-// and the built-in geometry shader key. The shader object cache stays
-// per-backend (their SpirvShader subclasses differ). This operates on
-// shaders/translations passed in. The host-specific tail (DXIL/VkPipeline
-// bytecode, pipeline state and storage) stays in each backend behind the Host
-// seam below.
+// SpirvShaderTranslator::Modification derivation and the built-in geometry
+// shader key. The shader object cache stays per-backend (their SpirvShader
+// subclasses differ). The host-specific tail (DXIL/VkPipeline bytecode,
+// pipeline state and storage) stays in each backend behind the Host seam
+// below.
 class GuestSpirvShaderCache {
  public:
   // Implemented by each backend to supply the host-specific pieces the shared
@@ -61,11 +61,6 @@ class GuestSpirvShaderCache {
     // from the device, D3D12 enables all and overrides a few). Called once for
     // the cache's main-thread translator and once per worker translator.
     virtual std::unique_ptr<SpirvShaderTranslator> CreateTranslator() const = 0;
-
-    // Whether manual barycentric (precise) pixel interpolation is available
-    // (D3D12 barycentrics). Vulkan returns false. Folded into the pixel shader
-    // modification.
-    virtual bool precise_interpolation_supported() const = 0;
 
     // Depth float24 policy, which lives on the backend's RenderTargetCache
     // subclass (not the shared base, so it can't be read through the base ref).
@@ -103,30 +98,13 @@ class GuestSpirvShaderCache {
       uint32_t normalized_color_mask,
       bool apply_polygon_offset_in_shader) const;
 
-  // Ensures a Translation for the modification on the given (backend-owned)
-  // shader exists WITHOUT translating to SPIR-V. Analyzes the ucode if needed.
-  // Main/draw thread only. Returns the (possibly untranslated) Translation.
-  Shader::Translation* EnsureTranslation(SpirvShader& shader,
-                                         uint64_t modification);
-  // Translates a Translation to SPIR-V on the given translator (the main
-  // thread's, or a worker's). use_try_claim coordinates concurrent translation
-  // of the same Translation. Returns the valid Translation or nullptr. The
-  // backend converts the SPIR-V to host bytecode afterward. Any thread.
-  Shader::Translation* TranslateSpirv(SpirvShaderTranslator& translator,
-                                      Shader::Translation& translation,
-                                      bool use_try_claim);
-  // Main-thread convenience: EnsureTranslation + TranslateSpirv on the shared
-  // translator.
-  Shader::Translation* EnsureAndTranslate(SpirvShader& shader,
-                                          uint64_t modification);
-
   // Built-in primitive-expansion geometry shader key (point/rect/quad). Derived
-  // from SPIR-V modifications. Shared by both backends. Each converts the
-  // SPIR-V from BuildGeometryShaderSpirv to its own bytecode.
+  // from SPIR-V modifications. Each backend builds the SPIR-V and converts it
+  // to its own bytecode.
   union GeometryShaderKey {
     uint32_t key;
     struct {
-      PipelineGeometryShader type : 2;
+      PipelineGeometryShader type : 3;
       uint32_t interpolator_count : 5;
       // Raw enabled count (0-6). Vulkan keys on this too but always builds 6.
       uint32_t user_clip_plane_count : 3;
@@ -154,13 +132,6 @@ class GuestSpirvShaderCache {
                                    uint64_t vertex_shader_modification,
                                    uint64_t pixel_shader_modification,
                                    GeometryShaderKey& key_out);
-  // Builds the built-in geometry shader SPIR-V for the key, using the shared
-  // generator and this cache's translator float-control features so the stages
-  // link. user_clip_plane_count_for_build lets the caller request a fixed count
-  // (Vulkan passes 6 when any are enabled, D3D12 passes the exact count).
-  std::vector<uint32_t> BuildGeometryShaderSpirv(
-      GeometryShaderKey key, uint32_t user_clip_plane_count_for_build) const;
-
   // Each backend selects the host tessellation vertex/hull shaders itself. That
   // selection references the generated vulkan_spirv blobs, whose generation
   // links xenia-gpu, and this base-library component cannot depend on xenia-gpu

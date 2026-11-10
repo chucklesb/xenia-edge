@@ -13,12 +13,14 @@
 #include <algorithm>
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/stb/stb_image.h"
+#include "xenia/base/png_utils.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/user_data.h"
 #include "xenia/kernel/xam/user_property.h"
 #include "xenia/kernel/xam/user_settings.h"
 #include "xenia/kernel/xam/user_tracker.h"
+#include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xam/xdbf/gpd_info.h"
 #include "xenia/kernel/xconfig.h"
 
@@ -159,14 +161,9 @@ void UserTracker::AddTitleToPlayedList(uint64_t xuid) {
   }
 
   const uint32_t title_id = spa_data_->title_id();
-  auto title_gpd = user->games_gpd_.find(title_id);
-  if (title_gpd == user->games_gpd_.end()) {
+  if (!user->games_gpd_.contains(title_id)) {
     user->games_gpd_.emplace(title_id, GpdInfoTitle(title_id));
     UpdateTitleGpdFile();
-  }
-
-  if (!spa_data_->include_in_profile()) {
-    return;
   }
 
   const uint64_t current_time = Clock::QueryGuestSystemTime();
@@ -191,16 +188,42 @@ void UserTracker::RemoveTitleFromPlayedList(uint64_t xuid, uint32_t title_id) {
     return;
   }
 
-  if (user->dashboard_gpd_.RemoveTitle(title_id)) {
-    UpdateSettingValue(xuid, kDashboardID,
-                       UserSettingId::XPROFILE_GAMERCARD_TITLES_PLAYED, -1);
-    FlushUserData(xuid);
+  auto title_data = user->dashboard_gpd_.GetTitleInfo(title_id);
+  if (!title_data) {
+    return;
   }
+
+  // Get the number of achievements and gamer score we got from this title.
+  int32_t gamerscore_earned =
+      static_cast<int32_t>(title_data->gamerscore_earned);
+  int32_t achievements_unlocked =
+      static_cast<int32_t>(title_data->achievements_unlocked);
+
+  // Remove the title's GPD.
+  if (!user->RemoveGpd(title_id)) {
+    return;
+  }
+
+  // Remove the title from dashboard GPD.
+  if (!user->dashboard_gpd_.RemoveTitle(title_id)) {
+    return;
+  }
+
+  // Lower the profile's stats.
+  UpdateSettingValue(xuid, kDashboardID,
+                     UserSettingId::XPROFILE_GAMERCARD_TITLES_PLAYED, -1);
+  UpdateSettingValue(xuid, kDashboardID, UserSettingId::XPROFILE_GAMERCARD_CRED,
+                     -gamerscore_earned);
+  UpdateSettingValue(xuid, kDashboardID,
+                     UserSettingId::XPROFILE_GAMERCARD_ACHIEVEMENTS_EARNED,
+                     -achievements_unlocked);
+
+  FlushUserData(xuid);
 }
 
 // Privates
 bool UserTracker::IsUserTracked(uint64_t xuid) const {
-  return tracked_xuids_.find(xuid) != tracked_xuids_.cend();
+  return tracked_xuids_.contains(xuid);
 }
 
 std::optional<TitleInfo> UserTracker::GetUserTitleInfo(
@@ -282,10 +305,10 @@ std::vector<TitleInfo> UserTracker::GetPlayedTitles(uint64_t xuid) const {
     played_titles.push_back(info);
   }
 
-  std::sort(played_titles.begin(), played_titles.end(),
-            [](const TitleInfo& first, const TitleInfo& second) {
-              return first.last_played > second.last_played;
-            });
+  std::ranges::sort(played_titles,
+                    [](const TitleInfo& first, const TitleInfo& second) {
+                      return first.last_played > second.last_played;
+                    });
 
   return played_titles;
 }
@@ -474,11 +497,12 @@ void UserTracker::AddProperty(const uint64_t xuid, const Property* property) {
     }
   }
 
-  auto entry = std::find_if(user->properties_.begin(), user->properties_.end(),
-                            [property_id](const Property& property_data) {
-                              return property_data.GetPropertyId().value ==
-                                     property_id.value;
-                            });
+  std::lock_guard prop_lock(user->prop_mutex);
+
+  auto entry = std::ranges::find_if(
+      user->properties_, [property_id](const Property& property_data) {
+        return property_data.GetPropertyId().value == property_id.value;
+      });
 
   if (entry != user->properties_.end()) {
     *entry = *property;
@@ -498,11 +522,13 @@ X_STATUS UserTracker::GetProperty(const uint64_t xuid, uint32_t* property_size,
   *property_size = 0;
   const auto& property_id = property->property_id;
 
-  const auto entry =
-      std::find_if(user->properties_.cbegin(), user->properties_.cend(),
-                   [property_id](const Property& property_data) {
-                     return property_data.GetPropertyId().value == property_id;
-                   });
+  std::lock_guard prop_lock(user->prop_mutex);
+
+  const auto entry = std::ranges::find_if(
+      std::as_const(user->properties_),
+      [property_id](const Property& property_data) {
+        return property_data.GetPropertyId().value == property_id;
+      });
 
   if (entry == user->properties_.cend()) {
     return X_E_INVALIDARG;
@@ -526,11 +552,12 @@ const Property* UserTracker::GetProperty(const uint64_t xuid,
     return nullptr;
   }
 
-  const auto entry =
-      std::find_if(user->properties_.cbegin(), user->properties_.cend(),
-                   [id](const Property& property_data) {
-                     return property_data.GetPropertyId().value == id;
-                   });
+  std::lock_guard prop_lock(user->prop_mutex);
+
+  const auto entry = std::ranges::find_if(
+      std::as_const(user->properties_), [id](const Property& property_data) {
+        return property_data.GetPropertyId().value == id;
+      });
 
   if (entry == user->properties_.cend()) {
     return nullptr;
@@ -590,13 +617,37 @@ bool UserTracker::GetUserSetting(uint64_t xuid, uint32_t title_id,
   return true;
 }
 
+std::pair<uint32_t, uint32_t> UserTracker::GetUserSubscriptionData(
+    UserProfile* user) const {
+  std::pair<uint32_t, uint32_t> data;
+  if (const auto setting = GetSetting(
+          user, kDashboardID,
+          static_cast<uint32_t>(
+              UserSettingId::XPROFILE_SUBSCRIPTION_TYPE_LENGTH_IN_MONTHS))) {
+    data.first = std::get<int32_t>(setting->get_host_data());
+  } else {
+    data.first = 0;
+  }
+
+  if (const auto setting =
+          GetSetting(user, kDashboardID,
+                     static_cast<uint32_t>(
+                         UserSettingId::XPROFILE_SUBSCRIPTION_PAYMENT_TYPE))) {
+    data.second = std::get<int32_t>(setting->get_host_data());
+  } else {
+    data.second = 0;
+  }
+
+  return data;
+}
+
 void UserTracker::UpdateContext(uint64_t xuid, uint32_t id, uint32_t value) {
   if (!IsUserTracked(xuid)) {
     return;
   }
 
   auto user = kernel_state()->xam_state()->GetUserProfile(xuid);
-  if (!user) {
+  if (!user || !spa_data_) {
     return;
   }
 
@@ -609,12 +660,13 @@ void UserTracker::UpdateContext(uint64_t xuid, uint32_t id, uint32_t value) {
     return;
   }
 
-  const auto entry =
-      std::find_if(user->properties_.begin(), user->properties_.end(),
-                   [id](const Property& property_data) {
-                     return property_data.IsContext() &&
-                            property_data.GetPropertyId().value == id;
-                   });
+  std::lock_guard prop_lock(user->prop_mutex);
+
+  const auto entry = std::ranges::find_if(
+      user->properties_, [id](const Property& property_data) {
+        return property_data.IsContext() &&
+               property_data.GetPropertyId().value == id;
+      });
 
   if (entry != user->properties_.cend()) {
     *entry = Property(id, value);
@@ -631,7 +683,7 @@ std::optional<uint32_t> UserTracker::GetUserContext(uint64_t xuid,
   }
 
   auto user = kernel_state()->xam_state()->GetUserProfile(xuid);
-  if (!user) {
+  if (!user || !spa_data_) {
     return std::nullopt;
   }
 
@@ -640,9 +692,10 @@ std::optional<uint32_t> UserTracker::GetUserContext(uint64_t xuid,
     return std::nullopt;
   }
 
-  const auto entry = std::find_if(
-      user->properties_.cbegin(), user->properties_.cend(),
-      [id](const Property& property_data) {
+  std::lock_guard prop_lock(user->prop_mutex);
+
+  const auto entry = std::ranges::find_if(
+      std::as_const(user->properties_), [id](const Property& property_data) {
         return property_data.get_type() == X_USER_DATA_TYPE::CONTEXT &&
                property_data.GetPropertyId().value == id;
       });
@@ -666,6 +719,8 @@ std::vector<AttributeKey> UserTracker::GetUserContextIds(uint64_t xuid) const {
 
   std::vector<AttributeKey> entries;
 
+  std::lock_guard prop_lock(user->prop_mutex);
+
   for (const auto& property : user->properties_) {
     if (!property.IsContext()) {
       continue;
@@ -685,6 +740,8 @@ std::vector<AttributeKey> UserTracker::GetUserPropertyIds(uint64_t xuid) const {
   if (!user) {
     return {};
   }
+
+  std::lock_guard prop_lock(user->prop_mutex);
 
   std::vector<AttributeKey> entries;
 
@@ -780,6 +837,17 @@ bool UserTracker::UpdateUserIcon(uint64_t xuid,
   }
 
   user->WriteProfileIcon(icon_type, icon_data);
+
+  // Both sizes are written, as titles can ask for either.
+  const bool large = icon_type == XTileType::kPersonalGamerTile;
+  const auto [other_width, other_height] =
+      large ? kProfileIconSizeSmall : kProfileIconSize;
+  const auto other = ResizePng(icon_data, other_width, other_height);
+  if (!other.empty()) {
+    user->WriteProfileIcon(large ? XTileType::kPersonalGamerTileSmall
+                                 : XTileType::kPersonalGamerTile,
+                           other);
+  }
   return true;
 }
 

@@ -12,17 +12,16 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
 #if XE_PLATFORM_MAC
 #include <mach/mach.h>
@@ -30,6 +29,7 @@
 #include <mach/vm_region.h>
 #endif  // XE_PLATFORM_MAC
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
@@ -43,6 +43,20 @@
 
 #include "xenia/base/main_android.h"
 #endif
+
+#if XE_PLATFORM_GNU_LINUX
+// Needs Linux 6.3 / glibc 2.38 headers.
+#ifndef MFD_EXEC
+#define MFD_EXEC 0x0010U
+#endif
+
+DEFINE_bool(use_shm_open, false,
+            "Back guest memory and the code cache with a /dev/shm file instead "
+            "of memfd.\n"
+            "Exposes both as named files that other processes can open to "
+            "inspect guest memory or JIT output while a title runs.",
+            "Linux");
+#endif  // XE_PLATFORM_GNU_LINUX
 
 namespace xe {
 namespace memory {
@@ -75,7 +89,10 @@ void AndroidShutdown() {
 }
 #endif
 
-size_t page_size() { return getpagesize(); }
+size_t page_size() {
+  static const size_t value = static_cast<size_t>(getpagesize());
+  return value;
+}
 size_t allocation_granularity() { return page_size(); }
 
 uint32_t ToPosixProtectFlags(PageAccess access) {
@@ -149,28 +166,66 @@ struct MappedFileRange {
 std::vector<MappedFileRange> mapped_file_ranges;
 std::mutex g_mapped_file_ranges_mutex;
 
-// Track shm file names for cleanup on exit
-std::vector<std::string> g_shm_file_names;
-std::mutex g_shm_file_names_mutex;
-static bool g_cleanup_handlers_installed = false;
+// Lets a Win32-style length-0 release find the reservation's extent.
+static std::mutex g_reservations_mutex;
+static std::unordered_map<void*, size_t> g_reservations;
 
-#if !XE_PLATFORM_ANDROID
-static void CleanupAtExit() {
-  for (const auto& name : g_shm_file_names) {
-    shm_unlink(name.c_str());
+// Address space held by a PROT_NONE reservation that file views replace, and
+// that comes back when they are unmapped. Windows holds the same with
+// placeholders.
+static std::mutex g_view_reservations_mutex;
+static std::vector<MappedFileRange> g_view_reservations;
+
+// Index of the view reservation the range sits in, or -1. The caller holds
+// g_view_reservations_mutex.
+static ptrdiff_t FindViewReservation(const void* base_address, size_t length) {
+  const auto begin = reinterpret_cast<uintptr_t>(base_address);
+  for (size_t i = 0; i < g_view_reservations.size(); ++i) {
+    // Length is compared against the distance to the end so it cannot wrap.
+    if (begin >= g_view_reservations[i].region_begin &&
+        begin <= g_view_reservations[i].region_end &&
+        length <= g_view_reservations[i].region_end - begin) {
+      return ptrdiff_t(i);
+    }
   }
+  return -1;
 }
 
-static void InstallCleanupHandlers() {
-  if (g_cleanup_handlers_installed) {
-    return;
-  }
-  g_cleanup_handlers_installed = true;
-
-  std::atexit(CleanupAtExit);
-  std::at_quick_exit(CleanupAtExit);
+static bool IsViewReservation(const void* base_address, size_t length) {
+  std::lock_guard guard(g_view_reservations_mutex);
+  return FindViewReservation(base_address, length) >= 0;
 }
-#endif  // !XE_PLATFORM_ANDROID
+
+// Puts a reservation over the range, dropping whatever is mapped in it.
+static bool ReserveRange(void* base_address, size_t length) {
+  void* result = mmap(base_address, length, PROT_NONE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  if (result == base_address) {
+    return true;
+  }
+  // Callers drop the result, so the log is the only sign that a view stayed
+  // mapped where the reservation should have come back.
+  XELOGE("mmap(PROT_NONE, {}, 0x{:X}) failed: {} ({})", base_address, length,
+         strerror(errno), errno);
+  return false;
+}
+
+static void RememberReservation(void* base_address, size_t length) {
+  std::lock_guard guard(g_reservations_mutex);
+  g_reservations[base_address] = length;
+}
+
+// Erase before munmap: a concurrent AllocFixed may reuse the address.
+static size_t TakeReservationLength(void* base_address) {
+  std::lock_guard guard(g_reservations_mutex);
+  auto it = g_reservations.find(base_address);
+  if (it == g_reservations.end()) {
+    return 0;
+  }
+  const size_t length = it->second;
+  g_reservations.erase(it);
+  return length;
+}
 
 void* AllocFixed(void* base_address, size_t length,
                  AllocationType allocation_type, PageAccess access) {
@@ -187,23 +242,24 @@ void* AllocFixed(void* base_address, size_t length,
 
   if (base_address != nullptr) {
     if (allocation_type == AllocationType::kCommit) {
-#if XE_PLATFORM_MAC
-      size_t host_page = page_size();
-      uintptr_t aligned_addr =
+      // mprotect rejects a base the host cannot address, so round out to whole
+      // host pages. Callers that must not disturb a neighbour sharing the page
+      // (guest pages smaller than the host page) protect through
+      // BaseHeap::ApplyHostProtect instead of committing here.
+      const size_t host_page = page_size();
+      const uintptr_t aligned_addr =
           reinterpret_cast<uintptr_t>(base_address) & ~(host_page - 1);
-      uintptr_t end_addr = reinterpret_cast<uintptr_t>(base_address) + length;
-      end_addr = (end_addr + host_page - 1) & ~(host_page - 1);
+      const uintptr_t end_addr =
+          (reinterpret_cast<uintptr_t>(base_address) + length + host_page - 1) &
+          ~(host_page - 1);
       if (mprotect(reinterpret_cast<void*>(aligned_addr),
-                   end_addr - aligned_addr, prot) == 0) {
-        return base_address;
+                   end_addr - aligned_addr, prot) != 0) {
+        XELOGE("mprotect({}, 0x{:X}, {}) failed: {} ({})",
+               reinterpret_cast<void*>(aligned_addr), end_addr - aligned_addr,
+               prot, strerror(errno), errno);
+        return nullptr;
       }
-      return nullptr;
-#else
-      if (Protect(base_address, length, access)) {
-        return base_address;
-      }
-      return nullptr;
-#endif  // XE_PLATFORM_MAC
+      return base_address;
     }
 #ifdef MAP_FIXED_NOREPLACE
     flags |= MAP_FIXED_NOREPLACE;
@@ -221,6 +277,7 @@ void* AllocFixed(void* base_address, size_t length,
     return nullptr;
   }
 
+  RememberReservation(result, length);
   return result;
 }
 
@@ -233,6 +290,7 @@ bool DeallocFixed(void* base_address, size_t length,
   std::lock_guard guard(g_mapped_file_ranges_mutex);
   for (const auto& mapped_range : mapped_file_ranges) {
     if (region_begin >= mapped_range.region_begin &&
+        region_begin < mapped_range.region_end &&
         region_end <= mapped_range.region_end) {
       switch (deallocation_type) {
         case DeallocationType::kDecommit:
@@ -248,8 +306,25 @@ bool DeallocFixed(void* base_address, size_t length,
   switch (deallocation_type) {
     case DeallocationType::kDecommit:
       return Protect(base_address, length, PageAccess::kNoAccess);
-    case DeallocationType::kRelease:
-      return munmap(base_address, length) == 0;
+    case DeallocationType::kRelease: {
+      // memory_win.cc passes length 0 for MEM_RELEASE; munmap rejects 0.
+      const size_t recorded = length ? 0 : TakeReservationLength(base_address);
+      const size_t release_length = length ? length : recorded;
+      if (!release_length) {
+        XELOGE(
+            "DeallocFixed: release of {} with length 0, but that address is "
+            "not a known reservation; refusing to guess",
+            base_address);
+        return false;
+      }
+      if (munmap(base_address, release_length) != 0) {
+        if (recorded) {
+          RememberReservation(base_address, recorded);
+        }
+        return false;
+      }
+      return true;
+    }
     default:
       assert_unhandled_case(deallocation_type);
   }
@@ -259,7 +334,14 @@ bool Protect(void* base_address, size_t length, PageAccess access,
              PageAccess* out_old_access) {
   if (out_old_access) {
     size_t length_copy = length;
-    QueryProtect(base_address, length_copy, *out_old_access);
+    if (!QueryProtect(base_address, length_copy, *out_old_access)) {
+      // The only caller restores this; kNoAccess would strand the page.
+      *out_old_access = PageAccess::kReadWrite;
+      XELOGW(
+          "Protect: could not read the current protection of {}; reporting "
+          "kReadWrite",
+          base_address);
+    }
   }
 
   uint32_t prot = ToPosixProtectFlags(access);
@@ -272,6 +354,8 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 }
 
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+  access_out = PageAccess::kNoAccess;
+  length = 0;
 #if XE_PLATFORM_MAC
   mach_vm_address_t address = reinterpret_cast<mach_vm_address_t>(base_address);
   mach_vm_size_t region_size = 0;
@@ -345,6 +429,7 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
             access_out == ToXeniaProtectFlags(next_protection)) {
           length =
               next_map_region_end - reinterpret_cast<uintptr_t>(base_address);
+          map_region_end = next_map_region_end;
           continue;
         }
         break;
@@ -403,7 +488,7 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
       assert_always();
       return kFileMappingHandleInvalid;
   }
-  oflag |= O_CREAT;
+  oflag |= O_CREAT | O_EXCL;
 
 #if XE_PLATFORM_MAC
   std::string shm_name = "/" + path.filename().string();
@@ -413,7 +498,7 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
     std::snprintf(hash_buf, sizeof(hash_buf), "/%016zx", h);
     shm_name = hash_buf;
   }
-  int ret = shm_open(shm_name.c_str(), oflag, 0777);
+  int ret = shm_open(shm_name.c_str(), oflag, 0600);
   if (ret < 0) {
     XELOGE("shm_open({}) failed: {} ({})", shm_name, strerror(errno), errno);
     return kFileMappingHandleInvalid;
@@ -425,34 +510,54 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
     shm_unlink(shm_name.c_str());
     return kFileMappingHandleInvalid;
   }
-  // Track for cleanup on abnormal exit and install cleanup handlers
-  {
-    std::lock_guard guard(g_shm_file_names_mutex);
-    g_shm_file_names.push_back(shm_name);
-  }
-  InstallCleanupHandlers();
+  // The descriptor keeps the object alive, so drop the name now. Nothing
+  // else can open it and nothing leaks if we die without unwinding.
+  shm_unlink(shm_name.c_str());
   return ret;
 #else
   auto full_path = "/" / path;
-  int ret = shm_open(full_path.c_str(), oflag, 0777);
+#if XE_PLATFORM_GNU_LINUX
+  // Prefer memfd: unlike /dev/shm it is unaffected by noexec mounts, LSM
+  // policy or a container's --shm-size, and the kernel reclaims it on exit so
+  // it needs no crash cleanup.
+  if (!cvars::use_shm_open) {
+    const bool needs_exec = access == PageAccess::kExecuteReadOnly ||
+                            access == PageAccess::kExecuteReadWrite;
+    int memfd =
+        memfd_create(path.c_str(), MFD_CLOEXEC | (needs_exec ? MFD_EXEC : 0u));
+    if (memfd < 0 && needs_exec && errno == EINVAL) {
+      // Pre-6.3 kernels reject the unknown flag but map exec anyway.
+      memfd = memfd_create(path.c_str(), MFD_CLOEXEC);
+    }
+    if (memfd >= 0) {
+      if (ftruncate(memfd, length) < 0) {
+        XELOGE("ftruncate(memfd {}, 0x{:X}) failed: {} ({})",
+               xe::strip_pii(xe::path_to_utf8(path)), length, strerror(errno),
+               errno);
+        close(memfd);
+        return kFileMappingHandleInvalid;
+      }
+      return memfd;
+    }
+    XELOGW("memfd_create({}) failed: {} ({}), falling back to shm_open",
+           xe::strip_pii(xe::path_to_utf8(path)), strerror(errno), errno);
+  }
+#endif  // XE_PLATFORM_GNU_LINUX
+  int ret = shm_open(full_path.c_str(), oflag, 0600);
   if (ret < 0) {
-    XELOGE("shm_open({}) failed: {} ({})", full_path.string(), strerror(errno),
-           errno);
+    XELOGE("shm_open({}) failed: {} ({})",
+           xe::strip_pii(xe::path_to_utf8(full_path)), strerror(errno), errno);
     return kFileMappingHandleInvalid;
   }
   if (ftruncate(ret, length) < 0) {
-    XELOGE("ftruncate({}, 0x{:X}) failed: {} ({})", full_path.string(), length,
-           strerror(errno), errno);
+    XELOGE("ftruncate({}, 0x{:X}) failed: {} ({})",
+           xe::strip_pii(xe::path_to_utf8(full_path)), length, strerror(errno),
+           errno);
     close(ret);
     shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
-  // Track for cleanup on abnormal exit and install cleanup handlers
-  {
-    std::lock_guard guard(g_shm_file_names_mutex);
-    g_shm_file_names.push_back(full_path.string());
-  }
-  InstallCleanupHandlers();
+  shm_unlink(full_path.c_str());
   return ret;
 #endif  // XE_PLATFORM_MAC
 #endif
@@ -460,48 +565,22 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
 
 void CloseFileMappingHandle(FileMappingHandle handle,
                             const std::filesystem::path& path) {
+  // Name already unlinked at creation, so the object dies with this close.
   close(handle);
-#if !XE_PLATFORM_ANDROID
-#if XE_PLATFORM_MAC
-  std::string shm_name = "/" + path.filename().string();
-  if (shm_name.size() > 30) {
-    std::size_t h = std::hash<std::string>{}(shm_name);
-    char hash_buf[24];
-    std::snprintf(hash_buf, sizeof(hash_buf), "/%016zx", h);
-    shm_name = hash_buf;
-  }
-  shm_unlink(shm_name.c_str());
-  // Remove from tracking
-  {
-    std::lock_guard guard(g_shm_file_names_mutex);
-    auto it =
-        std::find(g_shm_file_names.begin(), g_shm_file_names.end(), shm_name);
-    if (it != g_shm_file_names.end()) {
-      g_shm_file_names.erase(it);
-    }
-  }
-#else
-  auto full_path = "/" / path;
-  shm_unlink(full_path.c_str());
-  // Remove from tracking
-  {
-    std::lock_guard guard(g_shm_file_names_mutex);
-    auto it = std::find(g_shm_file_names.begin(), g_shm_file_names.end(),
-                        full_path.string());
-    if (it != g_shm_file_names.end()) {
-      g_shm_file_names.erase(it);
-    }
-  }
-#endif  // XE_PLATFORM_MAC
-#endif
 }
 
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length,
                   PageAccess access, size_t file_offset) {
   uint32_t prot = ToPosixProtectFlags(access);
 
+  // A view over a reservation needs no range of its own.
+  const bool over_reservation =
+      base_address != nullptr && IsViewReservation(base_address, length);
+
   int flags = MAP_SHARED;
-  if (base_address != nullptr) {
+  if (over_reservation) {
+    flags |= MAP_FIXED;
+  } else if (base_address != nullptr) {
 #ifdef MAP_FIXED_NOREPLACE
     flags |= MAP_FIXED_NOREPLACE;
 #endif
@@ -521,6 +600,10 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length,
     return nullptr;
   }
 
+  if (over_reservation) {
+    return result;
+  }
+
   std::lock_guard guard(g_mapped_file_ranges_mutex);
   mapped_file_ranges.push_back({reinterpret_cast<uintptr_t>(result),
                                 reinterpret_cast<uintptr_t>(result) + length});
@@ -529,6 +612,11 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length,
 
 bool UnmapFileView(FileMappingHandle handle, void* base_address,
                    size_t length) {
+  if (IsViewReservation(base_address, length)) {
+    // The reservation comes back, and the view was never tracked.
+    return ReserveRange(base_address, length);
+  }
+
   std::lock_guard guard(g_mapped_file_ranges_mutex);
 
 #if XE_PLATFORM_MAC
@@ -571,6 +659,55 @@ bool UnmapFileView(FileMappingHandle handle, void* base_address,
   assert_always("Error: Partial unmapping of files not yet supported.");
   return munmap(base_address, length) == 0;
 #endif  // XE_PLATFORM_MAC
+}
+
+bool ReserveFileViewPages(void* base_address, size_t length) {
+  std::lock_guard guard(g_view_reservations_mutex);
+  if (FindViewReservation(base_address, length) >= 0) {
+    // Part of a reservation already, with no view mapped in it.
+    return true;
+  }
+  int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_FIXED_NOREPLACE
+  flags |= MAP_FIXED_NOREPLACE;
+#endif
+  void* reservation = mmap(base_address, length, PROT_NONE, flags, -1, 0);
+  if (reservation == MAP_FAILED) {
+    return false;
+  }
+  if (reservation != base_address) {
+    // Without MAP_FIXED_NOREPLACE the base is only a hint, and a reservation
+    // elsewhere holds nothing the caller asked for.
+    munmap(reservation, length);
+    return false;
+  }
+  g_view_reservations.push_back(
+      {reinterpret_cast<uintptr_t>(base_address),
+       reinterpret_cast<uintptr_t>(base_address) + length});
+  return true;
+}
+
+void* MapFileViewPages(FileMappingHandle handle, void* base_address,
+                       size_t length, PageAccess access, size_t file_offset) {
+  return MapFileView(handle, base_address, length, access, file_offset);
+}
+
+bool ReleaseFileViewPages(FileMappingHandle handle, void* base_address,
+                          size_t length) {
+  std::lock_guard guard(g_view_reservations_mutex);
+  const ptrdiff_t index = FindViewReservation(base_address, length);
+  if (index < 0) {
+    return munmap(base_address, length) == 0;
+  }
+  const auto begin = reinterpret_cast<uintptr_t>(base_address);
+  if (g_view_reservations[index].region_begin == begin &&
+      g_view_reservations[index].region_end == begin + length) {
+    // The whole reservation, so the address space goes back to the host.
+    g_view_reservations.erase(g_view_reservations.begin() + index);
+    return munmap(base_address, length) == 0;
+  }
+  // Part of a reservation, so it comes back over the views released here.
+  return ReserveRange(base_address, length);
 }
 
 }  // namespace memory

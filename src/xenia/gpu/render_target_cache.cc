@@ -9,18 +9,34 @@
 
 #include "xenia/gpu/render_target_cache.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/gpu/draw_util.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/registers.h"
+#include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/xenos.h"
 
+DEFINE_bool(log_transfers, false,
+            "Log every EDRAM ownership transfer with its source and "
+            "destination render target and tile range.",
+            "GPU.Debug");
+DEFINE_bool(
+    debug_msaa_2x_as_4x, false,
+    "Use 4x MSAA with 2 samples instead of native 2x MSAA when available. "
+    "For scalability testing on host GPU APIs where 2x is not mandatory. MSAA "
+    "will be of a similar or worse quality and use more memory.",
+    "GPU.Debug");
 DEFINE_bool(
     depth_transfer_not_equal_test, true,
     "When transferring data between depth render targets, use the \"not "
@@ -33,7 +49,7 @@ DEFINE_bool(
     "beneficial to subsequent rendering, while setting this to false may "
     "reduce bandwidth usage during transfers as the previous depth won't need "
     "to be read.",
-    "GPU");
+    "GPU.Debug");
 // Lossless round trip: 545407F2.
 // Lossy round trip with the "greater or equal" test afterwards: 4D530919.
 // Lossy round trip with the "equal" test afterwards: 535107F5, 565507EF.
@@ -144,6 +160,16 @@ DEFINE_bool(
     "into account for render-to-texture, for more correct shadow filtering, "
     "bloom, etc., in some cases.",
     "GPU");
+DEFINE_uint32(
+    draw_resolution_scale_threshold, 0,
+    "Surface pitch in pixels at or below render targets skip being upscaled "
+    "by draw_resolution_scale_x/y. 0 disables it.\n"
+    "Small offscreen surfaces like bloom or depth of field buffers often "
+    "break when upscaled and keeping them native avoids that. The pitch "
+    "is compared after alignment to 80 pixel EDRAM tiles, so prefer "
+    "conservative values, only as high as the broken effects need.\n"
+    "Host render targets only.",
+    "GPU");
 DEFINE_bool(
     gamma_render_target_as_unorm16, true,
     "When the host can't write 8 bits per component pixels with piecewise "
@@ -153,7 +179,7 @@ DEFINE_bool(
     "Greatly increases accuracy for this format, but may result in render "
     "target copying costs if the game switches between 8_8_8_8_GAMMA and "
     "8_8_8_8 views for the same EDRAM render target.",
-    "GPU");
+    "GPU.Debug");
 DEFINE_bool(
     mrt_edram_used_range_clamp_to_min, true,
     "With host render targets, if multiple render targets are bound, estimate "
@@ -163,14 +189,7 @@ DEFINE_bool(
     "Has effect primarily on draws without viewport clipping.\n"
     "Setting this to false results in higher accuracy in rare cases, but may "
     "increase the amount of copying that needs to be done sometimes.",
-    "GPU");
-DEFINE_bool(
-    native_2x_msaa, true,
-    "Use host 2x MSAA when available. Can be disabled for scalability testing "
-    "on host GPU APIs where 2x is not mandatory, in this case, 2 samples of 4x "
-    "MSAA will be used instead (with similar or worse quality and higher "
-    "memory usage).",
-    "GPU");
+    "GPU.Debug");
 DEFINE_bool(
     native_stencil_value_output, true,
     "Use pixel shader stencil reference output where available for purposes "
@@ -183,18 +202,15 @@ DEFINE_bool(
     "When the host can only support 16_16 and 16_16_16_16 render targets as "
     "-1...1, remap -32...32 to -1...1 to use the full possible range of "
     "values, at the expense of multiplicative blending correctness.",
-    "GPU");
+    "GPU.Debug");
 DEFINE_bool(
     value_convert_7e3_8888_reuse, true,
     "Decode (HDR float to LDR unorm) instead of bit-reinterpreting when a 7e3 "
     "(2_10_10_10_FLOAT) EDRAM tile is reused in place as 8_8_8_8 and the "
-    "reusing "
-    "draw blends over it, so the background is not colored garbage (e.g. "
-    "Deadly "
-    "Premonition foliage).\n"
+    "reusing draw blends over it, so the background is not colored garbage "
+    "(e.g. Deadly Premonition foliage).\n"
     "On by default. Set to false to force bit-exact reinterpretation if a "
-    "title "
-    "regresses.",
+    "title regresses.",
     "GPU");
 UPDATE_from_bool(value_convert_7e3_8888_reuse, 2026, 6, 28, 12, false);
 // Enabled by default as the GPU is overall usually the bottleneck when the
@@ -209,7 +225,22 @@ DEFINE_bool(
     "needed when the ownership of a EDRAM range is changed.\n"
     "If this is enabled, excessive barriers may be eliminated when switching "
     "between different render targets in separate EDRAM locations.",
+    "GPU.Debug");
+DEFINE_bool(
+    direct_host_resolve, true,
+    "Resolve host render targets straight into shared memory where the copy "
+    "needs no format conversion, instead of dumping them into the EDRAM buffer "
+    "and copying back out of it. Saves a compute pass and its barrier per "
+    "resolve.\n"
+    "Set to false to always take the EDRAM path.",
     "GPU");
+DEFINE_bool(
+    aliased_depth_read_only, true,
+    "Matches interlock behavior by handling disjoint color and depth aliases "
+    "for host render targets, keeping read-only depth bound when color writes "
+    "only the unused stencil bits. May slightly increase overhead from keeping "
+    "both host targets live and bound.",
+    "GPU.Debug");
 
 namespace xe {
 namespace gpu {
@@ -264,9 +295,9 @@ void RenderTargetCache::GetPSIColorFormatInfo(
       // k_16_16 (the render target is fixed-point). There's one deviation from
       // how Direct3D 11.3 functional specification defines SNorm conversion
       // (NaN should be 0, not the lowest negative number), and that needs to be
-      // handled separately.
+      // handled separately. -32 is 0x8000 on real hardware.
       clamp_rgb_low = clamp_alpha_low = -32.0f;
-      clamp_rgb_high = clamp_alpha_high = 32.0f;
+      clamp_rgb_high = clamp_alpha_high = 32767.0f / 1024.0f;
       if (!(write_mask & 0b0001)) {
         keep_mask_low |= 0xFFFFu;
       }
@@ -342,10 +373,31 @@ void RenderTargetCache::GetPSIColorFormatInfo(
   }
 }
 
+bool RenderTargetCache::ColorOverlapsDepthStencil(
+    xenos::ColorRenderTargetFormat color_format, uint32_t color_keep_mask_low,
+    uint32_t color_keep_mask_high,
+    reg::RB_DEPTHCONTROL normalized_depth_control) {
+  uint32_t depth_stencil_used_bits = 0;
+  if (normalized_depth_control.z_enable) {
+    depth_stencil_used_bits |= 0xFFFFFF00u;
+  }
+  if (normalized_depth_control.stencil_enable) {
+    depth_stencil_used_bits |= 0x000000FFu;
+  }
+  uint32_t color_written_bits = ~color_keep_mask_low;
+  if (xenos::IsColorRenderTargetFormat64bpp(color_format)) {
+    // Conservatively treat either half as overlapping a 32bpp depth sample.
+    color_written_bits |= ~color_keep_mask_high;
+  }
+  return (color_written_bits & depth_stencil_used_bits) != 0;
+}
+
 uint32_t RenderTargetCache::Transfer::GetRangeRectangles(
-    uint32_t start_tiles, uint32_t end_tiles, uint32_t base_tiles,
-    uint32_t pitch_tiles, xenos::MsaaSamples msaa_samples, bool is_64bpp,
-    Rectangle* rectangles_out, const Rectangle* cutout) {
+    uint32_t start_tiles, uint32_t end_tiles, RenderTargetKey key,
+    bool is_64bpp, Rectangle* rectangles_out, const Rectangle* cutout) {
+  uint32_t base_tiles = key.base_tiles;
+  uint32_t pitch_tiles = key.GetPitchTiles();
+  xenos::MsaaSamples msaa_samples = key.msaa_samples;
   // EDRAM addressing wrapping must be handled by doing GetRangeRectangles for
   // two clamped ranges, in this case start_tiles == end_tiles will also
   // unambiguously mean an empty range rather than the entire EDRAM.
@@ -367,11 +419,8 @@ uint32_t RenderTargetCache::Transfer::GetRangeRectangles(
   // If the first and / or the last rows have the same X spans as the middle
   // part, merge them with it.
   uint32_t rectangle_count = 0;
-  // If start_tiles < base_tiles, this is the tail after EDRAM addressing
-  // wrapping.
-  uint32_t local_offset = start_tiles < base_tiles ? xenos::kEdramTileCount : 0;
-  uint32_t local_start = local_offset + start_tiles - base_tiles;
-  uint32_t local_end = local_offset + end_tiles - base_tiles;
+  uint32_t local_start = key.GetNonWrappedTileIndex(start_tiles) - base_tiles;
+  uint32_t local_end = local_start + (end_tiles - start_tiles);
   // Inclusive.
   uint32_t rows_start = local_start / pitch_tiles;
   // Exclusive.
@@ -517,6 +566,18 @@ void RenderTargetCache::InitializeCommon() {
       std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
       std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
                             RenderTargetKey(), RenderTargetKey()));
+
+  if (cvars::draw_resolution_scale_threshold) {
+    if (GetPath() != Path::kHostRenderTargets) {
+      XELOGW(
+          "draw_resolution_scale_threshold is only supported by the host "
+          "render target path - ignoring");
+    } else if (!IsDrawResolutionScaled()) {
+      XELOGW(
+          "draw_resolution_scale_threshold has no effect without "
+          "draw_resolution_scale_x/y above 1 - ignoring");
+    }
+  }
 }
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
@@ -543,20 +604,9 @@ void RenderTargetCache::ClearCache() {
   if (!render_targets_.empty()) {
     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher>
         used_render_targets;
-    for (const auto& ownership_range_pair : ownership_ranges_) {
-      const OwnershipRange& ownership_range = ownership_range_pair.second;
-      if (!ownership_range.render_target.IsEmpty()) {
-        used_render_targets.emplace(ownership_range.render_target);
-      }
-      if (!ownership_range.host_depth_render_target_unorm24.IsEmpty()) {
-        used_render_targets.emplace(
-            ownership_range.host_depth_render_target_unorm24);
-      }
-      if (!ownership_range.host_depth_render_target_float24.IsEmpty()) {
-        used_render_targets.emplace(
-            ownership_range.host_depth_render_target_float24);
-      }
-    }
+    ForEachEdramOwner([&used_render_targets](RenderTargetKey owner) {
+      used_render_targets.emplace(owner);
+    });
     if (render_targets_.size() != used_render_targets.size()) {
       typename decltype(render_targets_)::iterator it_next;
       for (auto it = render_targets_.begin(); it != render_targets_.end();
@@ -578,12 +628,105 @@ void RenderTargetCache::ClearCache() {
 
 void RenderTargetCache::BeginFrame() { ResetAccumulatedRenderTargets(); }
 
+int32_t RenderTargetCache::GetWindowOffsetTiles(
+    const RegisterFile& regs, reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask, uint64_t frame) {
+  bool kept_in_viewport;
+  int32_t window_offset_tiles = draw_util::GetWindowOffsetTiles(
+      regs, normalized_depth_control, normalized_color_mask,
+      GetPath() == Path::kHostRenderTargets, kept_in_viewport);
+  if (!window_offset_tiles && !kept_in_viewport) {
+    return 0;
+  }
+
+  window_offsets_kept_in_viewport_.erase(
+      std::remove_if(window_offsets_kept_in_viewport_.begin(),
+                     window_offsets_kept_in_viewport_.end(),
+                     [frame](const WindowOffsetKeptInViewport& kept) {
+                       return kept.frame + 1 < frame;
+                     }),
+      window_offsets_kept_in_viewport_.end());
+  auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  auto kept_it = std::find_if(
+      window_offsets_kept_in_viewport_.begin(),
+      window_offsets_kept_in_viewport_.end(),
+      [&pa_sc_window_offset,
+       &rb_surface_info](const WindowOffsetKeptInViewport& kept) {
+        return kept.window_offset == pa_sc_window_offset.value &&
+               kept.surface_pitch == rb_surface_info.surface_pitch &&
+               kept.msaa_samples == rb_surface_info.msaa_samples;
+      });
+
+  if (kept_it != window_offsets_kept_in_viewport_.end()) {
+    // Refresh on every draw of the tile, not just the ones kept in the
+    // viewport, so a reason that comes and goes doesn't flip the tile between
+    // the paths.
+    kept_it->frame = frame;
+    return 0;
+  }
+
+  if (kept_in_viewport) {
+    window_offsets_kept_in_viewport_.push_back(
+        {pa_sc_window_offset.value, rb_surface_info.surface_pitch,
+         rb_surface_info.msaa_samples, frame});
+    return 0;
+  }
+
+  return window_offset_tiles;
+}
+
+bool RenderTargetCache::IsScaleNativeForPitch(
+    uint32_t pitch_tiles_at_32bpp, xenos::MsaaSamples msaa_samples) const {
+  uint32_t threshold = cvars::draw_resolution_scale_threshold;
+  if (!threshold || !IsDrawResolutionScaled() ||
+      GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  // Pitch is the only guest surface dimension that's reliably known since host
+  // render target heights are overestimated to cover all EDRAM, and draw height
+  // estimates would flip the same surface between classes and churn transfers.
+  // Pitch and MSAA are also shared by every surface of a draw so depth and
+  // color always land in the same class.
+  uint32_t pitch_pixels_tile_aligned =
+      RenderTargetKey::GetWidth(pitch_tiles_at_32bpp, msaa_samples);
+  return pitch_pixels_tile_aligned != 0 &&
+         pitch_pixels_tile_aligned <= threshold;
+}
+
+bool RenderTargetCache::IsDrawScaleNative() const {
+  auto rb_surface_info = register_file().Get<reg::RB_SURFACE_INFO>();
+  // Same pitch normalization as in Update.
+  uint32_t msaa_samples_x_log2 =
+      uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X);
+  uint32_t pitch_tiles_at_32bpp =
+      ((rb_surface_info.surface_pitch << msaa_samples_x_log2) +
+       (xenos::kEdramTileWidthSamples - 1)) /
+      xenos::kEdramTileWidthSamples;
+  return IsScaleNativeForPitch(pitch_tiles_at_32bpp,
+                               rb_surface_info.msaa_samples);
+}
+
+// Whether blending reads the render target's current contents. A channel the
+// draw doesn't write can't store a blend result, so its factor says nothing.
+// The operation doesn't matter, the Xenos applies the factors to MIN and MAX
+// too unlike hosts.
+static bool DoesBlendReadDestination(reg::RB_BLENDCONTROL blend_control,
+                                     uint32_t write_mask) {
+  return ((write_mask & 0b0111) &&
+          blend_control.color_destblend != xenos::BlendFactor::kZero) ||
+         ((write_mask & 0b1000) &&
+          blend_control.alpha_destblend != xenos::BlendFactor::kZero);
+}
+
 bool RenderTargetCache::Update(bool is_rasterization_done,
                                reg::RB_DEPTHCONTROL normalized_depth_control,
                                uint32_t normalized_color_mask,
-                               const Shader& vertex_shader) {
+                               const Shader& vertex_shader,
+                               int32_t window_offset_tiles) {
   const RegisterFile& regs = register_file();
   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
+  last_update_draw_target_ = RenderTargetKey();
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
@@ -613,11 +756,13 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   uint32_t pitch_tiles_at_32bpp = ((pitch_pixels << msaa_samples_x_log2) +
                                    (xenos::kEdramTileWidthSamples - 1)) /
                                   xenos::kEdramTileWidthSamples;
+  // Scale class of all the surfaces of this draw.
+  bool scale_native = IsScaleNativeForPitch(pitch_tiles_at_32bpp, msaa_samples);
   if (!interlock_barrier_only) {
     uint32_t pitch_pixels_tile_aligned_scaled =
         pitch_tiles_at_32bpp *
         (xenos::kEdramTileWidthSamples >> msaa_samples_x_log2) *
-        draw_resolution_scale_x();
+        (scale_native ? 1 : draw_resolution_scale_x());
     uint32_t max_render_target_width = GetMaxRenderTargetWidth();
     if (pitch_pixels_tile_aligned_scaled > max_render_target_width) {
       // TODO(Triang3l): If really needed for some game on some device, clamp
@@ -640,14 +785,24 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   uint32_t depth_and_color_rts_used_bits = 0;
   // depth_and_color_rts_used_bits -> EDRAM base.
   uint32_t edram_bases[1 + xenos::kMaxColorRenderTargets];
+  // Guest bases for the aliasing tests, the window offset in the bases moves
+  // 64bpp ones twice as far and can bring render targets that don't overlap to
+  // one base.
+  uint32_t guest_bases[1 + xenos::kMaxColorRenderTargets];
   uint32_t resource_formats[1 + xenos::kMaxColorRenderTargets];
   uint32_t rts_are_64bpp = 0;
+  // One bit per color render target, unshifted unlike the used bits.
+  uint32_t color_rts_blend_reading_dest = 0;
+  // Color targets that leave the depth bits untouched.
+  bool rts_keep_depth_bits[1 + xenos::kMaxColorRenderTargets] = {};
   if (is_rasterization_done) {
     if (normalized_depth_control.z_enable ||
         normalized_depth_control.stencil_enable) {
       depth_and_color_rts_used_bits |= 1;
       auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-      edram_bases[0] = rb_depth_info.depth_base;
+      edram_bases[0] = draw_util::AddWindowOffsetToEdramBase(
+          rb_depth_info.depth_base, window_offset_tiles, false);
+      guest_bases[0] = rb_depth_info.depth_base;
       // With pixel shader interlock, always the same addressing disregarding
       // the format.
       resource_formats[0] =
@@ -661,12 +816,17 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
           reg::RB_COLOR_INFO::rt_register_indices[i]);
       uint32_t rt_bit_index = 1 + i;
       depth_and_color_rts_used_bits |= uint32_t(1) << rt_bit_index;
-      edram_bases[rt_bit_index] = color_info.color_base;
-      xenos::ColorRenderTargetFormat color_format =
-          regs.Get<reg::RB_COLOR_INFO>(
-                  reg::RB_COLOR_INFO::rt_register_indices[i])
-              .color_format;
+      if (DoesBlendReadDestination(
+              regs.Get<reg::RB_BLENDCONTROL>(
+                  reg::RB_BLENDCONTROL::rt_register_indices[i]),
+              (normalized_color_mask >> (4 * i)) & 0b1111)) {
+        color_rts_blend_reading_dest |= uint32_t(1) << i;
+      }
+      xenos::ColorRenderTargetFormat color_format = color_info.color_format;
       bool is_64bpp = xenos::IsColorRenderTargetFormat64bpp(color_format);
+      edram_bases[rt_bit_index] = draw_util::AddWindowOffsetToEdramBase(
+          color_info.color_base, window_offset_tiles, is_64bpp);
+      guest_bases[rt_bit_index] = color_info.color_base;
       if (is_64bpp) {
         rts_are_64bpp |= uint32_t(1) << rt_bit_index;
       }
@@ -683,11 +843,60 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
             GetColorResourceFormat(xenos::GetStorageColorFormat(color_format));
       }
       resource_formats[rt_bit_index] = uint32_t(color_resource_format);
+      if (!interlock_barrier_only && !is_64bpp) {
+        float unused_clamp[4];
+        uint32_t keep_mask_low, keep_mask_high;
+        GetPSIColorFormatInfo(color_format,
+                              (normalized_color_mask >> (i * 4)) & 0b1111,
+                              unused_clamp[0], unused_clamp[1], unused_clamp[2],
+                              unused_clamp[3], keep_mask_low, keep_mask_high);
+        rts_keep_depth_bits[rt_bit_index] = !(~keep_mask_low & 0xFFFFFF00u);
+      }
     }
   }
 
   uint32_t rts_remaining;
   uint32_t rt_index;
+
+  // A shared EDRAM base address doesn't necessarily mean the targets conflict
+  // with each other. 4D530A26 writes post-process data into the stencil byte
+  // of a 8_8_8_8 color target while simultaneously reading depth. Other MRT
+  // setups probably use similar aliasing tricks.
+  //
+  // To handle this, color target is given ownership of the range, but the
+  // current depth target is kept bound as read-only as long as the write ranges
+  // don't overlap.
+  bool keep_aliased_depth = false;
+  if (!interlock_barrier_only && cvars::aliased_depth_read_only &&
+      (depth_and_color_rts_used_bits & 1) &&
+      normalized_depth_control.z_enable &&
+      !normalized_depth_control.z_write_enable &&
+      !normalized_depth_control.stencil_enable) {
+    uint32_t depth_base = guest_bases[0];
+    for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!(depth_and_color_rts_used_bits & (uint32_t(1) << i)) ||
+          guest_bases[i] != depth_base) {
+        continue;
+      }
+      if (!rts_keep_depth_bits[i]) {
+        keep_aliased_depth = false;
+        break;
+      }
+      keep_aliased_depth = true;
+    }
+  }
+
+  // The color owner can't preserve depth if this draw also writes it.
+  if (!interlock_barrier_only && (depth_and_color_rts_used_bits & 1) &&
+      normalized_depth_control.z_write_enable) {
+    uint32_t depth_base = guest_bases[0];
+    for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if ((depth_and_color_rts_used_bits & (uint32_t(1) << i)) &&
+          guest_bases[i] == depth_base) {
+        rts_keep_depth_bits[i] = false;
+      }
+    }
+  }
 
   // Eliminate other bound render targets if their EDRAM base conflicts with
   // another render target - it's an error in most host implementations to bind
@@ -711,14 +920,17 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   rts_remaining = depth_and_color_rts_used_bits & ~(uint32_t(1));
   while (xe::bit_scan_forward(rts_remaining, &rt_index)) {
     rts_remaining &= ~(uint32_t(1) << rt_index);
-    uint32_t edram_base = edram_bases[rt_index];
+    uint32_t guest_base = guest_bases[rt_index];
     uint32_t rts_other_remaining =
         depth_and_color_rts_used_bits &
         (~((uint32_t(1) << (rt_index + 1)) - 1) | uint32_t(1));
     uint32_t rt_other_index;
     while (xe::bit_scan_forward(rts_other_remaining, &rt_other_index)) {
       rts_other_remaining &= ~(uint32_t(1) << rt_other_index);
-      if (edram_bases[rt_other_index] == edram_base) {
+      if (guest_bases[rt_other_index] == guest_base) {
+        if (rt_other_index == 0 && keep_aliased_depth) {
+          continue;
+        }
         depth_and_color_rts_used_bits &= ~(uint32_t(1) << rt_other_index);
       }
     }
@@ -736,6 +948,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     // just check if old bindings can still be used.
     std::memset(last_update_used_render_targets_, 0,
                 sizeof(last_update_used_render_targets_));
+    std::memset(last_update_blend_reading_color_rts_, 0,
+                sizeof(last_update_blend_reading_color_rts_));
     if (are_accumulated_render_targets_valid_) {
       for (size_t i = 0;
            i < xe::countof(last_update_accumulated_render_targets_); ++i) {
@@ -761,13 +975,35 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
 
   // Estimate height used by render targets (for color for writes, for depth /
   // stencil for both reads and writes) from various sources.
-  uint32_t height_used = std::min(
-      GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples),
-      draw_extent_estimator_.EstimateMaxY(
-          interlock_barrier_only
-              ? cvars::execute_unclipped_draw_vs_on_cpu_for_psi_render_backend
-              : true,
-          vertex_shader));
+  uint32_t height_used = draw_extent_estimator_.EstimateMaxY(
+      interlock_barrier_only
+          ? cvars::execute_unclipped_draw_vs_on_cpu_for_psi_render_backend
+          : true,
+      vertex_shader, window_offset_tiles != 0);
+  if (!(interlock_barrier_only && window_offset_tiles)) {
+    // Don't clamp an interlock range with the window offset in the bases to
+    // the period, it runs on into the next one and the shader wraps the
+    // addresses, the third tile of 1280x720 4x ends 832 tiles into it. Host
+    // render targets keep the offset in the viewport past the period.
+    height_used = std::min(
+        height_used, GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples));
+  }
+
+  RenderTargetKey rt_keys[1 + xenos::kMaxColorRenderTargets] = {};
+  RenderTarget* rts[1 + xenos::kMaxColorRenderTargets] = {};
+
+  // Read-only aliased depth doesn't participate in the ownership layout.
+  uint32_t ownership_rts_used_bits = depth_and_color_rts_used_bits;
+  if (keep_aliased_depth) {
+    ownership_rts_used_bits &= ~uint32_t(1);
+    RenderTargetKey& depth_key = rt_keys[0];
+    depth_key.base_tiles = edram_bases[0];
+    depth_key.pitch_tiles_at_32bpp = pitch_tiles_at_32bpp;
+    depth_key.msaa_samples = msaa_samples;
+    depth_key.is_depth = 1;
+    depth_key.resource_format = resource_formats[0];
+    depth_key.scale_native = uint32_t(scale_native);
+  }
 
   // Sorted by EDRAM base and then by index in the pipeline - for simplicity,
   // treat render targets placed closer to the end of the EDRAM as truncating
@@ -783,7 +1019,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   std::pair<uint32_t, uint32_t>
       edram_bases_sorted[1 + xenos::kMaxColorRenderTargets];
   uint32_t edram_bases_sorted_count = 0;
-  rts_remaining = depth_and_color_rts_used_bits;
+  rts_remaining = ownership_rts_used_bits;
   while (xe::bit_scan_forward(rts_remaining, &rt_index)) {
     rts_remaining &= ~(uint32_t(1) << rt_index);
     edram_bases_sorted[edram_bases_sorted_count++] =
@@ -798,7 +1034,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // tiles, and a 64bpp color buffer at 675 requiring 1350 tiles, but the
   // smallest distance between two render target bases is 675 tiles).
   uint32_t rt_max_distance_tiles_at_64bpp = xenos::kEdramTileCount * 2;
-  if (cvars::mrt_edram_used_range_clamp_to_min &&
+  if (!window_offset_tiles && cvars::mrt_edram_used_range_clamp_to_min &&
       edram_bases_sorted_count >= 2) {
     for (uint32_t i = 1; i < edram_bases_sorted_count; ++i) {
       const std::pair<uint32_t, uint32_t>& rt_base_prev =
@@ -821,13 +1057,38 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
 
   // Make sure all the needed render targets are created, and gather lengths of
   // ranges used by each render target.
-  RenderTargetKey rt_keys[1 + xenos::kMaxColorRenderTargets];
-  RenderTarget* rts[1 + xenos::kMaxColorRenderTargets];
   uint32_t rt_lengths_tiles[1 + xenos::kMaxColorRenderTargets];
+  uint32_t rt_starts_tiles[1 + xenos::kMaxColorRenderTargets];
   uint32_t length_used_tiles_at_32bpp =
       ((height_used << uint32_t(msaa_samples >= xenos::MsaaSamples::k2X)) +
        (xenos::kEdramTileHeightSamples - 1)) /
       xenos::kEdramTileHeightSamples * pitch_tiles_at_32bpp;
+  // Start the ranges at the scissor with the window offset in the bases,
+  // without clamping between the bases. The draw touches nothing between a
+  // base and the scissor top, and a range starting past the base distance
+  // would be cut to nothing. An x offset shifts the whole range by its tiles,
+  // the scissor's left tile is past the pitch in the next row and the last
+  // row runs that far past it.
+  uint32_t start_used_tiles_at_32bpp = 0;
+  if (window_offset_tiles) {
+    draw_util::Scissor scissor;
+    draw_util::GetScissor(regs, scissor, true, true);
+    uint32_t msaa_samples_x_log2 =
+        uint32_t(msaa_samples >= xenos::MsaaSamples::k4X);
+    start_used_tiles_at_32bpp =
+        (scissor.offset[1] << uint32_t(msaa_samples >=
+                                       xenos::MsaaSamples::k2X)) /
+            xenos::kEdramTileHeightSamples * pitch_tiles_at_32bpp +
+        (scissor.offset[0] << msaa_samples_x_log2) /
+            xenos::kEdramTileWidthSamples;
+    uint32_t right_tiles_at_32bpp =
+        (((scissor.offset[0] + scissor.extent[0]) << msaa_samples_x_log2) +
+         (xenos::kEdramTileWidthSamples - 1)) /
+        xenos::kEdramTileWidthSamples;
+    if (right_tiles_at_32bpp > pitch_tiles_at_32bpp) {
+      length_used_tiles_at_32bpp += right_tiles_at_32bpp - pitch_tiles_at_32bpp;
+    }
+  }
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_base = rt_base_index.first;
@@ -838,6 +1099,23 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     rt_key.msaa_samples = msaa_samples;
     rt_key.is_depth = rt_bit_index == 0;
     rt_key.resource_format = resource_formats[rt_bit_index];
+    rt_key.scale_native = uint32_t(scale_native);
+    uint32_t rt_is_64bpp = (rts_are_64bpp >> rt_bit_index) & 1;
+    uint32_t range_start_tiles = 0;
+    uint32_t range_end_tiles = 0;
+    if (window_offset_tiles) {
+      range_start_tiles = start_used_tiles_at_32bpp << rt_is_64bpp;
+      range_end_tiles = length_used_tiles_at_32bpp << rt_is_64bpp;
+      if (!interlock_barrier_only) {
+        // Take the render target of the period the scissor top is in and end
+        // the range with it, 64bpp color rows span two.
+        rt_key.next_period = std::min(
+            range_start_tiles >> xenos::kEdramBaseTilesBits, uint32_t(1));
+        range_end_tiles =
+            std::min(range_end_tiles, (uint32_t(rt_key.next_period) + 1)
+                                          << xenos::kEdramBaseTilesBits);
+      }
+    }
     if (!interlock_barrier_only) {
       RenderTarget* render_target = GetOrCreateRenderTarget(rt_key);
       if (!render_target) {
@@ -845,17 +1123,52 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       }
       rts[rt_bit_index] = render_target;
     }
-    uint32_t rt_is_64bpp = (rts_are_64bpp >> rt_bit_index) & 1;
-    // The last render target can occupy the EDRAM until the base of the first
-    // render target (itself in case of 1 render target) with EDRAM addressing
-    // wrapping.
-    rt_lengths_tiles[i] = std::min(
-        std::min(length_used_tiles_at_32bpp << rt_is_64bpp,
-                 rt_max_distance_tiles_at_64bpp >> (rt_is_64bpp ^ 1)),
-        ((i + 1 < edram_bases_sorted_count)
-             ? edram_bases_sorted[i + 1].first
-             : (xenos::kEdramTileCount + edram_bases_sorted[0].first)) -
-            rt_base);
+    if (window_offset_tiles) {
+      // Wrap the start into the period and take at most one period from it.
+      // ChangeOwnership wraps a range crossing the end of EDRAM, like the last
+      // render target wrapping to the first base below.
+      rt_starts_tiles[i] = range_start_tiles & (xenos::kEdramTileCount - 1);
+      rt_lengths_tiles[i] = std::min(range_end_tiles > range_start_tiles
+                                         ? range_end_tiles - range_start_tiles
+                                         : uint32_t(0),
+                                     xenos::kEdramTileCount);
+    } else {
+      rt_starts_tiles[i] = 0;
+      // The last render target can occupy the EDRAM until the base of the
+      // first render target (itself in case of 1 render target) with EDRAM
+      // addressing wrapping.
+      rt_lengths_tiles[i] = std::min(
+          std::min(length_used_tiles_at_32bpp << rt_is_64bpp,
+                   rt_max_distance_tiles_at_64bpp >> (rt_is_64bpp ^ 1)),
+          ((i + 1 < edram_bases_sorted_count)
+               ? edram_bases_sorted[i + 1].first
+               : (xenos::kEdramTileCount + edram_bases_sorted[0].first)) -
+              rt_base);
+    }
+  }
+
+  if (keep_aliased_depth) {
+    // The host depth must be current for the color owner's whole range.
+    uint32_t alias_start_tiles = 0;
+    uint32_t alias_length_tiles = 0;
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      if (edram_bases_sorted[i].first == edram_bases[0]) {
+        alias_start_tiles = rt_starts_tiles[i];
+        alias_length_tiles = rt_lengths_tiles[i];
+        break;
+      }
+    }
+    if (IsHostDepthCurrent(rt_keys[0], alias_start_tiles, alias_length_tiles)) {
+      rts[0] = GetOrCreateRenderTarget(rt_keys[0]);
+      if (!rts[0]) {
+        return false;
+      }
+    } else {
+      keep_aliased_depth = false;
+      depth_and_color_rts_used_bits &= ~uint32_t(1);
+      // Don't leave stale accumulated depth bound.
+      are_accumulated_render_targets_valid_ = false;
+    }
   }
 
   if (interlock_barrier_only) {
@@ -864,19 +1177,31 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     // barrier if an overlap is encountered later between pre-barrier and
     // post-barrier usages), check if any overlap requiring a barrier happens,
     // and then insert the barrier if needed.
-    bool interlock_barrier_needed = false;
-    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
-      const std::pair<uint32_t, uint32_t>& rt_base_index =
-          edram_bases_sorted[i];
-      if (WouldOwnershipChangeRequireTransfers(rt_keys[rt_base_index.second], 0,
-                                               rt_lengths_tiles[i])) {
-        interlock_barrier_needed = true;
-        break;
+    // Take a barrier when the offset in the bases differs from the last
+    // draw's. Two pixels can reach one word under one key then, an x offset
+    // past the pitch or y offsets a period apart, and the interlock only
+    // orders a pixel against itself.
+    uint32_t interlock_window_offset =
+        window_offset_tiles ? regs.Get<reg::PA_SC_WINDOW_OFFSET>().value : 0;
+    bool interlock_barrier_needed =
+        interlock_last_window_offset_ != UINT32_MAX &&
+        interlock_window_offset != interlock_last_window_offset_;
+    if (!interlock_barrier_needed) {
+      for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+        const std::pair<uint32_t, uint32_t>& rt_base_index =
+            edram_bases_sorted[i];
+        if (WouldOwnershipChangeRequireTransfers(rt_keys[rt_base_index.second],
+                                                 rt_starts_tiles[i],
+                                                 rt_lengths_tiles[i])) {
+          interlock_barrier_needed = true;
+          break;
+        }
       }
     }
     if (interlock_barrier_needed) {
       RequestPixelShaderInterlockBarrier();
     }
+    interlock_last_window_offset_ = interlock_window_offset;
   }
 
   // From now on ownership transfers should succeed for simplicity and
@@ -884,13 +1209,31 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // draw with whatever contents currently are in the render target in this
   // case).
 
+  uint32_t draw_target_index;
+  if (xe::bit_scan_forward(depth_and_color_rts_used_bits & ~uint32_t(1),
+                           &draw_target_index) ||
+      xe::bit_scan_forward(depth_and_color_rts_used_bits, &draw_target_index)) {
+    last_update_draw_target_ = rt_keys[draw_target_index];
+  }
+
+  // Slots dropped by the EDRAM base conflict elimination aren't drawn to.
+  uint32_t color_rts_blend_reading_dest_used =
+      color_rts_blend_reading_dest & (depth_and_color_rts_used_bits >> 1);
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    last_update_blend_reading_color_rts_[i] =
+        (color_rts_blend_reading_dest_used & (uint32_t(1) << i))
+            ? rt_keys[1 + i]
+            : RenderTargetKey();
+  }
+
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_bit_index = rt_base_index.second;
-    ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
-                    interlock_barrier_only
-                        ? nullptr
-                        : &last_update_transfers_[rt_bit_index]);
+    ChangeOwnership(
+        rt_keys[rt_bit_index], rt_starts_tiles[i], rt_lengths_tiles[i],
+        interlock_barrier_only ? nullptr
+                               : &last_update_transfers_[rt_bit_index],
+        nullptr, rts_keep_depth_bits[rt_bit_index]);
   }
 
   if (interlock_barrier_only) {
@@ -969,6 +1312,74 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   }
 
   return true;
+}
+
+bool RenderTargetCache::TrackLastUpdateDrawTarget(uint64_t frame) {
+  if (last_update_draw_target_.IsEmpty()) {
+    return true;
+  }
+  std::pair<uint64_t, uint64_t>& frames =
+      draw_target_last_frames_[last_update_draw_target_];
+  if (frames.first != frame) {
+    frames.second = frames.first;
+    frames.first = frame;
+  }
+  // Frame 0 is never. A pass drawn every frame may still miss one (4E4D083A).
+  return frames.second && frame - frames.second <= kDrawTargetRecurringFrames;
+}
+
+static bool IsAsyncShaderInlineHash(uint64_t hash) {
+  const char* list = cvars::async_shader_inline_hashes.c_str();
+  while (*list) {
+    char* end;
+    uint64_t list_hash = std::strtoull(list, &end, 16);
+    if (end == list) {
+      ++list;
+      continue;
+    }
+    if (list_hash == hash) {
+      return true;
+    }
+    list = end;
+  }
+  return false;
+}
+
+const char* RenderTargetCache::GetPipelineStandInWaitReason(
+    uint64_t frame, Shader& vertex_shader, const Shader* pixel_shader,
+    bool vertex_memexport_used, bool pixel_memexport_used,
+    bool storage_warm_up_running) {
+  bool draw_target_recurring = TrackLastUpdateDrawTarget(frame);
+  bool vertex_shader_drawn = vertex_shader.is_drawn();
+  vertex_shader.set_drawn();
+  if (IsAsyncShaderInlineHash(vertex_shader.ucode_data_hash()) ||
+      (pixel_shader &&
+       IsAsyncShaderInlineHash(pixel_shader->ucode_data_hash()))) {
+    return "async_shader_inline_hashes";
+  }
+  if (storage_warm_up_running) {
+    return "storage warm-up";
+  }
+  if (IsLastUpdateDrawTargetSmall()) {
+    return "small render target";
+  }
+  if (pixel_memexport_used) {
+    return "pixel memexport";
+  }
+  // A recurring render target says nothing about memexport output.
+  if (vertex_memexport_used && !vertex_shader_drawn) {
+    return "new memexport VS";
+  }
+  if (!draw_target_recurring && !vertex_shader_drawn) {
+    return "new VS, not drawn recently";
+  }
+  return nullptr;
+}
+
+std::string RenderTargetCache::GetLastUpdateDrawTargetName() const {
+  return last_update_draw_target_.IsEmpty()
+             ? std::string("no RT")
+             : last_update_draw_target_.GetDebugName();
 }
 
 uint32_t RenderTargetCache::GetLastUpdateBoundRenderTargets(
@@ -1141,6 +1552,77 @@ void RenderTargetCache::GetResolveCopyRectanglesToDump(
   }
 }
 
+bool RenderTargetCache::IsResolveSourceNativeOnly(uint32_t base,
+                                                  uint32_t row_length,
+                                                  uint32_t rows,
+                                                  uint32_t pitch) const {
+  if (!IsDrawResolutionScaled() || GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  std::vector<ResolveCopyDumpRectangle> rectangles;
+  GetResolveCopyRectanglesToDump(base, row_length, rows, pitch, rectangles);
+  if (rectangles.empty()) {
+    return false;
+  }
+  for (const ResolveCopyDumpRectangle& rectangle : rectangles) {
+    assert_not_null(rectangle.render_target);
+    if (!rectangle.render_target->key().scale_native) {
+      return false;
+    }
+  }
+  return true;
+}
+
+RenderTargetCache::DirectResolveEligibility
+RenderTargetCache::GetDirectResolveEligibility(
+    const draw_util::ResolveInfo& resolve_info,
+    draw_util::ResolveCopyShaderIndex copy_shader) const {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return DirectResolveEligibility::kNotHostRenderTargets;
+  }
+  switch (copy_shader) {
+    case draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA:
+    case draw_util::ResolveCopyShaderIndex::kFast32bpp4xMSAA:
+    case draw_util::ResolveCopyShaderIndex::kFast64bpp1x2xMSAA:
+    case draw_util::ResolveCopyShaderIndex::kFast64bpp4xMSAA:
+      break;
+    default:
+      return DirectResolveEligibility::kConvertingCopyShader;
+  }
+  uint32_t base, row_length_used, rows, pitch;
+  resolve_info.GetCopyEdramTileSpan(base, row_length_used, rows, pitch);
+  std::vector<ResolveCopyDumpRectangle> rectangles;
+  GetResolveCopyRectanglesToDump(base, row_length_used, rows, pitch,
+                                 rectangles);
+  if (rectangles.empty()) {
+    return DirectResolveEligibility::kNoOwnership;
+  }
+
+  bool is_depth = resolve_info.IsCopyingDepth();
+  const draw_util::ResolveEdramInfo& edram_info =
+      is_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
+  uint64_t owned_tiles = 0;
+  for (const ResolveCopyDumpRectangle& rectangle : rectangles) {
+    assert_not_null(rectangle.render_target);
+    RenderTargetKey rt_key = rectangle.render_target->key();
+    // The dump packs samples in the render target's own layout and the copy
+    // reads them back in the resolve's, so only matching layouts can drop the
+    // buffer in between. Formats within a layout may still differ - the fast
+    // copy is bitwise and only picks a red/blue swap from the format.
+    if (rt_key.is_depth != uint32_t(is_depth) ||
+        rt_key.msaa_samples != edram_info.msaa_samples ||
+        uint32_t(rt_key.Is64bpp()) != edram_info.format_is_64bpp) {
+      return DirectResolveEligibility::kSourceLayoutMismatch;
+    }
+    owned_tiles += rectangle.GetTileCount(row_length_used);
+  }
+  if (owned_tiles != uint64_t(row_length_used) * rows) {
+    return DirectResolveEligibility::kPartialOwnership;
+  }
+
+  return DirectResolveEligibility::kEligible;
+}
+
 bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     const draw_util::ResolveInfo& resolve_info,
     Transfer::Rectangle& clear_rectangle_out,
@@ -1149,6 +1631,11 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     RenderTarget*& color_render_target_out,
     std::vector<Transfer>& color_transfers_out) {
   assert_true(GetPath() == Path::kHostRenderTargets);
+
+  // These transfers precede a clear rather than a draw, so drop the last
+  // draw's blending and keep IsTransferValueConverted7e3And8888 bit-exact.
+  std::memset(last_update_blend_reading_color_rts_, 0,
+              sizeof(last_update_blend_reading_color_rts_));
 
   uint32_t pitch_tiles_at_32bpp;
   uint32_t base_offset_tiles_at_32bpp;
@@ -1173,6 +1660,15 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     return false;
   }
   assert_true(msaa_samples <= xenos::MsaaSamples::k4X);
+  if (msaa_samples > xenos::MsaaSamples::k4X) {
+    // Safety check because a lot of code assumes up to 4x, including arrays
+    // indexed by the sample count.
+    XELOGE(
+        "{}x MSAA requested by the guest in a resolve clear, Xenos only "
+        "supports up to 4x",
+        uint32_t(1) << uint32_t(msaa_samples));
+    return false;
+  }
   if (!pitch_tiles_at_32bpp) {
     return false;
   }
@@ -1194,7 +1690,9 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   uint32_t pitch_pixels =
       pitch_tiles_at_32bpp *
       (xenos::kEdramTileWidthSamples >> msaa_samples_x_log2);
-  uint32_t pitch_pixels_scaled = pitch_pixels * draw_resolution_scale_x();
+  bool scale_native = IsScaleNativeForPitch(pitch_tiles_at_32bpp, msaa_samples);
+  uint32_t pitch_pixels_scaled =
+      pitch_pixels * (scale_native ? 1 : draw_resolution_scale_x());
   uint32_t max_render_target_width = GetMaxRenderTargetWidth();
   if (pitch_pixels_scaled > max_render_target_width) {
     // TODO(Triang3l): If really needed for some game on some device, clamp the
@@ -1310,6 +1808,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     depth_render_target_key.is_depth = 1;
     depth_render_target_key.resource_format =
         resolve_info.depth_edram_info.format;
+    depth_render_target_key.scale_native = uint32_t(scale_native);
     depth_render_target = GetOrCreateRenderTarget(depth_render_target_key);
     if (!depth_render_target) {
       // Failed to create the depth render target, don't clear it.
@@ -1326,6 +1825,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     color_render_target_key.is_depth = 0;
     color_render_target_key.resource_format = uint32_t(GetColorResourceFormat(
         xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format)));
+    color_render_target_key.scale_native = uint32_t(scale_native);
     color_render_target = GetOrCreateRenderTarget(color_render_target_key);
     if (!color_render_target) {
       // Failed to create the color render target, don't clear it.
@@ -1354,6 +1854,48 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
         color_clear_length_tiles, &color_transfers_out, &clear_rectangle);
   }
   return true;
+}
+
+bool RenderTargetCache::InitializeTraceSubmitDownloads() {
+  if (IsDrawResolutionScaled()) {
+    // Scaled EDRAM has no 1:1 mapping to a guest snapshot.
+    return false;
+  }
+  if (GetPath() == Path::kHostRenderTargets) {
+    DumpAllRenderTargetsToEdram();
+  }
+  return BeginEdramSnapshotReadback();
+}
+
+void RenderTargetCache::InitializeTraceCompleteDownloads() {
+  const void* snapshot = MapEdramSnapshotReadback();
+  if (snapshot) {
+    assert_not_null(trace_writer_);
+    trace_writer_->WriteEdramSnapshot(snapshot);
+  } else {
+    XELOGE("Failed to map the EDRAM snapshot readback for frame tracing");
+  }
+  EndEdramSnapshotReadback();
+}
+
+bool RenderTargetCache::WriteEdramSnapshotToFile(
+    const std::filesystem::path& path) {
+  const void* snapshot = MapEdramSnapshotReadback();
+  bool written = false;
+  if (snapshot) {
+    FILE* file = xe::filesystem::OpenFile(path, "wb");
+    if (file) {
+      written = fwrite(snapshot, 1, xenos::kEdramSizeBytes, file) ==
+                xenos::kEdramSizeBytes;
+      fclose(file);
+    }
+  }
+  if (!written) {
+    XELOGE("Failed to write the EDRAM snapshot to {}",
+           xe::strip_pii(xe::path_to_utf8(path)));
+  }
+  EndEdramSnapshotReadback();
+  return written;
 }
 
 RenderTargetCache::RenderTarget*
@@ -1402,6 +1944,7 @@ RenderTargetCache::PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
 
 void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
   assert_true(GetPath() == Path::kPixelShaderInterlock);
+  interlock_last_window_offset_ = UINT32_MAX;
   // Clear ownership - any overlap of data written before the barrier is safe.
   OwnershipRange empty_range(xenos::kEdramTileCount, RenderTargetKey(),
                              RenderTargetKey(), RenderTargetKey());
@@ -1427,6 +1970,9 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(
   RenderTarget* render_target;
   if (it_rt != render_targets_.end()) {
     render_target = it_rt->second;
+  } else if (RenderTarget* reused_render_target = ReuseRenderTarget(key)) {
+    render_target = reused_render_target;
+    render_targets_.emplace(key, render_target);
   } else {
     render_target = CreateRenderTarget(key);
     uint32_t width = key.GetWidth();
@@ -1450,6 +1996,67 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(
     // Insert even if failed to create, not to try to create again.
     render_targets_.emplace(key, render_target);
   }
+  if (render_target) {
+    render_target->SetLastUseFrame(render_target_use_frame_);
+  }
+  return render_target;
+}
+
+RenderTargetCache::RenderTarget* RenderTargetCache::ReuseRenderTarget(
+    RenderTargetKey key) {
+  // The host size and format don't depend on the base.
+  auto GetShape = [](RenderTargetKey shape_key) {
+    shape_key.base_tiles = 0;
+    shape_key.next_period = 0;
+    return shape_key;
+  };
+  RenderTargetKey shape = GetShape(key);
+  bool owners_gathered = false;
+  auto it_reuse = render_targets_.end();
+  for (auto it = render_targets_.begin(); it != render_targets_.end(); ++it) {
+    const RenderTarget* render_target = it->second;
+    if (!render_target || GetShape(it->first) != shape ||
+        render_target_use_frame_ - render_target->last_use_frame() <
+            kRenderTargetReuseUnusedFrames ||
+        (it_reuse != render_targets_.end() &&
+         it_reuse->second->last_use_frame() <=
+             render_target->last_use_frame())) {
+      continue;
+    }
+    bool used_by_last_update = false;
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (last_update_used_render_targets_[i] == render_target ||
+          last_update_accumulated_render_targets_[i] == render_target) {
+        used_by_last_update = true;
+        break;
+      }
+    }
+    if (used_by_last_update) {
+      continue;
+    }
+    if (!owners_gathered) {
+      owners_gathered = true;
+      reuse_owners_.clear();
+      ForEachEdramOwner(
+          [this](RenderTargetKey owner) { reuse_owners_.push_back(owner); });
+    }
+    if (std::find(reuse_owners_.cbegin(), reuse_owners_.cend(), it->first) !=
+            reuse_owners_.cend() ||
+        !CanReuseRenderTarget(*render_target)) {
+      continue;
+    }
+    it_reuse = it;
+  }
+  if (it_reuse == render_targets_.end()) {
+    return nullptr;
+  }
+  RenderTarget* render_target = it_reuse->second;
+  RenderTargetKey old_key = it_reuse->first;
+  render_targets_.erase(it_reuse);
+  render_target->SetKey(key);
+  XELOGGPU("Reusing render target {} as {}", old_key.GetDebugName(),
+           key.GetDebugName());
+  RenderTargetReused(*render_target, old_key);
   return render_target;
 }
 
@@ -1462,32 +2069,56 @@ bool RenderTargetCache::IsTransferValueConverted7e3And8888(
       source.msaa_samples != dest.msaa_samples) {
     return false;
   }
-  auto is_7e3 = [](xenos::ColorRenderTargetFormat format) {
-    return format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
-           format == xenos::ColorRenderTargetFormat::
-                         k_2_10_10_10_FLOAT_AS_16_16_16_16;
-  };
-  // 7e3 -> plain 8_8_8_8 only. The reverse and gamma dests stay bit-exact.
-  if (!is_7e3(source.GetColorFormat()) ||
+  // 7e3 to plain 8_8_8_8 only. The reverse, and a gamma dest wherever its
+  // resource format is distinct, stay bit-exact.
+  if (xenos::GetStorageColorFormat(source.GetColorFormat()) !=
+          xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
       dest.GetColorFormat() != xenos::ColorRenderTargetFormat::k_8_8_8_8) {
     return false;
   }
-  // Decode only if the draw blends over the dest, so the bytes are actually
-  // read.
-  const RegisterFile& regs = register_file();
-  bool dest_blends = false;
-  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-    if (regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i])
-            .color_base != dest.base_tiles) {
+  // Only if the draw blends over the dest, so the bytes are actually read.
+  // Matching the whole key, as the blending of a slot that isn't drawn to
+  // says nothing about this dest.
+  for (RenderTargetKey blend_reading_rt :
+       last_update_blend_reading_color_rts_) {
+    if (blend_reading_rt == dest) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void RenderTargetCache::LogTransfers(
+    uint32_t render_target_count, RenderTarget* const* render_targets,
+    const std::vector<Transfer>* render_target_transfers,
+    const Transfer::Rectangle* resolve_clear_rectangle) const {
+  if (!cvars::log_transfers) {
+    return;
+  }
+  if (resolve_clear_rectangle) {
+    XELOGI("log_transfers: resolve clear {}x{} at {},{}",
+           resolve_clear_rectangle->width_pixels,
+           resolve_clear_rectangle->height_pixels,
+           resolve_clear_rectangle->x_pixels,
+           resolve_clear_rectangle->y_pixels);
+  }
+  for (uint32_t i = 0; i < render_target_count; ++i) {
+    const RenderTarget* dest = render_targets[i];
+    if (!dest) {
       continue;
     }
-    auto blend = regs.Get<reg::RB_BLENDCONTROL>(
-        reg::RB_BLENDCONTROL::rt_register_indices[i]);
-    dest_blends = blend.color_destblend != xenos::BlendFactor::kZero ||
-                  blend.alpha_destblend != xenos::BlendFactor::kZero;
-    break;
+    std::string dest_name = dest->key().GetDebugName();
+    for (const Transfer& transfer : render_target_transfers[i]) {
+      std::string host_depth_name;
+      if (transfer.host_depth_source) {
+        host_depth_name = ", host depth from " +
+                          transfer.host_depth_source->key().GetDebugName();
+      }
+      XELOGI("log_transfers: slot {}, {} <= {}, tiles [{}, {}){}", i, dest_name,
+             transfer.source->key().GetDebugName(), transfer.start_tiles,
+             transfer.end_tiles, host_depth_name);
+    }
   }
-  return dest_blends;
 }
 
 bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(
@@ -1557,10 +2188,47 @@ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(
   return false;
 }
 
+bool RenderTargetCache::IsHostDepthCurrent(RenderTargetKey depth_target,
+                                           uint32_t start_tiles_base_relative,
+                                           uint32_t length_tiles) const {
+  assert_true(GetPath() == Path::kHostRenderTargets);
+  assert_true(depth_target.is_depth);
+  assert_true(length_tiles <= xenos::kEdramTileCount);
+  if (!length_tiles) {
+    return true;
+  }
+  auto is_current_in_extent = [&](uint32_t extent_start,
+                                  uint32_t extent_end) -> bool {
+    auto it = ownership_ranges_.lower_bound(extent_start);
+    if (it != ownership_ranges_.cbegin()) {
+      auto it_pre = std::prev(it);
+      if (it_pre->second.end_tiles > extent_start) {
+        it = it_pre;
+      }
+    }
+    for (; it != ownership_ranges_.cend() && it->first < extent_end; ++it) {
+      // Empty and invalidated ranges are stale too.
+      if (it->second.depth_bits_target != depth_target) {
+        return false;
+      }
+    }
+    return true;
+  };
+  uint32_t start_tiles = (depth_target.base_tiles + start_tiles_base_relative) &
+                         (xenos::kEdramTileCount - 1);
+  uint32_t end_tiles = start_tiles + length_tiles;
+  if (!is_current_in_extent(start_tiles,
+                            std::min(end_tiles, xenos::kEdramTileCount))) {
+    return false;
+  }
+  return end_tiles <= xenos::kEdramTileCount ||
+         is_current_in_extent(0, end_tiles & (xenos::kEdramTileCount - 1));
+}
+
 void RenderTargetCache::ChangeOwnership(
     RenderTargetKey dest, uint32_t start_tiles_base_relative,
     uint32_t length_tiles, std::vector<Transfer>* transfers_append_out,
-    const Transfer::Rectangle* resolve_clear_cutout) {
+    const Transfer::Rectangle* resolve_clear_cutout, bool keep_depth_bits) {
   // xenos::kEdramTileCount with length 0 is fine if both the start and the end
   // are clamped to xenos::kEdramTileCount.
   assert_true(start_tiles_base_relative <=
@@ -1569,11 +2237,26 @@ void RenderTargetCache::ChangeOwnership(
   if (length_tiles == 0) {
     return;
   }
-  uint32_t dest_pitch_tiles = dest.GetPitchTiles();
-  bool dest_is_64bpp = dest.Is64bpp();
+  // Native scale render targets are kept out of host depth tracking entirely
+  // so the host depth buffer region only ever holds data at the global scale
+  // and transfers never read host depth across scale classes. Ranges keep
+  // their old scaled host owners, which is fine. Host depth is only used where
+  // it still round trips to guest depth. Sub threshold depth just loses
+  // float32 precision on round trips anyways.
   bool host_depth_encoding_different =
-      dest.is_depth && GetPath() == Path::kHostRenderTargets &&
+      dest.is_depth && !dest.scale_native &&
+      GetPath() == Path::kHostRenderTargets &&
       IsHostDepthEncodingDifferent(dest.GetDepthFormat());
+  // Depth targets and ordinary color writes replace the tracked depth bits.
+  bool dest_writes_depth_bits = GetPath() == Path::kHostRenderTargets &&
+                                (dest.is_depth || !keep_depth_bits);
+  // Split even an already-owned range if its depth bits must be refreshed.
+  auto is_claim_needed = [&](const OwnershipRange& range) -> bool {
+    if (!range.IsOwnedBy(dest, host_depth_encoding_different)) {
+      return true;
+    }
+    return dest_writes_depth_bits && range.depth_bits_target != dest;
+  };
   auto change_ownership_in_extent = [&](uint32_t extent_start,
                                         uint32_t extent_end) {
     // The map contains consecutive ranges, merged if the adjacent ones are the
@@ -1585,9 +2268,9 @@ void RenderTargetCache::ChangeOwnership(
     if (it != ownership_ranges_.begin()) {
       auto it_pre = std::prev(it);
       if (it_pre->second.end_tiles > extent_start &&
-          !it_pre->second.IsOwnedBy(dest, host_depth_encoding_different)) {
+          is_claim_needed(it_pre->second)) {
         // Different render target overlapping the range - split the head.
-        ownership_ranges_.emplace(extent_start, it_pre->second);
+        ownership_ranges_.emplace_hint(it, extent_start, it_pre->second);
         it_pre->second.end_tiles = extent_start;
         // Let the next loop do the transfer and needed merging and splitting
         // starting from the added tail.
@@ -1599,7 +2282,7 @@ void RenderTargetCache::ChangeOwnership(
         // Outside the touched extent already.
         break;
       }
-      if (it->second.IsOwnedBy(dest, host_depth_encoding_different)) {
+      if (!is_claim_needed(it->second)) {
         // Already owned by the needed render target - no need to transfer
         // anything.
         ++it;
@@ -1609,7 +2292,7 @@ void RenderTargetCache::ChangeOwnership(
       // (split in this case) or within it.
       if (it->second.end_tiles > extent_end) {
         // Split the tail.
-        ownership_ranges_.emplace(extent_end, it->second);
+        ownership_ranges_.emplace_hint(std::next(it), extent_end, it->second);
         it->second.end_tiles = extent_end;
       }
       if (transfers_append_out) {
@@ -1621,9 +2304,7 @@ void RenderTargetCache::ChangeOwnership(
           uint32_t transfer_end_tiles =
               std::min(it->second.end_tiles, extent_end);
           if (!resolve_clear_cutout ||
-              Transfer::GetRangeRectangles(it->first, transfer_end_tiles,
-                                           dest.base_tiles, dest_pitch_tiles,
-                                           dest.msaa_samples, dest_is_64bpp,
+              Transfer::GetRangeRectangles(it->first, transfer_end_tiles, dest,
                                            nullptr, resolve_clear_cutout)) {
             RenderTargetKey transfer_host_depth_source =
                 host_depth_encoding_different
@@ -1672,6 +2353,9 @@ void RenderTargetCache::ChangeOwnership(
       }
       // Claim the current range.
       it->second.render_target = dest;
+      if (dest_writes_depth_bits) {
+        it->second.depth_bits_target = dest;
+      }
       if (host_depth_encoding_different) {
         it->second.GetHostDepthRenderTarget(dest.GetDepthFormat()) = dest;
       }

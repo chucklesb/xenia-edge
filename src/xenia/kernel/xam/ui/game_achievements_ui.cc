@@ -11,6 +11,7 @@
 
 #include "xenia/hid/input.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/kernel/xam/xam_state.h"
 
 namespace xe {
 namespace kernel {
@@ -239,7 +240,7 @@ void GameAchievementsUI::OnDraw(ImGuiIO& io) {
   bool dialog_open = true;
 
   std::string title_name = xe::to_utf8(title_info_.title_name);
-  title_name.erase(std::remove(title_name.begin(), title_name.end(), '\0'),
+  title_name.erase(std::ranges::remove(title_name, '\0').begin(),
                    title_name.end());
 
   const std::string window_name =

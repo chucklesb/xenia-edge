@@ -30,7 +30,7 @@ namespace app {
 // Lightweight summary of one launchable file found by DirectoryScanner.
 struct DiscoveredGame {
   std::filesystem::path path;
-  std::string format;        // "xex" | "iso" | "zar" | "stfs"
+  std::string format;        // "xex" | "xbe" | "iso" | "zar" | "stfs"
   uint32_t title_id = 0;     // raw value (title_id_hex is the formatted form)
   std::string title_id_hex;  // 8 uppercase hex digits
   uint32_t media_id = 0;     // identifies the specific disc / content blob
@@ -59,29 +59,16 @@ struct DiscoveredGame {
   std::vector<uint8_t> icon_png;
 };
 
-// title_name (clean STFS header field) → display_name (often disc-suffixed)
-// → module_name (XEX/ISO/ZAR). May be empty if none are set.
-inline const std::string& PreferredName(const DiscoveredGame& g) {
-  if (!g.title_name.empty()) {
-    return g.title_name;
-  }
-  if (!g.display_name.empty()) {
-    return g.display_name;
-  }
-  return g.module_name;
-}
-
-// Name to store/show when importing a game. Trusts STFS header titles; for
-// XEX/ISO/ZAR (or an STFS with no title) it resolves the name from the embedded
-// x360db database, matching the title id and its alternative ids. Falls back to
-// PreferredName when the database has no entry.
+// The name importing a game gives its release, which NameNewRelease picks.
 std::string ResolveImportName(const DiscoveredGame& g);
 
 // Recursively scans a directory for launchable game files. Only default.xex
 // is considered a XEX; other .xex files are skipped (modules/companions). A
-// default.xex hit terminates the current directory. ISO/ZAR/STFS hits are
-// collected as multi-game candidates without stopping. Recursion happens
-// only when no default.xex was found. See ScanDirectory() for full algorithm.
+// default.xex or default.xbe hit terminates the current directory, apart from
+// the other of the two, which a disc for both consoles has. ISO/ZAR/STFS hits
+// are collected as multi-game candidates without stopping. Recursion happens
+// only when no default executable was found. See ScanDirectory() for full
+// algorithm.
 class DirectoryScanner {
  public:
   struct Progress {

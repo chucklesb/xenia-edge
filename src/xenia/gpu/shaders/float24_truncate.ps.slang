@@ -1,9 +1,8 @@
 // XE_DXIL_ONLY
 #include "pixel_formats.xesli"
-#include "xenos_draw.hlsli"
 
+// Only SV_Position. Depth-only draws use a zero-interpolator VS, so extra inputs break DXIL linkage.
 struct XePSInput {
-  XeVertexPrePS pre_ps;
   sample float4 position : SV_Position;
 };
 

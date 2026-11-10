@@ -64,17 +64,16 @@ bool SetProcessPriorityClass(const uint32_t priority_class) {
                           xeniaToWindowsPriorityClassMapping[priority_class]);
 }
 
-bool IsUseNexusForGameBarEnabled() {
-  constexpr LPCWSTR reg_path = L"SOFTWARE\\Microsoft\\GameBar";
-  constexpr LPCWSTR key = L"UseNexusForGameBarEnabled";
-
-  DWORD value = 0;
-  DWORD dataSize = sizeof(value);
-
-  RegGetValue(HKEY_CURRENT_USER, reg_path, key, RRF_RT_DWORD, nullptr, &value,
-              &dataSize);
-
-  return static_cast<bool>(value);
+std::string GetMachineId() {
+  // Set when Windows is installed.
+  wchar_t guid[64];
+  DWORD size = sizeof(guid);
+  if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography",
+                   L"MachineGuid", RRF_RT_REG_SZ, nullptr, guid,
+                   &size) != ERROR_SUCCESS) {
+    return {};
+  }
+  return xe::to_utf8(reinterpret_cast<const char16_t*>(guid));
 }
 
 }  // namespace xe

@@ -72,6 +72,8 @@ class VulkanDevice {
     uint32_t maxFragmentInputComponents = 64;
     uint32_t maxFragmentCombinedOutputResources = 4;
     float maxSamplerAnisotropy = 1.0f;
+    // Nanoseconds per timestamp query tick; 0 if the device has no timestamps.
+    float timestampPeriod = 0.0f;
     uint32_t maxViewportDimensions[2] = {4096, 4096};
     VkDeviceSize minUniformBufferOffsetAlignment = 256;
     VkDeviceSize minStorageBufferOffsetAlignment = 256;
@@ -154,11 +156,17 @@ class VulkanDevice {
     bool shaderSignedZeroInfNanPreserveFloat32 = false;
     bool shaderDenormFlushToZeroFloat32 = false;
     bool shaderRoundingModeRTEFloat32 = false;
+    bool shaderRoundingModeRTZFloat32 = false;
 
     // VK_EXT_fragment_shader_interlock (#252)
 
     bool fragmentShaderSampleInterlock = false;
     bool fragmentShaderPixelInterlock = false;
+
+    // VK_EXT_sample_locations (#144)
+
+    VkSampleCountFlags sampleLocationSampleCounts = 0;
+    bool variableSampleLocations = false;
 
     // VK_EXT_shader_demote_to_helper_invocation (#277, promoted to 1.3)
 
@@ -191,6 +199,20 @@ class VulkanDevice {
     uint32_t maxSubgroupSize = 0;
     bool subgroupSizeControl = false;
     bool computeFullSubgroups = false;
+
+    // VK_EXT_external_memory_host (#179). Alignment a host pointer must satisfy
+    // to be imported. 0 if the extension is not enabled.
+    VkDeviceSize minImportedHostPointerAlignment = 0;
+
+    // VK_EXT_conditional_rendering (#82)
+
+    bool conditionalRendering = false;
+
+    // VK_EXT_depth_bias_control (#284)
+
+    bool depthBiasControl = false;
+    bool leastRepresentableValueForceUnormRepresentation = false;
+    bool depthBiasExact = false;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.
@@ -207,6 +229,7 @@ class VulkanDevice {
     bool ext_KHR_swapchain = false;                     // #2
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
+    bool ext_EXT_sample_locations = false;              // #144
     bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147
     bool ext_1_2_KHR_image_format_list = false;         // #148
     // Has optional features not implied by this being true.
@@ -224,6 +247,8 @@ class VulkanDevice {
     // VK_KHR_fragment_shader_barycentric (#322) or
     // VK_NV_fragment_shader_barycentric (#203)
     bool ext_KHR_fragment_shader_barycentric = false;
+    bool ext_EXT_conditional_rendering = false;  // #82
+    bool ext_EXT_depth_bias_control = false;     // #284
 #if XE_PLATFORM_WIN32
     // VK_EXT_full_screen_exclusive (#256, Windows only)
     bool ext_EXT_full_screen_exclusive = false;
@@ -231,9 +256,18 @@ class VulkanDevice {
     // VK_EXT_device_fault (#342). For driver-side fault description after
     // VK_ERROR_DEVICE_LOST.
     bool ext_EXT_device_fault = false;
+    // VK_EXT_external_memory_host (#179). Imports guest RAM as device memory so
+    // the shared-memory buffer can alias guest RAM directly (zero-copy).
+    bool ext_EXT_external_memory_host = false;
   };
 
   const Extensions& extensions() const { return extensions_; }
+
+  // VK_EXT_external_memory_host entry point, or null if not enabled.
+  PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT()
+      const {
+    return vkGetMemoryHostPointerPropertiesEXT_;
+  }
 
   VkDevice device() const { return device_; }
 
@@ -254,6 +288,10 @@ class VulkanDevice {
 #include "xenia/ui/vulkan/functions/device_1_3_khr_maintenance4.inc"
     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
 #include "xenia/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc"
+    // VK_EXT_conditional_rendering (#82)
+#include "xenia/ui/vulkan/functions/device_ext_conditional_rendering.inc"
+    // VK_EXT_depth_bias_control (#284)
+#include "xenia/ui/vulkan/functions/device_ext_depth_bias_control.inc"
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };
@@ -388,6 +426,10 @@ class VulkanDevice {
   // VK_EXT_device_fault function pointer, loaded only if the extension is
   // enabled. Null otherwise.
   PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT_ = nullptr;
+  // VK_EXT_external_memory_host function pointer, loaded only if the extension
+  // is enabled. Null otherwise.
+  PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT_ =
+      nullptr;
   // Set when LogFaultInfo() has already logged - prevents repeat logging from
   // multiple device-loss observers.
   std::atomic_flag fault_info_logged_ = ATOMIC_FLAG_INIT;

@@ -16,7 +16,6 @@
 
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,15 +32,14 @@
 #include <shellapi.h>
 #include <softpub.h>
 #include <wincrypt.h>
-#include <winhttp.h>
 #include <wintrust.h>
 
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/config.h"
+#include "xenia/ui/http_download.h"
 
-#pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wintrust.lib")
@@ -50,8 +48,8 @@
 
 DEFINE_bool(
     d3d12_install_missing_runtime, true,
-    "When a required Direct3D 12 runtime DLL (the DXIL shader compiler, the "
-    "Agility SDK, or the debug layer) is missing, offer to download it from "
+    "When a required Direct3D 12 runtime DLL (the DXIL validator, the Agility "
+    "SDK, or the debug layer) is missing, offer to download it from "
     "Microsoft. Disable to manage the DLLs manually.",
     "D3D12");
 
@@ -76,19 +74,20 @@ namespace ui {
 
 namespace {
 
-// Pinned DirectX Shader Compiler redistributable. Update all of these together
-// when bumping: the SHA-256 is the GitHub release asset's "digest" field.
-constexpr wchar_t kDxcUrl[] =
-    L"https://github.com/microsoft/DirectXShaderCompiler/releases/download/"
-    L"v1.9.2602.24/dxc_2026_05_27.zip";
+// Pinned DirectX Shader Compiler redistributable. Only dxil.dll is taken from
+// it, the signer for the DXIL Mesa emits. Update all of these together when
+// bumping: the SHA-256 is the GitHub release asset's "digest" field.
+constexpr char kDxcUrl[] =
+    "https://github.com/microsoft/DirectXShaderCompiler/releases/download/"
+    "v1.9.2602.24/dxc_2026_05_27.zip";
 constexpr char kDxcSha256[] =
     "cf658aacf070d3045e31b8f1f8a696c2945f37c1095019481ef7c513368db3b4";
 
 // Pinned DirectX 12 Agility SDK redistributable (a NuGet .nupkg = zip). Version
 // must match the D3D12SDKVersion export in windowed_app_main_win (1.619.3 ->
 // 619).
-constexpr wchar_t kAgilityUrl[] =
-    L"https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.619.3";
+constexpr char kAgilityUrl[] =
+    "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.619.3";
 constexpr char kAgilitySha256[] =
     "43a7d5a3973812eb4b42623fae5275c790a005b8e48b8d7f5bb43cef39e073c5";
 
@@ -97,9 +96,9 @@ constexpr char kAgilitySha256[] =
 // kVulkanLoaderEntries zip path together when bumping the URL version. The zip
 // ships only x64 and x86 loaders, no arm64.
 #if !XE_ARCH_ARM64
-constexpr wchar_t kVulkanLoaderUrl[] =
-    L"https://sdk.lunarg.com/sdk/download/1.4.350.0/windows/"
-    L"vulkan-runtime-components.zip";
+constexpr char kVulkanLoaderUrl[] =
+    "https://sdk.lunarg.com/sdk/download/1.4.350.0/windows/"
+    "vulkan-runtime-components.zip";
 constexpr char kVulkanLoaderSha256[] =
     "23ce69f32cef3e2799617e2b1776cd0c71030d23a91f8375821cc40d76b185b9";
 #endif
@@ -117,7 +116,6 @@ struct RedistEntry {
   const wchar_t* dest_name;
 };
 constexpr RedistEntry kDxcEntries[] = {
-    {"bin/" XE_D3D12_REDIST_ARCH "/dxcompiler.dll", L"dxcompiler.dll"},
     {"bin/" XE_D3D12_REDIST_ARCH "/dxil.dll", L"dxil.dll"},
 };
 constexpr RedistEntry kAgilityEntries[] = {
@@ -145,13 +143,13 @@ constexpr RedistEntry kVulkanLoaderEntries[] = {
 // resolves to the latest build, so there's no stable SHA-256 to pin; the
 // download is validated by its Microsoft Authenticode signature instead.
 #if XE_ARCH_ARM64
-constexpr wchar_t kVCRedistUrl[] =
-    L"https://aka.ms/vs/17/release/vc_redist.arm64.exe";
+constexpr char kVCRedistUrl[] =
+    "https://aka.ms/vs/17/release/vc_redist.arm64.exe";
 constexpr wchar_t kVCRuntimeRegKey[] =
     L"SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\arm64";
 #else
-constexpr wchar_t kVCRedistUrl[] =
-    L"https://aka.ms/vs/17/release/vc_redist.x64.exe";
+constexpr char kVCRedistUrl[] =
+    "https://aka.ms/vs/17/release/vc_redist.x64.exe";
 constexpr wchar_t kVCRuntimeRegKey[] =
     L"SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64";
 #endif
@@ -171,25 +169,19 @@ constexpr DWORD kVCRuntimeMinMinor =
     kVCRuntimeBuiltMinor < kVCRuntimeLatestMinor ? kVCRuntimeBuiltMinor
                                                  : kVCRuntimeLatestMinor;
 
-// True if both dxcompiler.dll and dxil.dll resolve, either from the D3D12
-// folder or anywhere on the default DLL search path (system-wide or next to the
-// exe).
+// True if dxil.dll resolves, either from the D3D12 folder or anywhere on the
+// default DLL search path (system-wide or next to the exe).
 bool ShaderCompilerPresent(const std::filesystem::path& d3d12_dir) {
   std::error_code ec;
-  if (std::filesystem::exists(d3d12_dir / "dxcompiler.dll", ec) &&
-      std::filesystem::exists(d3d12_dir / "dxil.dll", ec)) {
+  if (std::filesystem::exists(d3d12_dir / "dxil.dll", ec)) {
     return true;
   }
-  HMODULE dxcompiler = LoadLibraryW(L"dxcompiler.dll");
   HMODULE dxil = LoadLibraryW(L"dxil.dll");
-  bool present = dxcompiler != nullptr && dxil != nullptr;
-  if (dxcompiler) {
-    FreeLibrary(dxcompiler);
+  if (!dxil) {
+    return false;
   }
-  if (dxil) {
-    FreeLibrary(dxil);
-  }
-  return present;
+  FreeLibrary(dxil);
+  return true;
 }
 
 #if !XE_ARCH_ARM64
@@ -241,97 +233,6 @@ void RememberVulkanDecline() {
   config::SaveConfig();
 }
 #endif
-
-bool DownloadToMemory(const wchar_t* url, std::vector<uint8_t>& out) {
-  out.clear();
-
-  URL_COMPONENTS components = {};
-  components.dwStructSize = sizeof(components);
-  wchar_t host[256] = {};
-  wchar_t path[1024] = {};
-  components.lpszHostName = host;
-  components.dwHostNameLength = DWORD(xe::countof(host));
-  components.lpszUrlPath = path;
-  components.dwUrlPathLength = DWORD(xe::countof(path));
-  if (!WinHttpCrackUrl(url, 0, 0, &components)) {
-    XELOGE("Download: failed to parse URL (error {})", GetLastError());
-    return false;
-  }
-
-  HINTERNET session =
-      WinHttpOpen(L"xenia-edge", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  if (!session) {
-    XELOGE("Download: WinHttpOpen failed (error {})", GetLastError());
-    return false;
-  }
-  WinHttpSetTimeouts(session, 15000, 15000, 30000, 60000);
-
-  bool success = false;
-  HINTERNET connect = WinHttpConnect(session, host, components.nPort, 0);
-  if (connect) {
-    DWORD flags =
-        components.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET request =
-        WinHttpOpenRequest(connect, L"GET", path, nullptr, WINHTTP_NO_REFERER,
-                           WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (request) {
-      if (WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                             WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-          WinHttpReceiveResponse(request, nullptr)) {
-        DWORD status = 0;
-        DWORD status_size = sizeof(status);
-        WinHttpQueryHeaders(
-            request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
-            WINHTTP_NO_HEADER_INDEX);
-        if (status == 200) {
-          success = true;
-          for (;;) {
-            DWORD available = 0;
-            if (!WinHttpQueryDataAvailable(request, &available)) {
-              XELOGE("Download: WinHttpQueryDataAvailable failed (error {})",
-                     GetLastError());
-              success = false;
-              break;
-            }
-            if (!available) {
-              break;
-            }
-            size_t offset = out.size();
-            out.resize(offset + available);
-            DWORD read = 0;
-            if (!WinHttpReadData(request, out.data() + offset, available,
-                                 &read)) {
-              XELOGE("Download: WinHttpReadData failed (error {})",
-                     GetLastError());
-              success = false;
-              break;
-            }
-            out.resize(offset + read);
-            if (!read) {
-              break;
-            }
-          }
-        } else {
-          XELOGE("Download: HTTP status {}", status);
-        }
-      } else {
-        XELOGE("Download: request failed (error {})", GetLastError());
-      }
-      WinHttpCloseHandle(request);
-    }
-    WinHttpCloseHandle(connect);
-  } else {
-    XELOGE("Download: WinHttpConnect failed (error {})", GetLastError());
-  }
-  WinHttpCloseHandle(session);
-
-  if (!success) {
-    out.clear();
-  }
-  return success;
-}
 
 bool VerifySha256(const std::vector<uint8_t>& data, const char* expected_hex) {
   uint8_t digest[32];
@@ -481,16 +382,6 @@ bool VerifyMicrosoftSignature(const std::wstring& path) {
   return is_microsoft;
 }
 
-bool WriteFileBytes(const std::filesystem::path& path, const void* data,
-                    size_t size) {
-  std::ofstream file(path, std::ios::binary | std::ios::trunc);
-  if (!file) {
-    return false;
-  }
-  file.write(static_cast<const char*>(data), std::streamsize(size));
-  return bool(file);
-}
-
 bool ExtractEntries(const std::vector<uint8_t>& zip_data,
                     const RedistEntry* entries, size_t entry_count,
                     const std::filesystem::path& out_dir) {
@@ -522,11 +413,11 @@ bool ExtractEntries(const std::vector<uint8_t>& zip_data,
       if (!wanted[i] || name != entries[i].zip_path) {
         continue;
       }
-      std::vector<char> buffer(static_cast<size_t>(entry->GetSize()));
+      std::vector<uint8_t> buffer(static_cast<size_t>(entry->GetSize()));
       zip.Read(buffer.data(), buffer.size());
       auto dest_path = out_dir / entries[i].dest_name;
       if (static_cast<size_t>(zip.LastRead()) != buffer.size() ||
-          !WriteFileBytes(dest_path, buffer.data(), buffer.size())) {
+          !xe::filesystem::WriteAllBytes(dest_path, buffer)) {
         XELOGE("DLL install: failed to extract {}", entries[i].zip_path);
         return false;
       }
@@ -551,7 +442,10 @@ void RelaunchAndExit() {
   if (length == 0 || length >= xe::countof(exe_path)) {
     return;
   }
+  // Continues this session's log rather than truncating it.
   std::wstring command_line = GetCommandLineW();
+  command_line += L" --log_append=true";
+  xe::FlushLog();
   STARTUPINFOW startup_info = {};
   startup_info.cb = sizeof(startup_info);
   PROCESS_INFORMATION process_info = {};
@@ -566,11 +460,11 @@ void RelaunchAndExit() {
 // Downloads `url`, verifies it against the expected SHA-256, and extracts the
 // given entries into out_dir. Shows an error dialog and returns false on any
 // failure.
-bool DownloadAndExtract(const wchar_t* url, const char* sha256_hex,
+bool DownloadAndExtract(const char* url, const char* sha256_hex,
                         const RedistEntry* entries, size_t entry_count,
                         const std::filesystem::path& out_dir) {
   std::vector<uint8_t> package;
-  if (!DownloadToMemory(url, package)) {
+  if (!HttpDownloader().DownloadToMemory(url, package)) {
     ShowError(
         _("Download failed. Check your internet connection and try again."));
     return false;
@@ -597,8 +491,8 @@ bool EnsureShaderCompilerRuntime(const std::filesystem::path& d3d12_dir) {
   }
   if (!cvars::d3d12_install_missing_runtime) {
     XELOGW(
-        "DXIL shader compiler runtime (dxcompiler.dll + dxil.dll) is missing "
-        "and auto-install is disabled (d3d12_install_missing_runtime=false)");
+        "The DXIL validator (dxil.dll) is missing and auto-install is disabled "
+        "(d3d12_install_missing_runtime=false)");
     return false;
   }
 
@@ -609,22 +503,21 @@ bool EnsureShaderCompilerRuntime(const std::filesystem::path& d3d12_dir) {
   }
   prompted = true;
 
-  if (!AskYesNo(
-          _("dxcompiler.dll and dxil.dll not found, required for Direct3D 12 "
-            "shaders. Download now (~26 MB)?"))) {
-    XELOGW("User declined the DXIL shader compiler runtime download");
+  if (!AskYesNo(_("dxil.dll not found, required for Direct3D 12 shaders. "
+                  "Download now (~26 MB)?"))) {
+    XELOGW("User declined the DXIL validator download");
     RememberDecline();
     return false;
   }
 
-  XELOGI("Downloading the DXIL shader compiler runtime from Microsoft...");
+  XELOGI("Downloading the DXIL validator from Microsoft...");
   if (!DownloadAndExtract(kDxcUrl, kDxcSha256, kDxcEntries,
                           xe::countof(kDxcEntries), d3d12_dir)) {
     return false;
   }
 
-  XELOGI("DXIL shader compiler runtime installed to {}",
-         xe::path_to_utf8(d3d12_dir));
+  XELOGI("DXIL validator installed to {}",
+         xe::strip_pii(xe::path_to_utf8(d3d12_dir)));
   return true;
 }
 
@@ -666,7 +559,7 @@ bool EnsureAgilityRuntime(const std::filesystem::path& d3d12_dir) {
   }
 
   XELOGI("DirectX 12 Agility SDK runtime installed to {}; restarting",
-         xe::path_to_utf8(d3d12_dir));
+         xe::strip_pii(xe::path_to_utf8(d3d12_dir)));
   RelaunchAndExit();
   // Only reached if the relaunch couldn't be started.
   ShowError(
@@ -713,7 +606,7 @@ bool EnsureDebugLayer(const std::filesystem::path& d3d12_dir) {
   }
 
   XELOGI("DirectX 12 debug layer installed to {}; restarting",
-         xe::path_to_utf8(d3d12_dir));
+         xe::strip_pii(xe::path_to_utf8(d3d12_dir)));
   RelaunchAndExit();
   // Only reached if the relaunch couldn't be started.
   ShowError(
@@ -758,7 +651,8 @@ bool EnsureVulkanLoader(const std::filesystem::path& vulkan_dir) {
     return false;
   }
 
-  XELOGI("Vulkan loader installed to {}", xe::path_to_utf8(vulkan_dir));
+  XELOGI("Vulkan loader installed to {}",
+         xe::strip_pii(xe::path_to_utf8(vulkan_dir)));
   return true;
 }
 #endif
@@ -802,7 +696,7 @@ bool EnsureVCRuntime() {
 
   XELOGI("Downloading the Microsoft Visual C++ runtime from Microsoft...");
   std::vector<uint8_t> installer;
-  if (!DownloadToMemory(kVCRedistUrl, installer)) {
+  if (!HttpDownloader().DownloadToMemory(kVCRedistUrl, installer)) {
     ShowError(
         _("Download failed. Check your internet connection and try again."));
     return false;
@@ -816,7 +710,7 @@ bool EnsureVCRuntime() {
   }
   std::filesystem::path installer_path =
       std::filesystem::path(temp_dir) / L"xenia_vc_redist.exe";
-  if (!WriteFileBytes(installer_path, installer.data(), installer.size())) {
+  if (!xe::filesystem::WriteAllBytes(installer_path, installer)) {
     ShowError(_("Failed to install the downloaded files."));
     return false;
   }

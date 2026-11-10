@@ -15,13 +15,43 @@
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/tomlplusplus/toml.hpp"
+#include "xenia/app/game_title_db.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string_util.h"
+#include "xenia/base/utf8.h"
+#include "xenia/emulator.h"
+#include "xenia/kernel/title_id_utils.h"
+#include "xenia/kernel/xam/indie_game.h"
+#include "xenia/vfs/iso_metadata.h"
+#include "xenia/vfs/stfs_metadata.h"
+#include "xenia/vfs/xbe_metadata.h"
+#include "xenia/vfs/xex_metadata.h"
+#include "xenia/vfs/zar_metadata.h"
 
 namespace xe {
 namespace app {
+
+// A release folder name, or empty when the name is not one. Only the exact
+// spelling VersionToString() produces is accepted, so one version can never
+// end up naming two folders.
+static std::optional<uint32_t> ParseVersionFolder(
+    const std::filesystem::path& name) {
+  const auto parsed = vfs::XexVersion::FromString(xe::path_to_utf8(name));
+  return parsed ? std::optional<uint32_t>(parsed->value()) : std::nullopt;
+}
+
+// Two paths can name the same file through a symlink or just a different case.
+// Falls back to comparing the strings when the file no longer exists.
+static bool SamePath(const std::filesystem::path& a,
+                     const std::filesystem::path& b) {
+  if (a == b) {
+    return true;
+  }
+  std::error_code ec;
+  return std::filesystem::equivalent(a, b, ec);
+}
 
 // '/' separators avoid TOML escaping and round-trip through std::filesystem.
 static std::string PathToToml(const std::filesystem::path& path) {
@@ -45,6 +75,39 @@ static void NormalizeDefault(LibraryEntry& entry) {
   }
 }
 
+std::string NameNewRelease(uint32_t title_id, const GameFileInfo* info,
+                           std::string_view hint, std::string_view sibling,
+                           const std::filesystem::path& path) {
+  // An original Xbox executable's certificate can hold a shortened title.
+  const bool xbox = info && info->content_type == XContentType::kXboxTitle;
+  if (info && !xbox && !info->title_name.empty()) {
+    return info->title_name;
+  }
+  if (info && !xbox && !info->display_name.empty()) {
+    return info->display_name;
+  }
+  if (const GameTitleInfo* known = GetGameTitleInfo(title_id);
+      known && !known->name.empty()) {
+    return known->name;
+  }
+  if (!hint.empty()) {
+    return std::string(hint);
+  }
+  if (xbox && !info->title_name.empty()) {
+    return info->title_name;
+  }
+  if (!sibling.empty()) {
+    return std::string(sibling);
+  }
+  // A file named default says nothing, and a drive's root has no folder name.
+  auto file = path.stem();
+  if (xe::utf8::equal_case(xe::path_to_utf8(file), "default") &&
+      !path.parent_path().filename().empty()) {
+    file = path.parent_path().filename();
+  }
+  return xe::path_to_utf8(file);
+}
+
 const LibraryPath& LibraryEntry::default_path() const {
   assert_false(paths.empty());
   for (const auto& p : paths) {
@@ -55,108 +118,559 @@ const LibraryPath& LibraryEntry::default_path() const {
   return paths.front();
 }
 
+std::string VersionToString(uint32_t version) {
+  return vfs::XexVersion::FromValue(version).ToString();
+}
+
+namespace {
+// An original Xbox game describes itself in its executable's certificate,
+// which has no media id.
+GameFileInfo FromXbe(vfs::XbeMetadata m) {
+  GameFileInfo info;
+  info.version = m.version;
+  info.disc_number = uint8_t(m.disc_number);
+  info.icon = std::move(m.icon_png);
+  info.title_name = std::move(m.title_name);
+  info.content_type = XContentType::kXboxTitle;
+  return info;
+}
+
+GameFileInfo FromIndieGame(kernel::xam::IndieGame game) {
+  GameFileInfo info;
+  info.icon = std::move(game.icon);
+  info.title_name = game.name;
+  info.display_name = std::move(game.name);
+  info.content_type = XContentType::kMarketplaceContent;
+  return info;
+}
+}  // namespace
+
+std::optional<GameFileInfo> ReadGameFileInfo(const std::filesystem::path& path,
+                                             XLanguage language) {
+  // An indie game installed as a folder.
+  std::error_code ec;
+  if (std::filesystem::is_directory(path, ec)) {
+    auto game = kernel::xam::ReadIndieGame(path);
+    if (!game) {
+      return std::nullopt;
+    }
+    return FromIndieGame(std::move(*game));
+  }
+  const auto extension =
+      xe::utf8::lower_ascii(xe::path_to_utf8(path.extension()));
+  if (extension == ".xbe") {
+    if (auto m = vfs::ExtractXbeMetadata(path)) {
+      return FromXbe(std::move(*m));
+    }
+  } else if (extension == ".xex") {
+    if (auto m = vfs::ExtractXexMetadata(path)) {
+      return GameFileInfo{m->media_id, m->version.value(), m->disc_number,
+                          m->disc_count};
+    }
+  } else if (extension == ".iso") {
+    if (auto m = vfs::ExtractIsoMetadata(path)) {
+      return GameFileInfo{m->media_id, m->version.value(), m->disc_number,
+                          m->disc_count};
+    }
+    if (auto m = vfs::ExtractXbeMetadata(path)) {
+      return FromXbe(std::move(*m));
+    }
+  } else if (extension == ".zar") {
+    if (auto m = vfs::ExtractZarMetadata(path)) {
+      return GameFileInfo{m->media_id, m->version.value(), m->disc_number,
+                          m->disc_count};
+    }
+  } else if (auto m = vfs::ExtractStfsMetadata(path, language)) {
+    // An indie game installed as the package file itself.
+    if (m->content_type == uint32_t(XContentType::kMarketplaceContent) &&
+        m->title_id == kernel::kXN_2002) {
+      auto game = kernel::xam::ReadIndieGame(path);
+      if (!game) {
+        return std::nullopt;
+      }
+      return FromIndieGame(std::move(*game));
+    }
+    // An Xbox Original package is listed as the game its executable names.
+    if (m->content_type == uint32_t(XContentType::kXboxTitle)) {
+      if (auto xbe = vfs::ExtractXbeMetadata(path)) {
+        return FromXbe(std::move(*xbe));
+      }
+      return std::nullopt;
+    }
+    // The container describes this release specifically, so take all of it
+    // while we are here. The title-level record cannot tell releases apart.
+    return GameFileInfo{m->media_id,
+                        m->version,
+                        m->disc_number,
+                        m->disc_count,
+                        std::move(m->icon_data),
+                        std::move(m->title_name),
+                        std::move(m->display_name),
+                        XContentType(m->content_type)};
+  }
+  return std::nullopt;
+}
+
 GameLibrary::GameLibrary(std::filesystem::path root) : root_(std::move(root)) {}
 
-std::filesystem::path GameLibrary::EntryDir(uint32_t title_id) const {
+std::filesystem::path GameLibrary::TitleDir(uint32_t title_id) const {
   return root_ / fmt::format("{:08X}", title_id);
 }
 
-std::filesystem::path GameLibrary::IconPath(uint32_t title_id) const {
-  return EntryDir(title_id) / "icon.png";
+std::filesystem::path GameLibrary::EntryDir(const LibraryKey& key) const {
+  return TitleDir(key.title_id) / xe::to_path(VersionToString(key.version));
 }
 
-LibraryEntry* GameLibrary::Find(uint32_t title_id) {
+bool GameLibrary::HasReleaseFolder(uint32_t title_id) const {
+  std::error_code ec;
+  for (const auto& sub : xe::filesystem::ListDirectories(TitleDir(title_id))) {
+    const auto dir = sub.path / sub.name;
+    if (ParseVersionFolder(sub.name) &&
+        std::filesystem::exists(dir / "game.toml", ec)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::filesystem::path GameLibrary::IconPath(const LibraryKey& key) const {
+  return EntryDir(key) / "icon.png";
+}
+
+std::filesystem::path GameLibrary::BoxArtPath(const LibraryKey& key) const {
+  return EntryDir(key) / "boxart.jpg";
+}
+
+LibraryEntry* GameLibrary::Find(const LibraryKey& key) {
+  auto it = std::find_if(entries_.begin(), entries_.end(),
+                         [&](const LibraryEntry& e) { return e.key() == key; });
+  return it == entries_.end() ? nullptr : &*it;
+}
+
+const LibraryEntry* GameLibrary::Find(const LibraryKey& key) const {
+  return const_cast<GameLibrary*>(this)->Find(key);
+}
+
+LibraryEntry* GameLibrary::FindByTitle(uint32_t title_id) {
   auto it = std::find_if(
       entries_.begin(), entries_.end(),
       [=](const LibraryEntry& e) { return e.title_id == title_id; });
   return it == entries_.end() ? nullptr : &*it;
 }
 
-const LibraryEntry* GameLibrary::Find(uint32_t title_id) const {
-  return const_cast<GameLibrary*>(this)->Find(title_id);
+const LibraryEntry* GameLibrary::FindByTitle(uint32_t title_id) const {
+  return const_cast<GameLibrary*>(this)->FindByTitle(title_id);
+}
+
+LibraryEntry* GameLibrary::FindByPath(uint32_t title_id,
+                                      const std::filesystem::path& path) {
+  for (auto& entry : entries_) {
+    if (entry.title_id != title_id) {
+      continue;
+    }
+    for (const auto& entry_path : entry.paths) {
+      if (SamePath(entry_path.path, path)) {
+        return &entry;
+      }
+    }
+  }
+  return nullptr;
+}
+
+const LibraryEntry* GameLibrary::FindByPath(
+    uint32_t title_id, const std::filesystem::path& path) const {
+  return const_cast<GameLibrary*>(this)->FindByPath(title_id, path);
+}
+
+bool GameLibrary::ReadEntry(const std::filesystem::path& game_toml,
+                            LibraryEntry& entry) const {
+  toml::table tbl;
+  try {
+    tbl = toml::parse_file(xe::path_to_utf8(game_toml));
+  } catch (const toml::parse_error& e) {
+    XELOGE("GameLibrary: failed to parse {}: {}",
+           xe::strip_pii(xe::path_to_utf8(game_toml)), e.description());
+    return false;
+  }
+
+  auto title_id_str = tbl["title_id"].value<std::string>();
+  if (!title_id_str) {
+    XELOGW("GameLibrary: missing title_id, skipping {}",
+           xe::strip_pii(xe::path_to_utf8(game_toml)));
+    return false;
+  }
+  entry.title_id = xe::string_util::from_string<uint32_t>(*title_id_str, true);
+  entry.name = tbl["name"].value_or(std::string());
+
+  if (auto version_str = tbl["version"].value<std::string>()) {
+    if (auto parsed = vfs::XexVersion::FromString(*version_str)) {
+      entry.version = parsed->value();
+    }
+  }
+  entry.last_played =
+      static_cast<time_t>(tbl["last_played"].value_or(int64_t(0)));
+  if (auto content_type_str = tbl["content_type"].value<std::string>()) {
+    entry.content_type = XContentType(
+        xe::string_util::from_string<uint32_t>(*content_type_str, true));
+  }
+
+  if (auto* paths = tbl["paths"].as_array()) {
+    for (auto&& node : *paths) {
+      auto* pt = node.as_table();
+      if (!pt) {
+        continue;
+      }
+      auto path_str = (*pt)["path"].value<std::string>();
+      if (!path_str || path_str->empty()) {
+        continue;
+      }
+      LibraryPath lp;
+      lp.path = xe::to_path(*path_str);
+      lp.is_default = (*pt)["default"].value_or(false);
+      if (auto media_id_str = (*pt)["media_id"].value<std::string>()) {
+        lp.media_id =
+            xe::string_util::from_string<uint32_t>(*media_id_str, true);
+      }
+      lp.disc_number = static_cast<uint8_t>((*pt)["disc"].value_or(0));
+      entry.paths.push_back(std::move(lp));
+    }
+  }
+
+  NormalizeDefault(entry);
+  return true;
+}
+
+std::vector<GameLibrary::Release> GameLibrary::SplitIntoReleases(
+    const LibraryEntry& entry, bool& identified) const {
+  std::vector<Release> result;
+  identified = false;
+  if (entry.paths.empty()) {
+    result.push_back(Release{entry});
+    return result;
+  }
+
+  std::vector<std::optional<GameFileInfo>> infos;
+  infos.reserve(entry.paths.size());
+  for (const auto& path : entry.paths) {
+    infos.push_back(ReadGameFileInfo(path.path, language_));
+  }
+
+  // A file that can't be read right now (moved, unplugged) must not look like
+  // a release of its own, or a missing disc would split the title in two.
+  // Those ride along with the first release we could identify. If none were
+  // readable the entry stays whole and unidentified, to retry another time.
+  identified = std::any_of(
+      infos.begin(), infos.end(),
+      [](const std::optional<GameFileInfo>& info) { return info.has_value(); });
+  if (!identified) {
+    result.push_back(Release{entry});
+    return result;
+  }
+
+  // Group on version. Discs of a set share one, so they land together with
+  // no special handling, and two releases of the game differ in it.
+  //
+  // The paths we could read come first, so that every release exists before
+  // an unreadable path looks for one to join. Interleaving the two lets the
+  // very first path be the unreadable one, with no release to attach it to.
+  std::vector<uint8_t> best_disc;
+  for (size_t i = 0; i < entry.paths.size(); ++i) {
+    if (!infos[i]) {
+      continue;
+    }
+    const GameFileInfo& info = *infos[i];
+    auto it = std::find_if(result.begin(), result.end(), [&](const Release& r) {
+      return r.entry.version == info.version;
+    });
+    if (it == result.end()) {
+      Release part;
+      part.entry.title_id = entry.title_id;
+      part.entry.version = info.version;
+      part.entry.name = entry.name;
+      part.entry.content_type = info.content_type;
+      result.push_back(std::move(part));
+      best_disc.push_back(0);
+      it = std::prev(result.end());
+    }
+    const size_t slot = static_cast<size_t>(it - result.begin());
+
+    // A release takes its art and names from its first disc, the one updates
+    // are built against.
+    const uint8_t disc =
+        static_cast<uint8_t>(info.disc_number ? info.disc_number : 1);
+    if (!best_disc[slot] || disc < best_disc[slot]) {
+      best_disc[slot] = disc;
+      it->icon = info.icon;
+      it->title_name = info.title_name;
+      it->display_name = info.display_name;
+    }
+
+    LibraryPath lp = entry.paths[i];
+    lp.media_id = info.media_id;
+    lp.disc_number = info.disc_number;
+    it->entry.paths.push_back(std::move(lp));
+  }
+
+  // Then the ones we couldn't read. `identified` guarantees a release exists.
+  for (size_t i = 0; i < entry.paths.size(); ++i) {
+    if (!infos[i]) {
+      result.front().entry.paths.push_back(entry.paths[i]);
+    }
+  }
+
+  NameReleases(result, entry.name);
+
+  for (auto& part : result) {
+    NormalizeDefault(part.entry);
+  }
+  return result;
+}
+
+void GameLibrary::NameReleases(std::vector<Release>& releases,
+                               const std::string& fallback) const {
+  // An expansion shares its base game's title_name, so if every release says
+  // the same thing that field cannot be what tells them apart.
+  const bool titles_differ =
+      std::any_of(releases.begin(), releases.end(), [&](const Release& r) {
+        return r.title_name != releases.front().title_name;
+      });
+  const bool prefer_display = releases.size() > 1 && !titles_differ;
+
+  for (auto& release : releases) {
+    const std::string& first =
+        prefer_display ? release.display_name : release.title_name;
+    const std::string& second =
+        prefer_display ? release.title_name : release.display_name;
+    if (!first.empty()) {
+      release.entry.name = first;
+    } else if (!second.empty()) {
+      release.entry.name = second;
+    } else {
+      release.entry.name = fallback;
+    }
+  }
+}
+
+void GameLibrary::PlaceIcon(const std::filesystem::path& dir,
+                            const std::vector<uint8_t>& icon,
+                            const std::filesystem::path& fallback_dir) const {
+  std::error_code ec;
+  if (!icon.empty()) {
+    std::ofstream file(dir / "icon.png", std::ios::binary | std::ios::trunc);
+    if (file) {
+      file.write(reinterpret_cast<const char*>(icon.data()), icon.size());
+      return;
+    }
+  }
+  // ISO, XEX and ZAR carry no art, so the title's existing icon is all there
+  // is for this release.
+  const auto fallback = fallback_dir / "icon.png";
+  if (std::filesystem::exists(fallback, ec)) {
+    std::filesystem::copy_file(
+        fallback, dir / "icon.png",
+        std::filesystem::copy_options::overwrite_existing, ec);
+  }
 }
 
 void GameLibrary::Load() {
   entries_.clear();
+  split_titles_.clear();
 
   std::error_code ec;
   if (!std::filesystem::exists(root_, ec)) {
     return;
   }
 
-  const auto dirs = xe::filesystem::FilterByName(
+  const auto title_dirs = xe::filesystem::FilterByName(
       xe::filesystem::ListDirectories(root_), std::regex("[0-9A-Fa-f]{8}"));
 
-  for (const auto& dir : dirs) {
-    const auto game_toml = dir.path / dir.name / "game.toml";
-    if (!std::filesystem::exists(game_toml, ec)) {
+  for (const auto& title_dir : title_dirs) {
+    // XeFu runs original Xbox games, which are listed as themselves.
+    if (xe::string_util::from_string<uint32_t>(xe::path_to_utf8(title_dir.name),
+                                               true) == kXeFuTitleId) {
       continue;
     }
+    const auto dir = title_dir.path / title_dir.name;
 
-    toml::table tbl;
-    try {
-      tbl = toml::parse_file(xe::path_to_utf8(game_toml));
-    } catch (const toml::parse_error& e) {
-      XELOGE("GameLibrary: failed to parse {}: {}", xe::path_to_utf8(game_toml),
-             e.description());
-      continue;
-    }
-
-    auto title_id_str = tbl["title_id"].value<std::string>();
-    if (!title_id_str) {
-      XELOGW("GameLibrary: missing title_id, skipping {}",
-             xe::path_to_utf8(game_toml));
-      continue;
-    }
-
-    LibraryEntry entry;
-    entry.title_id =
-        xe::string_util::from_string<uint32_t>(*title_id_str, true);
-    entry.name = tbl["name"].value_or(std::string());
-
-    if (auto* paths = tbl["paths"].as_array()) {
-      for (auto&& node : *paths) {
-        auto* pt = node.as_table();
-        if (!pt) {
-          continue;
-        }
-        auto path_str = (*pt)["path"].value<std::string>();
-        if (!path_str || path_str->empty()) {
-          continue;
-        }
-        LibraryPath lp;
-        lp.path = xe::to_path(*path_str);
-        lp.label = (*pt)["label"].value_or(std::string());
-        lp.is_default = (*pt)["default"].value_or(false);
-        entry.paths.push_back(std::move(lp));
+    // One version folder is proof the title is in the current layout, so the
+    // game.toml orphaned at its root never gets opened. That costs only the
+    // directory listing, which is what makes the orphan free to keep.
+    //
+    // Existing is what decides it, not loading. Re-deriving from the stale
+    // root file would overwrite the folders that are fine.
+    bool has_release_folder = false;
+    for (const auto& sub : xe::filesystem::ListDirectories(dir)) {
+      const auto version = ParseVersionFolder(sub.name);
+      if (!version) {
+        continue;
       }
+      const auto game_toml = sub.path / sub.name / "game.toml";
+      if (!std::filesystem::exists(game_toml, ec)) {
+        continue;  // a bare folder is not a release, so migration still runs
+      }
+      has_release_folder = true;
+      LibraryEntry entry;
+      if (!ReadEntry(game_toml, entry)) {
+        continue;
+      }
+      entry.version = *version;  // the folder name is what settles it
+      entries_.push_back(std::move(entry));
     }
-
-    if (entry.paths.empty()) {
-      XELOGW("GameLibrary: no usable paths, skipping {}",
-             xe::path_to_utf8(game_toml));
-      continue;
+    if (!has_release_folder) {
+      MigrateTitle(dir);
     }
-
-    NormalizeDefault(entry);
-    entries_.push_back(std::move(entry));
+  }
+  if (changed_callback_) {
+    changed_callback_();
   }
 }
 
-bool GameLibrary::WriteEntryAtomic(const LibraryEntry& entry) {
-  const auto dir = EntryDir(entry.title_id);
+void GameLibrary::MigrateTitle(const std::filesystem::path& title_dir) {
+  std::error_code ec;
+
+  // Where the title's data actually is. A build that keyed releases on media
+  // id left <title_id>/<media_id>/ folders holding newer data than the root
+  // file, so those win outright when present. Never both, or the root file's
+  // stale copy of the same paths would come along too.
+  std::vector<std::filesystem::path> obsolete;
+  LibraryEntry merged;
+  bool found = false;
+  for (const auto& sub :
+       xe::filesystem::FilterByName(xe::filesystem::ListDirectories(title_dir),
+                                    std::regex("[0-9A-Fa-f]{8}"))) {
+    const auto sub_dir = sub.path / sub.name;
+    LibraryEntry entry;
+    if (!ReadEntry(sub_dir / "game.toml", entry)) {
+      continue;
+    }
+    obsolete.push_back(sub_dir);
+
+    // Pooled rather than migrated one folder at a time. Those folders were
+    // keyed on media id, which gave each disc of a set its own, and two of
+    // them now resolve to the same version folder. Splitting the pool is
+    // also what puts such a set back together.
+    found = true;
+    merged.title_id = entry.title_id;
+    if (merged.name.empty()) {
+      merged.name = entry.name;
+    }
+    for (auto& disc : entry.paths) {
+      const bool known = std::any_of(
+          merged.paths.begin(), merged.paths.end(),
+          [&](const LibraryPath& p) { return SamePath(p.path, disc.path); });
+      if (!known) {
+        merged.paths.push_back(std::move(disc));
+      }
+    }
+  }
+  if (!found && !ReadEntry(title_dir / "game.toml", merged)) {
+    return;
+  }
+
+  bool identified = false;
+  auto parts = SplitIntoReleases(merged, identified);
+  if (!identified) {
+    // No readable path, so no version to name a folder with. Leave the title
+    // where it is and try again once the files are back.
+    entries_.push_back(std::move(merged));
+    return;
+  }
+  if (parts.size() > 1) {
+    split_titles_.push_back(merged.name.empty()
+                                ? fmt::format("{:08X}", merged.title_id)
+                                : merged.name);
+  }
+  for (auto& part : parts) {
+    const auto release_dir = EntryDir(part.entry.key());
+    std::filesystem::create_directories(release_dir, ec);
+    // The title's own art is the fallback. A release whose package carries
+    // its own gets that instead, so nothing is lost by not looking in the
+    // media-id folders for the copies they were given.
+    PlaceIcon(release_dir, part.icon, title_dir);
+    WriteEntryAtomic(part.entry, release_dir);
+    entries_.push_back(std::move(part.entry));
+  }
+
+  // Media-id folders are debris from a layout nothing reads any more, now
+  // that what they held is written elsewhere. The root game.toml and icon
+  // stay put, orphaned, for builds that predate versions.
+  for (const auto& dir : obsolete) {
+    std::filesystem::remove_all(dir, ec);
+  }
+}
+
+std::vector<GameLibrary::MissingFields> GameLibrary::FindMissingFields() const {
+  std::vector<MissingFields> missing;
+  std::error_code ec;
+  for (const auto& entry : entries_) {
+    // A title still in an older layout gets its fields when it is migrated.
+    if ((entry.content_type != XContentType::kInvalid && !entry.name.empty()) ||
+        !std::filesystem::exists(EntryDir(entry.key()) / "game.toml", ec)) {
+      continue;
+    }
+    MissingFields release{entry.key()};
+    release.language = language_;
+    for (const auto& path : entry.paths) {
+      release.paths.push_back(path.path);
+    }
+    missing.push_back(std::move(release));
+  }
+  return missing;
+}
+
+std::optional<GameFileInfo> GameLibrary::ReadMissingFields(
+    const MissingFields& missing) {
+  for (const auto& path : missing.paths) {
+    // A path that was unreadable when the title was split can belong to
+    // another release.
+    auto info = ReadGameFileInfo(path, missing.language);
+    if (info && info->version == missing.key.version) {
+      return info;
+    }
+  }
+  return std::nullopt;
+}
+
+bool GameLibrary::FillMissingFields(const LibraryKey& key,
+                                    const GameFileInfo& info) {
+  const auto* existing = Find(key);
+  if (!existing) {
+    return false;
+  }
+  LibraryEntry entry = *existing;
+  if (entry.content_type == XContentType::kInvalid) {
+    entry.content_type = info.content_type;
+  }
+  // Added before its name could be read, like an executable that keeps it only
+  // in its $$XTINFO section.
+  if (entry.name.empty() && !entry.paths.empty()) {
+    entry.name =
+        NameNewRelease(key.title_id, &info, {}, {}, entry.default_path().path);
+  }
+  if (entry.content_type == existing->content_type &&
+      entry.name == existing->name) {
+    return false;
+  }
+  return Upsert(std::move(entry));
+}
+
+bool GameLibrary::WriteEntryAtomic(const LibraryEntry& entry,
+                                   const std::filesystem::path& dir) {
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   if (ec) {
-    XELOGE("GameLibrary: cannot create {}: {}", xe::path_to_utf8(dir),
-           ec.message());
+    XELOGE("GameLibrary: cannot create {}: {}",
+           xe::strip_pii(xe::path_to_utf8(dir)), ec.message());
     return false;
   }
 
   toml::array paths;
   for (const auto& p : entry.paths) {
     toml::table pt;
-    pt.insert("label", p.label);
+    if (p.disc_number) {
+      pt.insert("disc", static_cast<int64_t>(p.disc_number));
+    }
+    pt.insert("media_id", fmt::format("{:08X}", p.media_id));
     pt.insert("path", PathToToml(p.path));
     if (p.is_default) {
       pt.insert("default", true);
@@ -166,29 +680,42 @@ bool GameLibrary::WriteEntryAtomic(const LibraryEntry& entry) {
   }
 
   toml::table tbl;
-  tbl.insert("title_id", fmt::format("{:08X}", entry.title_id));
+  // Omitted while unknown, which is what makes Load() look for it.
+  if (entry.content_type != XContentType::kInvalid) {
+    tbl.insert("content_type",
+               fmt::format("{:08X}", uint32_t(entry.content_type)));
+  }
+  // Seconds since the epoch. Omitted while unset so a release that has never
+  // been launched doesn't carry a field claiming it was.
+  if (entry.last_played) {
+    tbl.insert("last_played", static_cast<int64_t>(entry.last_played));
+  }
   tbl.insert("name", entry.name);
   tbl.insert("paths", std::move(paths));
+  tbl.insert("title_id", fmt::format("{:08X}", entry.title_id));
+  tbl.insert("version", VersionToString(entry.version));
 
   const auto final_path = dir / "game.toml";
   const auto tmp_path = dir / "game.toml.tmp";
   {
     std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
     if (!file) {
-      XELOGE("GameLibrary: cannot open {}", xe::path_to_utf8(tmp_path));
+      XELOGE("GameLibrary: cannot open {}",
+             xe::strip_pii(xe::path_to_utf8(tmp_path)));
       return false;
     }
     file << tbl << "\n";
     if (!file) {
-      XELOGE("GameLibrary: write failed for {}", xe::path_to_utf8(tmp_path));
+      XELOGE("GameLibrary: write failed for {}",
+             xe::strip_pii(xe::path_to_utf8(tmp_path)));
       return false;
     }
   }
 
   std::filesystem::rename(tmp_path, final_path, ec);
   if (ec) {
-    XELOGE("GameLibrary: cannot replace {}: {}", xe::path_to_utf8(final_path),
-           ec.message());
+    XELOGE("GameLibrary: cannot replace {}: {}",
+           xe::strip_pii(xe::path_to_utf8(final_path)), ec.message());
     std::filesystem::remove(tmp_path, ec);
     return false;
   }
@@ -196,58 +723,153 @@ bool GameLibrary::WriteEntryAtomic(const LibraryEntry& entry) {
 }
 
 bool GameLibrary::Upsert(LibraryEntry entry) {
-  if (entry.paths.empty()) {
-    XELOGW("GameLibrary: refusing to store {:08X} with no paths",
-           entry.title_id);
+  // These are listed as the games they run.
+  if (entry.title_id == kXeFuTitleId || entry.title_id == kernel::kXN_2002) {
     return false;
   }
   NormalizeDefault(entry);
 
-  if (!WriteEntryAtomic(entry)) {
+  auto* existing = Find(entry.key());
+  if (!WriteEntryAtomic(entry, EntryDir(entry.key()))) {
     return false;
   }
 
-  if (auto* existing = Find(entry.title_id)) {
+  if (existing) {
     *existing = std::move(entry);
   } else {
     entries_.push_back(std::move(entry));
   }
+  if (changed_callback_) {
+    changed_callback_();
+  }
   return true;
 }
 
-bool GameLibrary::AddDisc(uint32_t title_id, const std::string& name,
-                          const std::filesystem::path& path,
-                          const std::string& label) {
+bool GameLibrary::AddDisc(uint32_t title_id, const std::string& hint,
+                          const std::filesystem::path& path) {
   if (title_id == 0 || path.empty()) {
     return false;
   }
 
+  // Which release this belongs to is the file's own version. Discs of a set
+  // share one, so a disc joins its siblings without anything having to work
+  // out that they are siblings.
+  const auto info = ReadGameFileInfo(path, language_);
+  const LibraryKey key{title_id, info ? info->version : 0};
+  LibraryEntry* existing = Find(key);
+
   LibraryEntry entry;
-  if (auto* existing = Find(title_id)) {
+  if (existing) {
     entry = *existing;
   } else {
     entry.title_id = title_id;
-    entry.name = name;
+    entry.version = key.version;
+    const auto* sibling = FindByTitle(title_id);
+    entry.name = NameNewRelease(title_id, info ? &*info : nullptr, hint,
+                                sibling ? sibling->name : std::string(), path);
   }
 
   const bool known =
       std::any_of(entry.paths.begin(), entry.paths.end(),
-                  [&](const LibraryPath& p) { return p.path == path; });
+                  [&](const LibraryPath& p) { return SamePath(p.path, path); });
   if (known) {
     return false;
   }
 
-  entry.paths.push_back({path, label, false});
+  LibraryPath added;
+  added.path = path;
+  if (info) {
+    added.media_id = info->media_id;
+    added.disc_number = info->disc_number;
+    if (entry.content_type == XContentType::kInvalid) {
+      entry.content_type = info->content_type;
+    }
+  }
+  entry.paths.push_back(std::move(added));
   return Upsert(std::move(entry));
 }
 
-bool GameLibrary::SetIcon(uint32_t title_id, std::span<const uint8_t> png) {
-  const auto dir = EntryDir(title_id);
+bool GameLibrary::MarkPlayed(const LibraryKey& key, time_t when) {
+  auto* existing = Find(key);
+  if (!existing) {
+    return false;
+  }
+  if (existing->last_played == when) {
+    return true;  // same second, skip the rewrite
+  }
+  LibraryEntry entry = *existing;
+  entry.last_played = when;
+  return Upsert(std::move(entry));
+}
+
+bool GameLibrary::SetDefaultPath(const LibraryKey& key,
+                                 const std::filesystem::path& path) {
+  auto* existing = Find(key);
+  if (!existing) {
+    return false;
+  }
+  const bool present =
+      std::any_of(existing->paths.begin(), existing->paths.end(),
+                  [&](const LibraryPath& p) { return SamePath(p.path, path); });
+  if (!present) {
+    return false;
+  }
+  if (SamePath(existing->default_path().path, path)) {
+    return true;  // already default, skip the rewrite
+  }
+
+  LibraryEntry entry = *existing;
+  for (auto& p : entry.paths) {
+    p.is_default = SamePath(p.path, path);
+  }
+  return Upsert(std::move(entry));
+}
+
+bool GameLibrary::RemovePath(const LibraryKey& key,
+                             const std::filesystem::path& path) {
+  auto* existing = Find(key);
+  if (!existing) {
+    return false;
+  }
+  auto it = std::find_if(
+      existing->paths.begin(), existing->paths.end(),
+      [&](const LibraryPath& p) { return SamePath(p.path, path); });
+  if (it == existing->paths.end()) {
+    return false;
+  }
+  LibraryEntry entry = *existing;
+  entry.paths.erase(entry.paths.begin() +
+                    std::distance(existing->paths.begin(), it));
+  return Upsert(std::move(entry));  // picks a new default if needed
+}
+
+bool GameLibrary::PruneMissingPaths(const LibraryKey& key) {
+  auto* existing = Find(key);
+  if (!existing) {
+    return false;
+  }
+  LibraryEntry entry = *existing;
+  const size_t before = entry.paths.size();
+  std::error_code ec;
+  entry.paths.erase(std::remove_if(entry.paths.begin(), entry.paths.end(),
+                                   [&](const LibraryPath& p) {
+                                     return !std::filesystem::exists(p.path,
+                                                                     ec);
+                                   }),
+                    entry.paths.end());
+  if (entry.paths.size() == before) {
+    return false;
+  }
+  return Upsert(std::move(entry));  // picks a new default if needed
+}
+
+bool GameLibrary::SetIcon(const LibraryKey& key, std::span<const uint8_t> png) {
+  const auto dir = EntryDir(key);
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   if (ec) {
-    XELOGE("GameLibrary: cannot create {}: {}", xe::path_to_utf8(dir),
-           ec.message());
+    XELOGE("GameLibrary: cannot create {}: {}",
+           xe::strip_pii(xe::path_to_utf8(dir)), ec.message());
     return false;
   }
 
@@ -256,38 +878,51 @@ bool GameLibrary::SetIcon(uint32_t title_id, std::span<const uint8_t> png) {
   {
     std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
     if (!file) {
-      XELOGE("GameLibrary: cannot open {}", xe::path_to_utf8(tmp_path));
+      XELOGE("GameLibrary: cannot open {}",
+             xe::strip_pii(xe::path_to_utf8(tmp_path)));
       return false;
     }
     file.write(reinterpret_cast<const char*>(png.data()), png.size());
     if (!file) {
-      XELOGE("GameLibrary: write failed for {}", xe::path_to_utf8(tmp_path));
+      XELOGE("GameLibrary: write failed for {}",
+             xe::strip_pii(xe::path_to_utf8(tmp_path)));
       return false;
     }
   }
 
   std::filesystem::rename(tmp_path, final_path, ec);
   if (ec) {
-    XELOGE("GameLibrary: cannot replace {}: {}", xe::path_to_utf8(final_path),
-           ec.message());
+    XELOGE("GameLibrary: cannot replace {}: {}",
+           xe::strip_pii(xe::path_to_utf8(final_path)), ec.message());
     std::filesystem::remove(tmp_path, ec);
     return false;
   }
   return true;
 }
 
-bool GameLibrary::Remove(uint32_t title_id) {
+bool GameLibrary::Remove(const LibraryKey& key) {
   std::error_code ec;
-  std::filesystem::remove_all(EntryDir(title_id), ec);
+  std::filesystem::remove_all(EntryDir(key), ec);
   if (ec) {
-    XELOGE("GameLibrary: cannot remove {:08X}: {}", title_id, ec.message());
+    XELOGE("GameLibrary: cannot remove {:08X}/{}: {}", key.title_id,
+           VersionToString(key.version), ec.message());
     return false;
   }
-  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
-                                [=](const LibraryEntry& e) {
-                                  return e.title_id == title_id;
-                                }),
-                 entries_.end());
+  entries_.erase(
+      std::remove_if(entries_.begin(), entries_.end(),
+                     [&](const LibraryEntry& e) { return e.key() == key; }),
+      entries_.end());
+  if (changed_callback_) {
+    changed_callback_();
+  }
+
+  // The last release takes the title folder with it, orphaned root file
+  // included, or an older build would go on listing a title the user removed.
+  // Asks the filesystem rather than the loaded entries, so a release folder
+  // that failed to load still keeps the title folder alive.
+  if (!HasReleaseFolder(key.title_id)) {
+    std::filesystem::remove_all(TitleDir(key.title_id), ec);
+  }
   return true;
 }
 

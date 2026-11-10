@@ -23,14 +23,20 @@ bool InitializeAndroidSystemForApplicationContext();
 void ShutdownAndroidSystem();
 #endif
 
+#if XE_PLATFORM_GNU_LINUX
+// SDL3, loaded at runtime as xenia-base doesn't link it. Null if it's missing,
+// otherwise release it with dlclose.
+void* LoadSDL3Library();
+#endif
+
 // The URL must include the protocol.
 void LaunchWebBrowser(const std::string_view url);
 void LaunchFileExplorer(const std::filesystem::path& path);
 
 bool SetProcessPriorityClass(const uint32_t priority_class);
 
-// Determine if the Xbox Gamebar is enabled via the Windows registry
-bool IsUseNexusForGameBarEnabled();
+// An id the operating system keeps for this machine, empty when it has none.
+std::string GetMachineId();
 
 enum class SimpleMessageBoxType {
   Help,
@@ -40,6 +46,11 @@ enum class SimpleMessageBoxType {
 
 // This is expected to block the caller until the message box is closed.
 void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message);
+
+#if XE_PLATFORM_MAC
+// Whether the running executable carries an x86_64 slice Rosetta can launch.
+bool ExecutableHasX86_64Slice();
+#endif
 
 }  // namespace xe
 

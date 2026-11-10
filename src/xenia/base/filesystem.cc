@@ -9,10 +9,13 @@
 
 #include "xenia/base/filesystem.h"
 
+#include <algorithm>
 #include <fstream>
 #include <ios>
+#include <utility>
 
 #include "xenia/base/string_util.h"
+#include "xenia/base/utf8.h"
 
 namespace xe {
 namespace filesystem {
@@ -32,6 +35,26 @@ std::vector<uint8_t> ReadAllBytes(const std::filesystem::path& path) {
     return {};
   }
   return data;
+}
+
+bool WriteAllBytes(const std::filesystem::path& path,
+                   std::span<const uint8_t> data) {
+  std::ofstream f(path, std::ios::binary | std::ios::trunc);
+  f.write(reinterpret_cast<const char*>(data.data()),
+          std::streamsize(data.size()));
+  f.close();
+  return !f.fail();
+}
+
+std::filesystem::path FindChildIgnoringCase(const std::filesystem::path& parent,
+                                            const std::string_view name) {
+  std::error_code ec;
+  for (const auto& child : std::filesystem::directory_iterator(parent, ec)) {
+    if (xe::utf8::equal_case(xe::path_to_utf8(child.path().filename()), name)) {
+      return child.path();
+    }
+  }
+  return {};
 }
 
 std::string ReadAllText(const std::filesystem::path& path) {
@@ -74,14 +97,31 @@ std::error_code CreateFolder(const std::filesystem::path& path) {
   return ec;
 }
 
+// Host listing order is not portable, ntfs collates while ext4 hands back
+// hash order, so a directory would enumerate differently per platform. Collate
+// on the uppercased name to match ntfs, keeping windows behavior untouched.
+// Not console accurate, an stfs package enumerates in slot order, i.e. creation
+// order, which host filesystems cannot reproduce since creation time does not
+// survive copies on windows and moves on write on posix.
+static bool CollatesBefore(const FileInfo& left, const FileInfo& right) {
+  return xe::utf8::upper_ascii(xe::path_to_utf8(left.name)) <
+         xe::utf8::upper_ascii(xe::path_to_utf8(right.name));
+}
+
+std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
+  std::vector<FileInfo> files = internal::ListFilesUnsorted(path);
+  std::ranges::sort(files, CollatesBefore);
+  return files;
+}
+
 std::vector<FileInfo> ListDirectories(const std::filesystem::path& path) {
   std::vector<FileInfo> files = ListFiles(path);
   std::vector<FileInfo> directories = {};
 
-  std::copy_if(files.cbegin(), files.cend(), std::back_inserter(directories),
-               [](const FileInfo& file) {
-                 return file.type == FileInfo::Type::kDirectory;
-               });
+  std::ranges::copy_if(std::as_const(files), std::back_inserter(directories),
+                       [](const FileInfo& file) {
+                         return file.type == FileInfo::Type::kDirectory;
+                       });
 
   return directories;
 }
@@ -90,11 +130,11 @@ std::vector<FileInfo> FilterByName(const std::vector<FileInfo>& files,
                                    const std::regex pattern) {
   std::vector<FileInfo> filtered_entries = {};
 
-  std::copy_if(
-      files.cbegin(), files.cend(), std::back_inserter(filtered_entries),
-      [pattern](const FileInfo& file) {
-        return std::regex_match(file.name.filename().string(), pattern);
-      });
+  std::ranges::copy_if(files, std::back_inserter(filtered_entries),
+                       [pattern](const FileInfo& file) {
+                         return std::regex_match(
+                             xe::path_to_utf8(file.name.filename()), pattern);
+                       });
   return filtered_entries;
 }
 

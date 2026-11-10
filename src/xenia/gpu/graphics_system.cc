@@ -9,12 +9,15 @@
 
 #include "xenia/gpu/graphics_system.h"
 
+#include <charconv>
+
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
+#include "xenia/base/utf8.h"
 #include "xenia/config.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -58,7 +61,7 @@ DEFINE_bool(
     store_shaders, true,
     "Store shaders persistently and load them when loading games to avoid "
     "runtime spikes and freezes when playing the game not for the first time.",
-    "GPU");
+    "GPU.Debug");
 
 namespace xe {
 namespace gpu {
@@ -82,6 +85,17 @@ GraphicsSystem::GraphicsSystem() : frame_limiter_worker_running_(false) {
 }
 
 GraphicsSystem::~GraphicsSystem() = default;
+
+// The trace writer is compiled out of Release unless XENIA_ENABLE_GPU_TRACE is
+// enabled.
+constexpr bool kTraceCaptureAvailable =
+    XE_ENABLE_TRACE_WRITER_INSTRUMENTATION != 0;
+
+static void WarnTraceCaptureUnavailable() {
+  XELOGW(
+      "GPU trace capture isn't built into this configuration; use a Debug "
+      "build or enable the XENIA_ENABLE_GPU_TRACE CMake option");
+}
 
 X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                                kernel::KernelState* kernel_state,
@@ -132,6 +146,33 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   // Create command processor. This will spin up a thread to process all
   // incoming ringbuffer packets.
   command_processor_ = CreateCommandProcessor();
+
+  // Trace requests from the command line, made before Initialize starts the
+  // command processor thread, which reads the frame numbers on every swap.
+  if (cvars::trace_gpu_stream) {
+    BeginTracing();
+  }
+  std::vector<uint32_t> trace_frame_numbers;
+  for (std::string_view frame :
+       utf8::split(cvars::trace_gpu_frames, ", ", true)) {
+    uint32_t frame_number;
+    auto [end, error] = std::from_chars(
+        frame.data(), frame.data() + frame.size(), frame_number);
+    if (error != std::errc() || end != frame.data() + frame.size()) {
+      XELOGW("Ignoring invalid frame number \"{}\" in trace_gpu_frames", frame);
+      continue;
+    }
+    trace_frame_numbers.push_back(frame_number);
+  }
+  if (!trace_frame_numbers.empty()) {
+    if constexpr (kTraceCaptureAvailable) {
+      command_processor_->SetTraceFrameNumbers(cvars::trace_gpu_prefix,
+                                               std::move(trace_frame_numbers));
+    } else {
+      WarnTraceCaptureUnavailable();
+    }
+  }
+
   if (!command_processor_->Initialize()) {
     XELOGE("Unable to initialize command processor");
     return X_STATUS_UNSUCCESSFUL;
@@ -150,13 +191,6 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
           kernel_state_, 128 * 1024, 0,
           [this]() {
             uint64_t last_frame_time = Clock::QueryGuestTickCount();
-    // Sleep for 90% of the vblank duration on Windows/macOS, spin for 10%
-    // Linux uses full sleep duration due to scheduler quantum issues
-#if XE_PLATFORM_WIN32 || XE_PLATFORM_MAC
-            constexpr double duration_scalar = 0.90;
-#elif XE_PLATFORM_LINUX
-            constexpr double duration_scalar = 1.0;
-#endif
 
             while (frame_limiter_worker_running_) {
               // If there is no title running then there is no need for guest
@@ -176,12 +210,6 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
 
               if (refresh_cap_enabled) {
                 const uint32_t vblank_hz = GetGuestVblankRateHz();
-                const uint64_t sleep_ns = static_cast<uint64_t>(
-                    (1000000000.0 / static_cast<double>(vblank_hz)) *
-                    duration_scalar);
-
-#if XE_PLATFORM_WIN32 || XE_PLATFORM_MAC
-                // Windows/macOS: time-gating + 90% sleep + 10% spin
                 const uint64_t tick_freq = Clock::guest_tick_frequency();
                 const uint64_t target_duration_ticks = tick_freq / vblank_hz;
                 const uint64_t current_time = Clock::QueryGuestTickCount();
@@ -195,16 +223,25 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                     last_frame_time += target_duration_ticks;
                   }
                   MarkVblank();
+#if XE_PLATFORM_WIN32 || XE_PLATFORM_MAC
+                  // Sleep for 90% of the period, spin for the rest.
+                  const uint64_t sleep_ns = static_cast<uint64_t>(
+                      900000000.0 / (vblank_hz * Clock::guest_time_scalar()));
 #if XE_PLATFORM_MAC
                   threading::NanoSleepPrecise(sleep_ns);
 #else
                   threading::NanoSleep(sleep_ns);
 #endif
+#endif
                 }
-#elif XE_PLATFORM_LINUX
-                // Linux: simplified timing to avoid oversleeping
-                MarkVblank();
-                threading::NanoSleep(sleep_ns);
+#if XE_PLATFORM_LINUX
+                else {
+                  // Sleep to the deadline, so a late wake-up shortens the
+                  // next sleep instead of stretching the period.
+                  threading::NanoSleep(static_cast<int64_t>(
+                      (target_duration_ticks - time_delta) * 1000000000.0 /
+                      (tick_freq * Clock::guest_time_scalar())));
+                }
 #endif
               } else {
                 // Unlimited mode (guest_display_refresh_cap=false) - fire
@@ -221,11 +258,14 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   frame_limiter_worker_thread_->set_can_debugger_suspend(true);
   frame_limiter_worker_thread_->set_name("GPU Frame limiter");
   frame_limiter_worker_thread_->Create();
+  // Linux only sleeps, so kLowest (nice 15) would just add wake-up latency.
+#if XE_PLATFORM_LINUX
+  frame_limiter_worker_thread_->thread()->set_priority(
+      threading::ThreadPriority::kNormal);
+#else
   frame_limiter_worker_thread_->thread()->set_priority(
       threading::ThreadPriority::kLowest);
-  if (cvars::trace_gpu_stream) {
-    BeginTracing();
-  }
+#endif
 
   return X_STATUS_SUCCESS;
 }
@@ -237,11 +277,7 @@ void GraphicsSystem::Shutdown() {
     command_processor_.reset();
   }
 
-  if (frame_limiter_worker_thread_) {
-    frame_limiter_worker_running_ = false;
-    frame_limiter_worker_thread_->Wait(0, 0, 0, nullptr);
-    frame_limiter_worker_thread_.reset();
-  }
+  StopFrameLimiter();
 
   if (presenter_) {
     if (app_context_) {
@@ -254,6 +290,14 @@ void GraphicsSystem::Shutdown() {
   }
 
   provider_.reset();
+}
+
+void GraphicsSystem::StopFrameLimiter() {
+  if (frame_limiter_worker_thread_) {
+    frame_limiter_worker_running_ = false;
+    frame_limiter_worker_thread_->Wait(0, 0, 0, nullptr);
+    frame_limiter_worker_thread_.reset();
+  }
 }
 
 void GraphicsSystem::OnHostGpuLossFromAnyThread(
@@ -295,6 +339,8 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
       return 0x08100748;
     case XE_GPU_REG_RB_BC_CONTROL:
       return 0x0000200E;
+    case XE_GPU_REG_RB_HSIO_INTERFACE_ALIGNER_VALUE:
+      return 0x00BBBBBB;
     case XE_GPU_REG_D1MODE_V_COUNTER: {
       // Free-running scanline counter, like Xenos drives off the pixel clock.
       // Cycles 0..(total_lines-1) every frame, including the vertical-blank
@@ -349,6 +395,10 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
   switch (r) {
     case 0x01C5:  // CP_RB_WPTR
       command_processor_->UpdateWritePointer(value);
+      break;
+    case 0x0F01:  // RB_BC_CONTROL
+      break;
+    case 0x0F2D:  // RB_HSIO_INTERFACE_ALIGNER_VALUE
       break;
     case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
       break;
@@ -415,6 +465,7 @@ void GraphicsSystem::InvalidateGpuMemory() {
 
 void GraphicsSystem::InitializeShaderStorage(
     const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
+    std::function<void()> started_callback,
     std::function<void()> completion_callback) {
   if (!cvars::store_shaders) {
     if (completion_callback) {
@@ -426,13 +477,20 @@ void GraphicsSystem::InitializeShaderStorage(
     if (command_processor_->is_paused()) {
       // Safe to run on any thread while the command processor is paused, no
       // race condition.
+      if (started_callback) {
+        started_callback();
+      }
       command_processor_->InitializeShaderStorage(
           cache_root, title_id, true, std::move(completion_callback));
     } else {
       xe::threading::Fence fence;
       command_processor_->CallInThread(
           [this, cache_root, title_id, &fence,
+           started_callback = std::move(started_callback),
            completion_callback = std::move(completion_callback)]() mutable {
+            if (started_callback) {
+              started_callback();
+            }
             command_processor_->InitializeShaderStorage(
                 cache_root, title_id, true, std::move(completion_callback));
             fence.Signal();
@@ -442,7 +500,11 @@ void GraphicsSystem::InitializeShaderStorage(
   } else {
     command_processor_->CallInThread(
         [this, cache_root, title_id,
+         started_callback = std::move(started_callback),
          completion_callback = std::move(completion_callback)]() mutable {
+          if (started_callback) {
+            started_callback();
+          }
           command_processor_->InitializeShaderStorage(
               cache_root, title_id, false, std::move(completion_callback));
         });
@@ -450,14 +512,30 @@ void GraphicsSystem::InitializeShaderStorage(
 }
 
 void GraphicsSystem::RequestFrameTrace() {
-  command_processor_->RequestFrameTrace(cvars::trace_gpu_prefix);
+  if constexpr (kTraceCaptureAvailable) {
+    command_processor_->RequestFrameTrace(cvars::trace_gpu_prefix);
+  } else {
+    WarnTraceCaptureUnavailable();
+  }
 }
 
 void GraphicsSystem::BeginTracing() {
-  command_processor_->BeginTracing(cvars::trace_gpu_prefix);
+  if constexpr (kTraceCaptureAvailable) {
+    command_processor_->BeginTracing(cvars::trace_gpu_prefix);
+  } else {
+    WarnTraceCaptureUnavailable();
+  }
 }
 
 void GraphicsSystem::EndTracing() { command_processor_->EndTracing(); }
+
+void GraphicsSystem::RequestEndTracing() {
+  command_processor_->RequestEndTracing();
+}
+
+bool GraphicsSystem::is_tracing_stream() const {
+  return command_processor_->is_tracing_stream();
+}
 
 void GraphicsSystem::Pause() {
   paused_ = true;

@@ -28,14 +28,6 @@ if(XE_TARGET_AARCH64)
 endif()
 
 # ==============================================================================
-# aes_128
-# ==============================================================================
-add_library(aes_128 STATIC
-  aes_128/unroll/aes.c
-)
-target_include_directories(aes_128 PUBLIC aes_128)
-
-# ==============================================================================
 # asio (header-only)
 # ==============================================================================
 add_library(asio INTERFACE)
@@ -468,6 +460,28 @@ add_library(imgui STATIC
 target_include_directories(imgui PUBLIC imgui PRIVATE stb)
 
 # ==============================================================================
+# mbedtls (crypto modules only, chosen in mbedtls-xenia/xenia_mbedtls_config.h)
+# ==============================================================================
+add_library(mbedtls STATIC
+  mbedtls/library/aes.c
+  mbedtls/library/bignum.c
+  mbedtls/library/bignum_core.c
+  mbedtls/library/constant_time.c
+  mbedtls/library/des.c
+  mbedtls/library/dhm.c
+  mbedtls/library/md.c
+  mbedtls/library/md5.c
+  mbedtls/library/platform_util.c
+  mbedtls/library/sha1.c
+  mbedtls/library/sha256.c
+  mbedtls/library/sha512.c
+)
+target_include_directories(mbedtls PUBLIC mbedtls/include mbedtls-xenia)
+target_compile_definitions(mbedtls PUBLIC
+  "MBEDTLS_CONFIG_FILE=\"xenia_mbedtls_config.h\""
+)
+
+# ==============================================================================
 # miniaudio (header-only)
 # ==============================================================================
 add_library(miniaudio INTERFACE)
@@ -711,6 +725,27 @@ set(SDL_RENDER OFF CACHE INTERNAL "")
 set(SDL_SENSOR OFF CACHE INTERNAL "")
 set(SDL_HIDAPI_LIBUSB OFF CACHE INTERNAL "")
 
+# We never create an SDL window, so the video backends are dead weight.
+# SDL_VIDEO and SDL_X11 must stay on: system_gnulinux.cc dlopens
+# SDL_ShowSimpleMessageBox(), which dispatches through the video bootstrap list.
+set(SDL_WAYLAND OFF CACHE INTERNAL "")
+set(SDL_KMSDRM OFF CACHE INTERNAL "")
+set(SDL_VULKAN OFF CACHE INTERNAL "")
+set(SDL_OPENGL OFF CACHE INTERNAL "")
+set(SDL_OPENGLES OFF CACHE INTERNAL "")
+
+# Of the X11 extensions only Xdbe and Xrandr are reachable from the messagebox
+# toolkit. The rest guard windowing and input code we never enter.
+set(SDL_X11_XCURSOR OFF CACHE INTERNAL "")
+set(SDL_X11_XFIXES OFF CACHE INTERNAL "")
+set(SDL_X11_XINPUT OFF CACHE INTERNAL "")
+set(SDL_X11_XSCRNSAVER OFF CACHE INTERNAL "")
+set(SDL_X11_XSHAPE OFF CACHE INTERNAL "")
+set(SDL_X11_XSYNC OFF CACHE INTERNAL "")
+set(SDL_X11_XTEST OFF CACHE INTERNAL "")
+set(SDL_FRIBIDI OFF CACHE INTERNAL "")
+set(SDL_LIBTHAI OFF CACHE INTERNAL "")
+
 # SDL3's sdlcommands.cmake uses file(GLOB CONFIGURE_DEPENDS ...) for its
 # source lists. CMake honours that by emitting a "Re-checking globbed
 # directories" probe on every build — slow and pointless for a submodule
@@ -874,82 +909,49 @@ endfunction()
 
 # --- libavutil ---
 add_library(libavutil STATIC
-  FFmpeg/libavutil/adler32.c
-  FFmpeg/libavutil/aes.c
-  FFmpeg/libavutil/aes_ctr.c
   FFmpeg/libavutil/audio_fifo.c
   FFmpeg/libavutil/avstring.c
   FFmpeg/libavutil/avsscanf.c
-  FFmpeg/libavutil/base64.c
-  FFmpeg/libavutil/blowfish.c
   FFmpeg/libavutil/bprint.c
   FFmpeg/libavutil/buffer.c
-  FFmpeg/libavutil/cast5.c
-  FFmpeg/libavutil/camellia.c
   FFmpeg/libavutil/channel_layout.c
-  FFmpeg/libavutil/csp.c
   FFmpeg/libavutil/cpu.c
   FFmpeg/libavutil/crc.c
   FFmpeg/libavutil/des.c
   FFmpeg/libavutil/dict.c
   FFmpeg/libavutil/display.c
-  FFmpeg/libavutil/dovi_meta.c
-  FFmpeg/libavutil/downmix_info.c
-  FFmpeg/libavutil/encryption_info.c
   FFmpeg/libavutil/error.c
   FFmpeg/libavutil/eval.c
   FFmpeg/libavutil/fifo.c
-  FFmpeg/libavutil/file.c
   FFmpeg/libavutil/file_open.c
   FFmpeg/libavutil/float_dsp.c
-  FFmpeg/libavutil/fixed_dsp.c
   FFmpeg/libavutil/frame.c
-  FFmpeg/libavutil/hash.c
-  FFmpeg/libavutil/hdr_dynamic_metadata.c
-  FFmpeg/libavutil/hmac.c
   FFmpeg/libavutil/hwcontext.c
   FFmpeg/libavutil/imgutils.c
-  FFmpeg/libavutil/integer.c
-  FFmpeg/libavutil/intmath.c
-  FFmpeg/libavutil/lfg.c
-  FFmpeg/libavutil/lls.c
   FFmpeg/libavutil/log.c
   FFmpeg/libavutil/log2_tab.c
   FFmpeg/libavutil/mathematics.c
   FFmpeg/libavutil/mastering_display_metadata.c
-  FFmpeg/libavutil/md5.c
   FFmpeg/libavutil/mem.c
-  FFmpeg/libavutil/murmur3.c
   FFmpeg/libavutil/opt.c
   FFmpeg/libavutil/parseutils.c
   FFmpeg/libavutil/pixdesc.c
-  FFmpeg/libavutil/pixelutils.c
   FFmpeg/libavutil/random_seed.c
   FFmpeg/libavutil/rational.c
   FFmpeg/libavutil/reverse.c
   FFmpeg/libavutil/rc4.c
-  FFmpeg/libavutil/ripemd.c
   FFmpeg/libavutil/samplefmt.c
   FFmpeg/libavutil/sha.c
-  FFmpeg/libavutil/sha512.c
   FFmpeg/libavutil/slicethread.c
   FFmpeg/libavutil/spherical.c
   FFmpeg/libavutil/stereo3d.c
-  FFmpeg/libavutil/threadmessage.c
   FFmpeg/libavutil/time.c
   FFmpeg/libavutil/timecode.c
-  FFmpeg/libavutil/tree.c
-  FFmpeg/libavutil/twofish.c
   FFmpeg/libavutil/utils.c
-  FFmpeg/libavutil/xga_font_data.c
-  FFmpeg/libavutil/xtea.c
-  FFmpeg/libavutil/tea.c
   FFmpeg/libavutil/tx.c
   FFmpeg/libavutil/tx_float.c
   FFmpeg/libavutil/tx_double.c
   FFmpeg/libavutil/tx_int32.c
-  FFmpeg/libavutil/video_enc_params.c
-  FFmpeg/libavutil/film_grain_params.c
   FFmpeg/libavutil/side_data.c
   FFmpeg/libavutil/refstruct.c
   FFmpeg/libavutil/container_fifo.c
@@ -962,11 +964,6 @@ add_library(libavutil STATIC
 if(XE_TARGET_X86_64)
   target_sources(libavutil PRIVATE
     FFmpeg/libavutil/x86/cpu.c
-    FFmpeg/libavutil/x86/fixed_dsp_init.c
-    FFmpeg/libavutil/x86/float_dsp_init.c
-    FFmpeg/libavutil/x86/imgutils_init.c
-    FFmpeg/libavutil/x86/lls_init.c
-    FFmpeg/libavutil/x86/tx_float_init.c
   )
 endif()
 # aarch64 platform files
@@ -991,46 +988,24 @@ ffmpeg_common(libavutil)
 
 # --- libavcodec ---
 add_library(libavcodec STATIC
-  FFmpeg/libavcodec/ac3_parser.c
-  FFmpeg/libavcodec/adts_parser.c
   FFmpeg/libavcodec/allcodecs.c
   FFmpeg/libavcodec/avcodec.c
-  FFmpeg/libavcodec/avdct.c
   FFmpeg/libavcodec/packet.c
   FFmpeg/libavcodec/bitstream.c
   FFmpeg/libavcodec/bitstream_filters.c
   FFmpeg/libavcodec/bsf.c
   FFmpeg/libavcodec/codec_desc.c
   FFmpeg/libavcodec/codec_par.c
-  FFmpeg/libavcodec/d3d11va.c
   FFmpeg/libavcodec/decode.c
-  FFmpeg/libavcodec/dirac.c
-  FFmpeg/libavcodec/dv_profile.c
   FFmpeg/libavcodec/encode.c
-  FFmpeg/libavcodec/imgconvert.c
-  FFmpeg/libavcodec/jni.c
-  FFmpeg/libavcodec/mathtables.c
-  FFmpeg/libavcodec/mediacodec.c
-  FFmpeg/libavcodec/mpeg12framerate.c
   FFmpeg/libavcodec/options.c
   FFmpeg/libavcodec/parser.c
   FFmpeg/libavcodec/parsers.c
   FFmpeg/libavcodec/profiles.c
-  FFmpeg/libavcodec/qsv_api.c
   FFmpeg/libavcodec/raw.c
   FFmpeg/libavcodec/utils.c
-  FFmpeg/libavcodec/vorbis_parser.c
-  FFmpeg/libavcodec/xiph.c
   FFmpeg/libavcodec/dct32_fixed.c
   FFmpeg/libavcodec/dct32_float.c
-  FFmpeg/libavcodec/faandct.c
-  FFmpeg/libavcodec/faanidct.c
-  FFmpeg/libavcodec/fdctdsp.c
-  FFmpeg/libavcodec/jfdctfst.c
-  FFmpeg/libavcodec/jfdctint.c
-  FFmpeg/libavcodec/idctdsp.c
-  FFmpeg/libavcodec/simple_idct.c
-  FFmpeg/libavcodec/jrevdct.c
   FFmpeg/libavcodec/mpegaudio.c
   FFmpeg/libavcodec/mpegaudiodec_common.c
   FFmpeg/libavcodec/mpegaudiodsp.c
@@ -1060,30 +1035,20 @@ add_library(libavcodec STATIC
   FFmpeg/libavcodec/mpegaudiotabs.c
   FFmpeg/libavcodec/tiff_common.c
 )
-if(WIN32)
-  target_sources(libavcodec PRIVATE FFmpeg/libavcodec/file_open.c)
-endif()
 # x86 platform files
 if(XE_TARGET_X86_64)
   target_sources(libavcodec PRIVATE
-    FFmpeg/libavcodec/x86/constants.c
-    FFmpeg/libavcodec/x86/fdctdsp_init.c
-    FFmpeg/libavcodec/x86/idctdsp_init.c
     FFmpeg/libavcodec/x86/mpegaudiodsp.c
-    FFmpeg/libavcodec/x86/fdct.c
   )
 endif()
 # aarch64 platform files
 if(XE_TARGET_AARCH64)
   if(XE_HAS_GAS_ASM)
     target_sources(libavcodec PRIVATE
-      FFmpeg/libavcodec/aarch64/idctdsp_init_aarch64.c
       FFmpeg/libavcodec/aarch64/mpegaudiodsp_init.c
     )
     xe_add_gas_sources(libavcodec
-      FFmpeg/libavcodec/aarch64/idctdsp_neon.S
       FFmpeg/libavcodec/aarch64/mpegaudiodsp_neon.S
-      FFmpeg/libavcodec/aarch64/simple_idct_neon.S
     )
   endif()
 endif()
@@ -1106,11 +1071,9 @@ add_library(libavformat STATIC
   FFmpeg/libavformat/id3v1.c
   FFmpeg/libavformat/id3v2.c
   FFmpeg/libavformat/metadata.c
-  FFmpeg/libavformat/mux.c
   FFmpeg/libavformat/options.c
   FFmpeg/libavformat/protocols.c
   FFmpeg/libavformat/riff.c
-  FFmpeg/libavformat/sdp.c
   FFmpeg/libavformat/url.c
   FFmpeg/libavformat/utils.c
   FFmpeg/libavformat/riffdec.c
@@ -1129,9 +1092,6 @@ add_library(libavformat STATIC
   FFmpeg/libavformat/asf_tags.c
   FFmpeg/libavformat/to_upper4.c
 )
-if(WIN32)
-  target_sources(libavformat PRIVATE FFmpeg/libavformat/file_open.c)
-endif()
 target_link_libraries(libavformat PRIVATE libavutil libavcodec)
 ffmpeg_common(libavformat)
 
@@ -1162,6 +1122,11 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
       find_package(OpenGL REQUIRED)
       find_package(ZLIB REQUIRED)
       find_package(EXPAT REQUIRED)
+      if(NOT APPLE)
+        # wxWebRequest's only Linux backend. Without it wx drops wxWebRequest
+        # and with it wx::net.
+        find_package(CURL REQUIRED)
+      endif()
       # Tag bare IMPORTED_LOCATION imports with Release before wx is added —
       # wx references these targets during its own configure pass, where
       # CMAKE_MAP_IMPORTED_CONFIG_DEBUG="Release;NOCONFIG" can't resolve a
@@ -1200,6 +1165,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
     set(wxUSE_STC OFF CACHE BOOL "" FORCE)
     set(wxUSE_HTML OFF CACHE BOOL "" FORCE)
     set(wxUSE_XRC OFF CACHE BOOL "" FORCE)
+    set(wxUSE_XML OFF CACHE BOOL "" FORCE)
     set(wxUSE_PRINTING_ARCHITECTURE OFF CACHE BOOL "" FORCE)
     set(wxUSE_HELP OFF CACHE BOOL "" FORCE)
     set(wxUSE_MS_HTML_HELP OFF CACHE BOOL "" FORCE)
@@ -1216,6 +1182,13 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
     set(wxUSE_LIBJPEG OFF CACHE BOOL "" FORCE)
     set(wxUSE_LIBWEBP OFF CACHE BOOL "" FORCE)
     set(wxUSE_NANOSVG OFF CACHE BOOL "" FORCE)
+    set(wxUSE_APPINDICATOR OFF CACHE BOOL "" FORCE)
+    # Forced since wx caches these as OFF when it can't find a backend, which
+    # would outlive installing one.
+    set(wxUSE_WEBREQUEST ON CACHE BOOL "" FORCE)
+    if(UNIX AND NOT APPLE)
+      set(wxUSE_WEBREQUEST_CURL ON CACHE BOOL "" FORCE)
+    endif()
     add_subdirectory(wxWidgets)
     if(WIN32)
       # Generic file dialog (not built by default on MSW) — used as a Wine
@@ -1263,24 +1236,24 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
     set_property(DIRECTORY PROPERTY COMPILE_OPTIONS
         "${_xe_save_thirdparty_options}")
     add_library(xe-wxWidgets INTERFACE)
-    target_link_libraries(xe-wxWidgets INTERFACE wx::aui wx::adv wx::core wx::base)
+    target_link_libraries(xe-wxWidgets INTERFACE
+        wx::aui wx::adv wx::core wx::net wx::base)
     # Consumers including wx headers must agree on wxDEBUG_LEVEL with the
     # compiled wx libraries to keep inline assert expansions consistent.
     target_compile_definitions(xe-wxWidgets INTERFACE
         $<$<CONFIG:Release>:wxDEBUG_LEVEL=0>)
 endif()
 
-# spirv_to_dxil (Mesa, NIR based SPIR-V to DXIL) is the sole D3D12 guest shader
+# spirv_to_dxil (Mesa, NIR based SPIR-V to DXIL) is the D3D12 guest shader
 # backend. Mesa is meson only, so it is built out of tree by meson and linked
-# statically into the exe (no runtime DLL, matching the rest of xenia).
-# libspirv_to_dxil.a does not bundle its deps, so we link the whole archive set
-# (nir, vtn, compiler, dxil_compiler, util, blake3, zlib). Built once as release
-# to match xenia's /MD CRT in every config. Only the D3D12 backend (Windows)
-# consumes it, so the build is gated on WIN32.
+# statically (no runtime DLL, matching the rest of xenia). libspirv_to_dxil.a
+# does not bundle its deps, so we link the whole archive set (nir, vtn,
+# compiler, dxil_compiler, util, blake3, and on Windows the bundled zlib wrap).
 #
-# The meson setup must run in an MSVC environment so meson detects cl. Verify the
-# archive paths below against the real build output if Mesa is restructured.
-if(WIN32)
+# Built on WIN32 and APPLE. The Windows build runs release with /MD to match
+# xenia's CRT under an MSVC environment so meson detects cl. Verify the archive
+# paths below against the real build output if Mesa is restructured.
+if(WIN32 OR APPLE)
   # Mesa source tree built for spirv_to_dxil. Defaults to the third_party/mesa
   # submodule (our fork with the barycentric, linking, keep_io_vars and FSI->ROV
   # changes). Repoint this cache variable to build a different Mesa checkout.
@@ -1291,8 +1264,8 @@ if(WIN32)
   set(_xe_mesa_dir "${XENIA_MESA_SOURCE_DIR}")
   if(NOT EXISTS "${_xe_mesa_dir}/meson.build")
     message(FATAL_ERROR
-      "The D3D12 backend requires a Mesa tree at ${_xe_mesa_dir} for "
-      "spirv_to_dxil. Run: git submodule update --init third_party/mesa "
+      "spirv_to_dxil requires a Mesa tree at ${_xe_mesa_dir}. Run: "
+      "git submodule update --init third_party/mesa "
       "(or set XENIA_MESA_SOURCE_DIR to your Mesa checkout).")
   endif()
   find_program(XE_MESON_EXECUTABLE meson)
@@ -1314,8 +1287,12 @@ if(WIN32)
     "${_xe_s2d_build}/src/util/libmesa_util.a"
     "${_xe_s2d_build}/src/util/libmesa_util_simd.a"
     "${_xe_s2d_build}/src/c11/impl/libmesa_util_c11.a"
-    "${_xe_s2d_build}/src/util/blake3/libblake3.a"
-    "${_xe_s2d_build}/subprojects/zlib-1.3.1/libz.a")
+    "${_xe_s2d_build}/src/util/blake3/libblake3.a")
+  # Windows has no system zlib, so meson builds the bundled wrap subproject.
+  # macOS finds the system zlib, so that archive is never emitted there.
+  if(WIN32)
+    list(APPEND _xe_s2d_deps "${_xe_s2d_build}/subprojects/zlib-1.3.1/libz.a")
+  endif()
 
   # We only static-link the archives above; spirv_to_dxil is a both_libraries()
   # target, so a full "meson compile" also links spirv_to_dxil.dll and builds
@@ -1329,22 +1306,122 @@ if(WIN32)
     list(APPEND _xe_s2d_ninja_targets "${_xe_ar_rel}")
   endforeach()
 
+  # Meson takes [host_machine] from the build machine, so an off-arch target
+  # needs a cross file - which also drops its run-the-sanity-binary probe.
+  set(_xe_s2d_host_aarch64 FALSE)
+  if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64|arm64")
+    set(_xe_s2d_host_aarch64 TRUE)
+  endif()
+  set(_xe_s2d_cross FALSE)
+  if((XE_TARGET_AARCH64 AND NOT _xe_s2d_host_aarch64) OR
+     (_xe_s2d_host_aarch64 AND NOT XE_TARGET_AARCH64))
+    set(_xe_s2d_cross TRUE)
+  endif()
+  if(XE_TARGET_AARCH64)
+    set(_xe_s2d_cpu "aarch64")
+  else()
+    set(_xe_s2d_cpu "x86_64")
+  endif()
+
+  # Common meson feature toggles. MSVC also needs the CRT selector and a warning
+  # override; clang (macOS) rejects the MSVC /wd flag, so those are MSVC only.
+  set(_xe_s2d_meson_args
+    --default-library=static --buildtype=release
+    -Dspirv-to-dxil=true
+    -Dgallium-drivers= -Dvulkan-drivers= -Dplatforms=
+    -Dglx=disabled -Degl=disabled -Dgbm=disabled
+    -Dopengl=false -Dgles1=disabled -Dgles2=disabled
+    -Dllvm=disabled -Dvideo-codecs=)
+  if(MSVC)
+    # /MD matches xenia's CRT; /wd4189 overrides mesa's /we4189: Release strips
+    # asserts, leaving assert-only locals that would trip the promoted warning.
+    list(APPEND _xe_s2d_meson_args
+      -Db_vscrt=md -Dc_args=/wd4189 -Dcpp_args=/wd4189)
+    if(_xe_s2d_cross)
+      set(_xe_s2d_cross_file
+        "${CMAKE_CURRENT_BINARY_DIR}/mesa-windows-cross-${_xe_s2d_cpu}.ini")
+      file(WRITE "${_xe_s2d_cross_file}"
+"[binaries]
+c = 'cl'
+cpp = 'cl'
+ar = 'lib'
+
+[host_machine]
+system = 'windows'
+cpu_family = '${_xe_s2d_cpu}'
+cpu = '${_xe_s2d_cpu}'
+endian = 'little'
+")
+      list(APPEND _xe_s2d_meson_args --cross-file "${_xe_s2d_cross_file}")
+    endif()
+  endif()
+  if(APPLE)
+    # Mesa's meson build sets no deployment target, so its objects get the SDK's
+    # and the linker warns about every one of them being newer than what the
+    # rest of the tree links against.
+    if(CMAKE_OSX_DEPLOYMENT_TARGET)
+      list(APPEND _xe_s2d_meson_args
+        "-Dc_args=-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+        "-Dcpp_args=-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    endif()
+
+    # Extend the Apple ar/ranlib "has no symbols" quieting we apply to CMake
+    # targets (root CMakeLists.txt) to meson's mesa build. Several util/nir
+    # sources compile to empty objects on macOS (futex is Linux-only,
+    # strndup/u_string/u_atomic/bitscan are libc or inline, nir_validate is
+    # NDEBUG-gated). Meson's rule is `ar csr ... && ranlib -c ...` and both
+    # steps warn. Meson hardcodes the `csr` args, so route ar through a wrapper
+    # that creates with `Scr` (capital S skips the symtab, keeping ar quiet) and
+    # override ranlib with -no_warning_for_no_symbols (it writes the symtab) via
+    # a native file - the same recipe as CMAKE_*_ARCHIVE_CREATE/FINISH. Written
+    # outside _xe_s2d_build, which configure wipes.
+    set(_xe_s2d_ar "${CMAKE_CURRENT_BINARY_DIR}/mesa-macos-ar.sh")
+    file(WRITE "${_xe_s2d_ar}" [=[#!/bin/sh
+# Create static archives with 'Scr' (capital S skips the symbol table, so Apple
+# ar stays quiet on zero-symbol objects); the ranlib step writes it afterward.
+# Pass meson's `ar --version` linker probe straight through for detection.
+case "$1" in
+  c*) shift; exec /usr/bin/ar Scr "$@" ;;
+  *) exec /usr/bin/ar "$@" ;;
+esac
+]=])
+    file(CHMOD "${_xe_s2d_ar}"
+      PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ WORLD_READ)
+    set(_xe_s2d_ar_ini
+      "ar = '${_xe_s2d_ar}'\nranlib = ['/usr/bin/ranlib', '-no_warning_for_no_symbols']\n")
+    set(_xe_s2d_native "${CMAKE_CURRENT_BINARY_DIR}/mesa-macos-native.ini")
+    file(WRITE "${_xe_s2d_native}" "[binaries]\n${_xe_s2d_ar_ini}")
+    list(APPEND _xe_s2d_meson_args --native-file "${_xe_s2d_native}")
+
+    if(_xe_s2d_cross)
+      # meson spells it aarch64, clang -arch spells it arm64.
+      string(REPLACE "aarch64" "arm64" _xe_s2d_clang_arch "${_xe_s2d_cpu}")
+      set(_xe_s2d_cross_file
+        "${CMAKE_CURRENT_BINARY_DIR}/mesa-macos-cross-${_xe_s2d_cpu}.ini")
+      file(WRITE "${_xe_s2d_cross_file}"
+"[binaries]
+c = ['${CMAKE_C_COMPILER}', '-arch', '${_xe_s2d_clang_arch}']
+cpp = ['${CMAKE_CXX_COMPILER}', '-arch', '${_xe_s2d_clang_arch}']
+objc = ['${CMAKE_C_COMPILER}', '-arch', '${_xe_s2d_clang_arch}']
+${_xe_s2d_ar_ini}
+[host_machine]
+system = 'darwin'
+cpu_family = '${_xe_s2d_cpu}'
+cpu = '${_xe_s2d_cpu}'
+endian = 'little'
+")
+      list(APPEND _xe_s2d_meson_args --cross-file "${_xe_s2d_cross_file}")
+    endif()
+  endif()
+
   include(ExternalProject)
   # Wipe then setup keeps the configure step idempotent across reconfigures.
-  # /wd4189 overrides mesa's /we4189: Release strips asserts, leaving assert-only
-  # locals that would otherwise trip the promoted warning as an error.
   ExternalProject_Add(mesa_spirv_to_dxil
     SOURCE_DIR "${_xe_mesa_dir}"
     CONFIGURE_COMMAND
       "${CMAKE_COMMAND}" -E rm -rf "${_xe_s2d_build}"
       COMMAND "${XE_MESON_EXECUTABLE}" setup "${_xe_s2d_build}" "${_xe_mesa_dir}"
-        --default-library=static --buildtype=release -Db_vscrt=md
-        -Dc_args=/wd4189 -Dcpp_args=/wd4189
-        -Dspirv-to-dxil=true
-        -Dgallium-drivers= -Dvulkan-drivers= -Dplatforms=
-        -Dglx=disabled -Degl=disabled -Dgbm=disabled
-        -Dopengl=false -Dgles1=disabled -Dgles2=disabled
-        -Dllvm=disabled -Dvideo-codecs=
+        ${_xe_s2d_meson_args}
     BUILD_COMMAND "${XE_NINJA_EXECUTABLE}" -C "${_xe_s2d_build}"
       ${_xe_s2d_ninja_targets}
     INSTALL_COMMAND ""
@@ -1356,17 +1433,56 @@ if(WIN32)
 
   add_library(spirv_to_dxil STATIC IMPORTED GLOBAL)
   add_dependencies(spirv_to_dxil mesa_spirv_to_dxil)
-  # Built release once. synchronization/version are the only non-default system
-  # libs Mesa needs.
+  # synchronization/version are the only non-default system libs Mesa needs, and
+  # only on Windows (mesa's meson resolves both to nothing off Windows).
+  set(_xe_s2d_link ${_xe_s2d_deps})
+  if(WIN32)
+    list(APPEND _xe_s2d_link synchronization version)
+  endif()
   set_target_properties(spirv_to_dxil PROPERTIES
     IMPORTED_LOCATION "${_xe_s2d_main}"
     INTERFACE_INCLUDE_DIRECTORIES
       "${_xe_mesa_dir}/src/microsoft/spirv_to_dxil;${_xe_mesa_dir}/src/microsoft/compiler"
-    INTERFACE_LINK_LIBRARIES "${_xe_s2d_deps};synchronization;version")
+    INTERFACE_LINK_LIBRARIES "${_xe_s2d_link}")
   # Multi-Config evaluates every config, so point each at the same archive.
   foreach(_xe_cfg IN LISTS CMAKE_CONFIGURATION_TYPES)
     string(TOUPPER "${_xe_cfg}" _xe_cfg_u)
     set_target_properties(spirv_to_dxil PROPERTIES
       IMPORTED_LOCATION_${_xe_cfg_u} "${_xe_s2d_main}")
+  endforeach()
+endif()
+
+# ==============================================================================
+# Metal Shader Converter (Apple only — the DXIL -> AIR half of the Metal guest
+# shader path, taking the DXIL that spirv_to_dxil above produces)
+# ==============================================================================
+# Apache 2.0 but closed source, so it is downloaded rather than built. The
+# headers are vendored here; the dylib is mirrored as a release asset and
+# fetched by `./xenia-build.py msc` into .metal-shader-converter/, because
+# Apple's own download requires a developer login.
+if(APPLE)
+  set(_xe_msc_root "${CMAKE_CURRENT_SOURCE_DIR}/metal-shader-converter")
+  file(GLOB _xe_msc_found
+       "${PROJECT_SOURCE_DIR}/.metal-shader-converter/*/libmetalirconverter.dylib")
+  if(NOT _xe_msc_found)
+    message(FATAL_ERROR
+      "The Metal backend requires Apple's Metal Shader Converter. Run: "
+      "./xenia-build.py msc")
+  endif()
+  list(GET _xe_msc_found 0 _xe_msc_dylib)
+
+  add_library(xenia-third-party-metal-shader-converter SHARED IMPORTED GLOBAL)
+  # IR_RUNTIME_METALCPP makes metal_irconverter_runtime.h's inline helpers take
+  # metal-cpp types instead of Objective-C ones.
+  set_target_properties(xenia-third-party-metal-shader-converter PROPERTIES
+    IMPORTED_LOCATION "${_xe_msc_dylib}"
+    INTERFACE_INCLUDE_DIRECTORIES
+      "${_xe_msc_root}/include;${_xe_msc_root}/include/metal_irconverter;${_xe_msc_root}/include/metal_irconverter_runtime"
+    INTERFACE_COMPILE_DEFINITIONS "IR_RUNTIME_METALCPP")
+  # Multi-Config evaluates every config, so point each at the same dylib.
+  foreach(_xe_cfg IN LISTS CMAKE_CONFIGURATION_TYPES)
+    string(TOUPPER "${_xe_cfg}" _xe_cfg_u)
+    set_target_properties(xenia-third-party-metal-shader-converter PROPERTIES
+      IMPORTED_LOCATION_${_xe_cfg_u} "${_xe_msc_dylib}")
   endforeach()
 endif()

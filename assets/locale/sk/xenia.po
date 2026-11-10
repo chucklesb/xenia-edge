@@ -11,39 +11,13 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=3; plural=(n==1) ? 0 : (n>=2 && n<=4) ? 1 : 2;\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"Vyhľadať súbor?"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   %zu už nainštalovaných"
 
-#: src/xenia/ui/game_list_panel_wx.cc:1240
-msgid " (%zu discs)"
-msgstr " (počet diskov: %zu)"
-
 #: src/xenia/ui/install_progress_dialog_wx.cc:185
 msgid " - %s (%08X)"
 msgstr " — %s (%08X)"
-
-#: src/xenia/ui/game_config_dialog_wx.cc:285
-msgid "%08X - Config Overrides"
-msgstr ""
-
-#: src/xenia/ui/patches_dialog_wx.cc:37
-msgid "%s (%08X)"
-msgstr "%s (%08X)"
-
-#: src/xenia/ui/game_config_dialog_wx.cc:286
-msgid "%s (%08X) - Config Overrides"
-msgstr "%s (%08X) — prepísania konfigurácie"
 
 #: src/xenia/app/emulator_window.cc:1995
 msgid "%s (Slot %d)"
@@ -51,7 +25,7 @@ msgstr "%s (slot %d)"
 
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:52
 msgid "%zu directories scanned   %zu files probed   %zu games found"
-msgstr ""
+msgstr "Prehľadaných priečinkov: %zu   preskúmaných súborov: %zu   nájdených hier: %zu"
 "Prehľadaných adresárov: %zu   preskúmaných súborov: %zu   nájdených hier: %zu"
 
 #: src/xenia/app/emulator_window.cc:895
@@ -64,14 +38,14 @@ msgstr "Prid&ať hry…"
 
 #: src/xenia/app/emulator_window.cc:864
 msgid "&Audio"
-msgstr "&Zvuk"
+msgstr "Z&vuk"
 
 #: src/xenia/app/emulator_window.cc:824
 msgid "&Configuration"
 msgstr "Konfigurá&cia"
 
 #: src/xenia/app/emulator_window.cc:898
-msgid "&Controllers"
+msgid "C&ontrollers"
 msgstr "&Ovládače"
 
 #: src/xenia/app/emulator_window.cc:786
@@ -80,7 +54,7 @@ msgstr "&Súbor"
 
 #: src/xenia/app/emulator_window.cc:884
 msgid "&Help"
-msgstr "&Pomocník"
+msgstr "Po&mocník"
 
 #: src/xenia/app/emulator_window.cc:877
 msgid "&Install Content..."
@@ -113,10 +87,6 @@ msgstr "&Zobrazenie"
 #: src/xenia/app/emulator_window.cc:867
 msgid "&Volume"
 msgstr "&Hlasitosť"
-
-#: src/xenia/ui/game_scan_progress_dialog_wx.cc:276
-msgid "(Installed) "
-msgstr "(nainštalované) "
 
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:62
 msgid "(unknown title)"
@@ -190,14 +160,6 @@ msgstr "Argentína"
 #: src/xenia/ui/profile_editor_dialog_wx.cc:68
 msgid "Armenia"
 msgstr "Arménsko"
-
-#: src/xenia/ui/quick_settings_dialog_wx.cc:252
-msgid "Audio"
-msgstr "Zvuk"
-
-#: src/xenia/ui/quick_settings_dialog_wx.cc:258
-msgid "Audio Backend:"
-msgstr "Zvukový backend:"
 
 #: src/xenia/app/emulator_window.cc:2402
 msgid "Auto (%s)"
@@ -312,10 +274,6 @@ msgstr "Kompatibilita"
 msgid "Complete"
 msgstr "Dokončené"
 
-#: src/xenia/ui/game_list_panel_wx.cc:1028
-msgid "Config Overrides..."
-msgstr "Prepísania konfigurácie…"
-
 #: src/xenia/ui/advanced_settings_dialog_wx.cc:104
 #: src/xenia/ui/advanced_settings_dialog_wx.cc:419
 msgid "Configuration Manager"
@@ -364,22 +322,9 @@ msgstr "Chorvátsko"
 msgid "Czech Republic"
 msgstr "Česká republika"
 
-#: src/xenia/ui/game_list_panel_wx.cc:990
-msgid "DLC"
-msgstr "DLC"
-
 #: src/xenia/app/emulator_window.cc:335
 msgid "Dance Pad"
 msgstr "Tanečná podložka"
-
-#: src/xenia/ui/game_list_panel_wx.cc:690
-#: src/xenia/ui/game_list_panel_wx.cc:693
-msgid "Default"
-msgstr "Predvolené"
-
-#: src/xenia/ui/quick_settings_dialog_wx.cc:263
-msgid "Default Volume:"
-msgstr "Predvolená hlasitosť:"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:90
 msgid "Denmark"
@@ -420,14 +365,6 @@ msgstr "&Koniec"
 msgid "Ecuador"
 msgstr "Ekvádor"
 
-#: src/xenia/ui/game_list_panel_wx.cc:648
-msgid "Edit Discs"
-msgstr "Upraviť disky"
-
-#: src/xenia/ui/game_list_panel_wx.cc:937
-msgid "Edit Discs..."
-msgstr "Upraviť disky…"
-
 #: src/xenia/app/emulator_window.cc:2053
 msgid "Edit..."
 msgstr "Upraviť…"
@@ -450,49 +387,15 @@ msgstr "Nastavenia emulátora"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:52
 msgid "English"
-msgstr "angličtina"
+msgstr "Angličtina"
 
 #: src/xenia/app/emulator_window.cc:2076 src/xenia/app/emulator_window.cc:2220
 msgid "Enter gamertag for new profile:"
 msgstr "Zadajte gamertag pre nový profil:"
 
-#: src/xenia/ui/game_list_panel_wx.cc:754
-msgid "Enter new label:"
-msgstr "Zadajte nový popis:"
-
-#: src/xenia/ui/game_config_dialog_wx.cc:435
-msgid "Error"
-msgstr "Chyba"
-
 #: src/xenia/ui/profile_editor_dialog_wx.cc:94
 msgid "Estonia"
 msgstr "Estónsko"
-
-#: src/xenia/app/emulator_window.cc:2421
-msgid ""
-"Experimental fork of Xenia Canary.\n"
-"\n"
-"https://github.com/has207/xenia-edge\n"
-"\n"
-"Branch: %s\n"
-"Commit: %s\n"
-"Build Date: %s\n"
-"\n"
-"UI font: Inter by Rasmus Andersson (https://rsms.me/inter/, SIL Open Font "
-"License 1.1).\n"
-"Icons by Icons8 (https://icons8.com)."
-msgstr ""
-"Experimentálny fork Xenia Canary.\n"
-"\n"
-"https://github.com/has207/xenia-edge\n"
-"\n"
-"Vetva: %s\n"
-"Commit: %s\n"
-"Dátum zostavenia: %s\n"
-"\n"
-"Písmo rozhrania: Inter od Rasmusa Anderssona (https://rsms.me/inter/, SIL "
-"Open Font License 1.1).\n"
-"Ikony: Icons8 (https://icons8.com)."
 
 #: src/xenia/app/emulator_window.cc:887
 msgid "FA&Q..."
@@ -501,14 +404,6 @@ msgstr "FA&Q…"
 #: src/xenia/ui/patches_dialog_wx.cc:225
 msgid "Failed to save changes."
 msgstr "Zmeny sa nepodarilo uložiť."
-
-#: src/xenia/ui/game_config_dialog_wx.cc:434
-msgid "Failed to save: %s"
-msgstr "Uloženie zlyhalo: %s"
-
-#: src/xenia/ui/patches_dialog_wx.cc:214
-msgid "Failed to update patch state."
-msgstr "Nepodarilo sa aktualizovať stav patcha."
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:181
 #: src/xenia/ui/profile_editor_dialog_wx.cc:185
@@ -553,7 +448,7 @@ msgstr "Francúzsko"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:55
 msgid "French"
-msgstr "francúzština"
+msgstr "Francúzština"
 
 #: src/xenia/ui/quick_settings_dialog_wx.cc:281
 msgid "Full"
@@ -580,8 +475,8 @@ msgid "Gamepad"
 msgstr "Gamepad"
 
 #: src/xenia/ui/game_list_panel_wx.cc:96
-msgid "Gameplay"
-msgstr "Hrateľnosť"
+msgid "Gets in game"
+msgstr "Dostane sa do hry"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:458
 msgid "Gamer Bio:"
@@ -621,7 +516,7 @@ msgstr "Gruzínsko"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:54
 msgid "German"
-msgstr "nemčina"
+msgstr "Nemčina"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:89
 msgid "Germany"
@@ -675,10 +570,6 @@ msgstr "Maďarsko"
 msgid "Iceland"
 msgstr "Island"
 
-#: src/xenia/ui/game_list_panel_wx.cc:302
-msgid "Icon"
-msgstr "Ikona"
-
 #: src/xenia/ui/profile_editor_dialog_wx.cc:396
 msgid "Icon change is disabled while a title is running."
 msgstr "Zmena ikony je zakázaná, kým beží titul."
@@ -715,10 +606,6 @@ msgstr "Cesta inštalácie: "
 msgid "Installation Progress"
 msgstr "Priebeh inštalácie"
 
-#: src/xenia/ui/game_list_panel_wx.cc:761
-msgid "Invalid Label"
-msgstr "Neplatný popis"
-
 #: src/xenia/ui/profile_editor_dialog_wx.cc:594
 #: src/xenia/ui/profile_editor_dialog_wx.cc:602
 msgid "Invalid file"
@@ -754,7 +641,7 @@ msgstr "Izrael"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:57
 msgid "Italian"
-msgstr "taliančina"
+msgstr "Taliančina"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:115
 msgid "Italy"
@@ -770,7 +657,7 @@ msgstr "Japonsko"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:53
 msgid "Japanese"
-msgstr "japončina"
+msgstr "Japončina"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:117
 msgid "Jordan"
@@ -790,7 +677,7 @@ msgstr "Kórea"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:58
 msgid "Korean"
-msgstr "kórejčina"
+msgstr "Kórejčina"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:122
 msgid "Kuwait"
@@ -799,15 +686,6 @@ msgstr "Kuvajt"
 #: src/xenia/ui/profile_editor_dialog_wx.cc:120
 msgid "Kyrgyzstan"
 msgstr "Kirgizsko"
-
-#: src/xenia/ui/game_list_panel_wx.cc:691
-#: src/xenia/ui/game_list_panel_wx.cc:695
-msgid "Label"
-msgstr "Popis"
-
-#: src/xenia/ui/game_list_panel_wx.cc:761
-msgid "Label cannot contain '::'."
-msgstr "Popis nesmie obsahovať „::“."
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:464
 #: src/xenia/ui/quick_settings_dialog_wx.cc:311
@@ -865,7 +743,7 @@ msgstr "Načítavajú sa tituly…"
 
 #: src/xenia/ui/game_list_panel_wx.cc:98
 msgid "Loads"
-msgstr "Načítava sa"
+msgstr "Spustí sa"
 
 #: src/xenia/app/emulator_window.cc:2003
 msgid "Login"
@@ -964,6 +842,14 @@ msgstr "Žiadne profily nenájdené"
 msgid "No file path is set for this title."
 msgstr "Pre tento titul nie je nastavená cesta k súboru."
 
+#: src/xenia/ui/game_scan_progress_dialog_wx.cc:376
+msgid "No games found."
+msgstr "Nenašli sa žiadne hry."
+
+#: src/xenia/ui/game_scan_progress_dialog_wx.cc:376
+msgid "No new games found."
+msgstr "Nenašli sa žiadne nové hry."
+
 #: src/xenia/ui/profile_editor_dialog_wx.cc:178
 #: src/xenia/ui/profile_editor_dialog_wx.cc:184
 #: src/xenia/ui/quick_settings_dialog_wx.cc:279
@@ -1011,10 +897,6 @@ msgstr "Otvoriť"
 #: src/xenia/app/emulator_window.cc:951 src/xenia/app/emulator_window.cc:1716
 msgid "Open a title"
 msgstr "Otvoriť titul"
-
-#: src/xenia/ui/game_list_panel_wx.cc:949
-msgid "Open containing folder"
-msgstr "Otvoriť obsahujúci priečinok"
 
 #: src/xenia/ui/quick_settings_dialog_wx.cc:285
 msgid "Open using Rosetta"
@@ -1076,7 +958,7 @@ msgstr "Poľsko"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:62
 msgid "Polish"
-msgstr "poľština"
+msgstr "Poľština"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:149
 msgid "Portugal"
@@ -1084,7 +966,7 @@ msgstr "Portugalsko"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:60
 msgid "Portuguese"
-msgstr "portugalčina"
+msgstr "Portugalčina"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:184
 msgid "Pro"
@@ -1153,14 +1035,6 @@ msgstr "Odstrániť zo zoznamu"
 msgid "Remove this override"
 msgstr "Odstrániť toto prepísanie"
 
-#: src/xenia/ui/game_list_panel_wx.cc:754
-msgid "Rename Label"
-msgstr "Premenovať popis"
-
-#: src/xenia/ui/game_list_panel_wx.cc:728
-msgid "Rename Label..."
-msgstr "Premenovať popis…"
-
 #: src/xenia/ui/quick_settings_dialog_wx.cc:169
 msgid "Rendering:"
 msgstr "Vykresľovanie:"
@@ -1190,7 +1064,7 @@ msgstr "Rumunsko"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:63
 msgid "Russian"
-msgstr "ruština"
+msgstr "Ruština"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:153
 msgid "Russian Federation"
@@ -1216,7 +1090,7 @@ msgstr "Uložené. Prejaví sa pri ďalšom spustení."
 
 #: src/xenia/ui/game_list_panel_wx.cc:981
 msgid "Saves"
-msgstr "Uložené pozície"
+msgstr "Pozície"
 
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:120
 msgid "Scan for Games"
@@ -1277,7 +1151,7 @@ msgstr "Silver"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:61
 msgid "Simplified Chinese"
-msgstr "zjednodušená čínština"
+msgstr "Zjednodušená čínština"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:156
 msgid "Singapore"
@@ -1305,7 +1179,7 @@ msgstr "Španielsko"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:56
 msgid "Spanish"
-msgstr "španielčina"
+msgstr "Španielčina"
 
 #: src/xenia/ui/game_list_panel_wx.cc:301
 msgid "Status"
@@ -1314,10 +1188,6 @@ msgstr "Stav"
 #: src/xenia/ui/install_progress_dialog_wx.cc:181
 msgid "Status: %s"
 msgstr "Stav: %s"
-
-#: src/xenia/ui/game_scan_progress_dialog_wx.cc:239
-msgid "Status: Installed"
-msgstr "Stav: nainštalované"
 
 #: src/xenia/app/emulator_window.cc:1713
 msgid "Stop the running title and return to the list"
@@ -1374,10 +1244,6 @@ msgstr ""
 msgid "Title"
 msgstr "Titul"
 
-#: src/xenia/ui/game_list_panel_wx.cc:985
-msgid "Title Updates"
-msgstr "Aktualizácie titulu"
-
 #: src/xenia/ui/game_list_panel_wx.cc:597
 msgid "Title not found"
 msgstr "Titul sa nenašiel"
@@ -1388,7 +1254,7 @@ msgstr "Prepínače sa prejavia pri ďalšom spustení."
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:59
 msgid "Traditional Chinese"
-msgstr "tradičná čínština"
+msgstr "Tradičná čínština"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:165
 msgid "Trinidad And Tobago"
@@ -1535,8 +1401,8 @@ msgstr "titul %08X"
 
 
 #: src/xenia/ui/redist_installer_wx.cc:396
-msgid "dxcompiler.dll and dxil.dll not found, required for Direct3D 12 shaders. Download now (~26 MB)?"
-msgstr "dxcompiler.dll a dxil.dll sa nenašli, vyžadované pre shadery Direct3D 12. Stiahnuť teraz (~26 MB)?"
+msgid "dxil.dll not found, required for Direct3D 12 shaders. Download now (~26 MB)?"
+msgstr "dxil.dll sa nenašiel, vyžadovaný pre shadery Direct3D 12. Stiahnuť teraz (~26 MB)?"
 
 #: src/xenia/ui/redist_installer_wx.cc:438
 msgid "D3D12Core.dll not found, required for Shader Model 6.6. Download now (~35 MB) and restart?"
@@ -1581,3 +1447,382 @@ msgstr "Ladiaca vrstva Direct3D 12 bola nainštalovaná, ale automatický rešta
 #: src/xenia/ui/redist_installer_wx.cc:746
 msgid "vulkan-1.dll not found, required for the Vulkan graphics backend. Download now (~20 MB)?"
 msgstr "vulkan-1.dll sa nenašiel, vyžadovaný pre grafický backend Vulkan. Stiahnuť teraz (~20 MB)?"
+
+
+#: src/xenia/ui/game_info_panel_wx.cc:681
+msgid "%s belongs to title %08X."
+msgstr "%s patrí k titulu %08X."
+
+#: src/xenia/ui/game_info_panel_wx.cc:720
+msgid "%s could not be copied: %s"
+msgstr "%s sa nepodarilo skopírovať: %s"
+
+#: src/xenia/ui/game_info_panel_wx.cc:694
+msgid "%s is a different kind of content."
+msgstr "%s je iný druh obsahu."
+
+#: src/xenia/ui/game_info_panel_wx.cc:707
+msgid "%s is for a different release of this game."
+msgstr "%s patrí k inej verzii tejto hry."
+
+#: src/xenia/ui/game_info_panel_wx.cc:675
+msgid "%s is not a content package."
+msgstr "%s nie je balík obsahu."
+
+#: src/xenia/ui/game_list_panel_wx.cc:773
+msgid "(%zu discs)"
+msgstr "(počet diskov: %zu)"
+
+#: src/xenia/ui/game_info_panel_wx.cc:656
+msgid "All Files (*.*)|*.*"
+msgstr "Všetky súbory (*.*)|*.*"
+
+#: src/xenia/app/emulator_window.cc:439
+msgid "BSD 3-Clause License"
+msgstr "licenciou BSD s 3 klauzulami"
+
+#: src/xenia/app/emulator_window.cc:434
+msgid ""
+"Branch: %s\n"
+"Commit: %s\n"
+"Build Date: %s"
+msgstr ""
+"Vetva: %s\n"
+"Commit: %s\n"
+"Dátum zostavenia: %s"
+
+#: src/xenia/ui/game_info_panel_wx.cc:232
+msgid "Close the info pane"
+msgstr "Zavrieť informačný panel"
+
+#: src/xenia/ui/game_info_panel_wx.cc:215
+msgid "Configuration"
+msgstr "Konfigurácia"
+
+#: src/xenia/ui/game_info_panel_wx.cc:437
+msgid "Details"
+msgstr "Podrobnosti"
+
+#: src/xenia/ui/game_info_panel_wx.cc:560
+msgid "Discs (%zu)"
+msgstr "Disky (%zu)"
+
+#: src/xenia/ui/game_info_panel_wx.cc:830
+msgid "Enter a name for this version:"
+msgstr "Zadajte názov tejto verzie:"
+
+#: src/xenia/app/emulator_window.cc:3011
+msgid "Experimental fork of Xenia Canary."
+msgstr "Experimentálny fork Xenia Canary."
+
+#: src/xenia/ui/game_config_panel_wx.cc:334
+msgid "Failed to save."
+msgstr "Uloženie zlyhalo."
+
+#: src/xenia/ui/game_info_panel_wx.cc:410
+msgid "Give this version its own name"
+msgstr "Dať tejto verzii vlastný názov"
+
+#: src/xenia/app/emulator_window.cc:444
+msgid "Icons by %s"
+msgstr "Ikony od %s"
+
+#: src/xenia/app/emulator_window.cc:444
+msgid "Icons8"
+msgstr "Icons8"
+
+#: src/xenia/ui/game_info_panel_wx.cc:211
+msgid "Info"
+msgstr "Info"
+
+#: src/xenia/ui/game_info_panel_wx.cc:349
+msgid "Installed Content (%zu)"
+msgstr "Nainštalovaný obsah (%zu)"
+
+#: src/xenia/app/emulator_window.cc:443
+msgid "Inter by Rasmus Andersson"
+msgstr "Inter od Rasmusa Anderssona"
+
+#: src/xenia/app/emulator_window.cc:607
+msgid "Library updated"
+msgstr "Knižnica aktualizovaná"
+
+#: src/xenia/ui/game_info_panel_wx.cc:153
+msgid "Never"
+msgstr "Nikdy"
+
+#: src/xenia/ui/game_info_panel_wx.cc:391
+msgid "No art"
+msgstr "Bez obrázka"
+
+#: src/xenia/ui/game_info_panel_wx.cc:472
+msgid "No compatibility report is linked."
+msgstr "Nie je prepojená žiadna správa o kompatibilite."
+
+#: src/xenia/ui/game_info_panel_wx.cc:625
+msgid "No patches are bundled for this title."
+msgstr "Pre tento titul nie sú priložené žiadne patche."
+
+#: src/xenia/ui/game_info_panel_wx.cc:361
+msgid "No profile is signed in."
+msgstr "Nie je prihlásený žiadny profil."
+
+#: src/xenia/ui/quick_settings_dialog_wx.cc:331
+msgid "Not supported on macOS"
+msgstr "Nepodporované v systéme macOS"
+
+#: src/xenia/ui/game_info_panel_wx.cc:607
+msgid "Nothing installed."
+msgstr "Nič nie je nainštalované."
+
+#: src/xenia/ui/game_info_panel_wx.cc:757
+msgid "Open folder"
+msgstr "Otvoriť priečinok"
+
+#: src/xenia/ui/game_info_panel_wx.cc:830
+msgid "Rename Game"
+msgstr "Premenovať hru"
+
+#: src/xenia/ui/game_info_panel_wx.cc:408
+msgid "Rename..."
+msgstr "Premenovať..."
+
+#: src/xenia/ui/game_list_panel_wx.cc:130
+msgid "Reverse the sort order"
+msgstr "Obrátiť poradie zoradenia"
+
+#: src/xenia/ui/game_config_panel_wx.cc:334
+msgid "Saved."
+msgstr "Uložené."
+
+#: src/xenia/ui/game_info_panel_wx.cc:359
+msgid "Saves (%zu)"
+msgstr "Uložené pozície (%zu)"
+
+#: src/xenia/ui/game_info_panel_wx.cc:308
+msgid "Select a game for details."
+msgstr "Vyberte hru na zobrazenie podrobností."
+
+#: src/xenia/ui/game_info_panel_wx.cc:655
+msgid "Select content packages"
+msgstr "Vyberte balíky obsahu"
+
+#: src/xenia/ui/game_info_panel_wx.cc:728
+msgid "Some packages were not added"
+msgstr "Niektoré balíky neboli pridané"
+
+#: src/xenia/app/emulator_window.cc:599
+msgid ""
+"These games were found in more than one version, and each version now has its own entry in the list. Saves and updates belong to a single version, so they are kept apart.\n"
+"\n"
+"%s"
+msgstr ""
+"Tieto hry sa našli vo viac než jednej verzii a každá verzia má teraz v zozname vlastnú položku. Uložené pozície a aktualizácie patria k jednej verzii, preto sa uchovávajú oddelene.\n"
+"\n"
+"%s"
+
+#: src/xenia/ui/game_info_panel_wx.cc:464
+msgid "This title is not in the compatibility database."
+msgstr "Tento titul nie je v databáze kompatibility."
+
+#: src/xenia/ui/game_info_panel_wx.cc:344
+msgid "Title Updates (%zu)"
+msgstr "Aktualizácie titulu (%zu)"
+
+#: src/xenia/app/emulator_window.cc:442
+msgid "UI font: %s (SIL Open Font License 1.1)"
+msgstr "Písmo rozhrania: %s (SIL Open Font License 1.1)"
+
+#: src/xenia/ui/game_info_panel_wx.cc:399
+msgid "Unknown title"
+msgstr "Neznámy titul"
+
+#: src/xenia/ui/game_info_panel_wx.cc:452
+msgid "Version"
+msgstr "Verzia"
+
+#: src/xenia/app/emulator_window.cc:438
+msgid "Xenia is distributed under the %s"
+msgstr "Xenia je šírená pod %s"
+
+#: src/xenia/ui/game_info_panel_wx.cc:212
+msgid "Content"
+msgstr "Obsah"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "Alternatívna gitara"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "Basgitara"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"Hry pre pôvodný Xbox bežia cez XeFu, emulátor spätnej kompatibility konzoly Xbox 360, ale v jeho priečinku chýba %s:\n"
+"\n"
+"%s\n"
+"\n"
+"Skopírujte tam xbox.xex a súbory xefu*.xex z priečinka Compatibility na pevnom disku konzoly Xbox 360."
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "XeFu sa nenašiel"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"Titul sa nepodarilo spustiť.\n"
+"\n"
+"Technické podrobnosti nájdete v súbore xenia.log."
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "Spustenie titulu zlyhalo!"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "Presun údajov"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"Niektoré vaše existujúce údaje sa nepodarilo presunúť do nového profilu. Neúspešné položky: %u\n"
+"\n"
+"Technické podrobnosti nájdete v súbore xenia.log."
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "Vaše existujúce údaje boli presunuté do nového profilu."
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"Pre tento titul nie je nastavená cesta k súboru.\n"
+"\n"
+"Vyhľadať súbor?"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"Súbor sa nenašiel:\n"
+"%s\n"
+"\n"
+"Vyhľadať súbor?"
+
+#: src/xenia/app/emulator_window.cc:2325
+msgid "Failed to read the system update."
+msgstr "Aktualizáciu systému sa nepodarilo prečítať."
+
+#: src/xenia/app/emulator_window.cc:2329
+msgid "Failed to write the system files."
+msgstr "Systémové súbory sa nepodarilo zapísať."
+
+#: src/xenia/app/emulator_window.cc:2296
+#: src/xenia/app/emulator_window.cc:2319
+#: src/xenia/app/emulator_window.cc:2324
+#: src/xenia/app/emulator_window.cc:2328
+#: src/xenia/app/emulator_window.cc:2333
+msgid "Install System Files"
+msgstr "Inštalácia systémových súborov"
+
+#: src/xenia/app/emulator_window.cc:2297
+msgid "Installing the system files..."
+msgstr "Prebieha inštalácia systémových súborov…"
+
+#: src/xenia/app/emulator_window.cc:2282
+msgid "Select a USB System Update"
+msgstr "Vyberte aktualizáciu systému pre USB"
+
+#: src/xenia/app/emulator_window.cc:2310
+msgid "System files installed"
+msgstr "Systémové súbory nainštalované"
+
+#: src/xenia/app/emulator_window.cc:2335
+msgid ""
+"The previous system files couldn't be put back in place. Move their folders back or delete them to install again. They are in:\n"
+"%s"
+msgstr ""
+"Predchádzajúce systémové súbory sa nepodarilo vrátiť na pôvodné miesto. Ak chcete inštaláciu zopakovať, presuňte ich priečinky späť alebo ich odstráňte. Nachádzajú sa v priečinku:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2311
+msgid ""
+"The system files are installed in:\n"
+"%s"
+msgstr ""
+"Systémové súbory sú nainštalované v priečinku:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2320
+msgid "This file isn't a USB system update."
+msgstr "Tento súbor nie je aktualizáciou systému pre USB."
+
+#: src/xenia/app/emulator_window.cc:1035
+msgid "Start Dashboard"
+msgstr "Spustiť panel Xbox"
+
+#: src/xenia/app/emulator_window.cc:1171
+msgid "Download && Install..."
+msgstr "Stiahnuť a nainštalovať…"
+
+#: src/xenia/app/emulator_window.cc:1174
+msgid "Select File..."
+msgstr "Vybrať súbor…"
+
+#: src/xenia/app/emulator_window.cc:2455
+msgid "Downloading the system update..."
+msgstr "Prebieha sťahovanie aktualizácie systému…"
+
+#: src/xenia/app/emulator_window.cc:2441
+msgid "System files are already installed. Do you want to replace them?"
+msgstr "Systémové súbory sú už nainštalované. Chcete ich nahradiť?"
+
+#: src/xenia/app/emulator_window.cc:1178
+msgid "Download Cover Art..."
+msgstr "Stiahnuť obaly hier…"
+
+#: src/xenia/app/emulator_window.cc:2393
+#: src/xenia/app/emulator_window.cc:2402
+#: src/xenia/app/emulator_window.cc:2430
+msgid "Download Cover Art"
+msgstr "Sťahovanie obalov hier"
+
+#: src/xenia/app/emulator_window.cc:2394
+msgid "There's no cover art to download."
+msgstr "Nie sú k dispozícii žiadne obaly na stiahnutie."
+
+#: src/xenia/app/emulator_window.cc:2403
+msgid "Downloading cover art..."
+msgstr "Prebieha sťahovanie obalov hier…"
+
+#: src/xenia/app/emulator_window.cc:2418
+msgid "Covers downloaded: %d"
+msgstr "Stiahnuté obaly: %d"
+
+#: src/xenia/app/emulator_window.cc:2422
+msgid "Games whose cover couldn't be downloaded: %d"
+msgstr "Hry, ktorých obal sa nepodarilo stiahnuť: %d"
+
+#: src/xenia/app/emulator_window.cc:2427
+msgid "Covers that couldn't be saved: %d"
+msgstr "Obaly, ktoré sa nepodarilo uložiť: %d"

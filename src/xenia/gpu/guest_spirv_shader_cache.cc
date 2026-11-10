@@ -9,16 +9,11 @@
 
 #include "xenia/gpu/guest_spirv_shader_cache.h"
 
-#include <thread>
-
 #include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
-#include "xenia/base/string_buffer.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/render_target_cache.h"
-#include "xenia/gpu/spirv_builtin_geometry_shader.h"
-#include "xenia/gpu/spirv_shader.h"
 #include "xenia/gpu/spirv_shader_translator.h"
 
 namespace xe {
@@ -130,10 +125,13 @@ uint64_t GuestSpirvShaderCache::GetPixelShaderModification(
   }
 
   // Depth/stencil mode, blend pre-multiply and the color target mask are host
-  // render target path state. In the FSI path the shader runs the EDRAM ROP
-  // from the system constants, so these stay at their defaults.
+  // render target path state, left at their defaults on the FSI path.
   if (render_target_cache_.GetPath() ==
       RenderTargetCache::Path::kHostRenderTargets) {
+    // Whether this draw is native res due to a scale threshold.
+    modification.pixel.resolution_scale_native =
+        uint32_t(render_target_cache_.IsDrawScaleNative());
+
     using DepthStencilMode =
         SpirvShaderTranslator::Modification::DepthStencilMode;
     if (host_.depth_float24_convert_in_pixel_shader() &&
@@ -191,50 +189,38 @@ uint64_t GuestSpirvShaderCache::GetPixelShaderModification(
         (((normalized_color_mask >> 4) & 0xF) ? 2 : 0) |
         (((normalized_color_mask >> 8) & 0xF) ? 4 : 0) |
         (((normalized_color_mask >> 12) & 0xF) ? 8 : 0);
-  }
-
-  // Manual barycentric interpolation for precision, where the host supports it
-  // (D3D12 barycentrics). Vulkan leaves this at the default.
-  modification.pixel.precise_interpolation =
-      host_.precise_interpolation_supported() ? 1 : 0;
-
-  return modification.value;
-}
-
-Shader::Translation* GuestSpirvShaderCache::EnsureTranslation(
-    SpirvShader& shader, uint64_t modification) {
-  if (!shader.is_ucode_analyzed()) {
-    StringBuffer ucode_disasm;
-    shader.AnalyzeUcode(ucode_disasm);
-  }
-  return shader.GetOrCreateTranslation(modification);
-}
-
-Shader::Translation* GuestSpirvShaderCache::TranslateSpirv(
-    SpirvShaderTranslator& translator, Shader::Translation& translation,
-    bool use_try_claim) {
-  if (!translation.is_translated()) {
-    bool should_translate = true;
-    if (use_try_claim) {
-      should_translate = translation.TryClaimTranslation();
-      if (!should_translate) {
-        // Another thread is translating this same modification - wait for it.
-        while (!translation.is_translated()) {
-          std::this_thread::yield();
-        }
+  } else {
+    // The FSI shader runs the EDRAM ROP itself, so specialize it for the
+    // sample count. No new pipeline permutations, they already vary by it.
+    modification.pixel.set_fsi_msaa_samples(
+        regs.Get<reg::RB_SURFACE_INFO>().msaa_samples);
+    // Per render target, the format that drives the pack and unpack trees
+    // and whether it blends. Unlike the sample count these add pipeline
+    // permutations - the FSI render pass has no attachments to vary by - so
+    // skip render targets the draw masks off, which the shader skips anyway.
+    bool any_blending = false;
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if (!shader.writes_color_target(i) ||
+          !((normalized_color_mask >> (i * 4)) & 0xF)) {
+        continue;
+      }
+      modification.pixel.set_fsi_rt_format(
+          i, regs.Get<reg::RB_COLOR_INFO>(
+                     reg::RB_COLOR_INFO::rt_register_indices[i])
+                 .color_format);
+      // The shader treats 1 * source + 0 * destination as no blending.
+      if ((regs.Get<reg::RB_BLENDCONTROL>(
+                   reg::RB_BLENDCONTROL::rt_register_indices[i])
+               .value &
+           0x1FFF1FFF) != 0x00010001) {
+        any_blending = true;
       }
     }
-    if (should_translate && !translator.TranslateAnalyzedShader(translation)) {
-      return nullptr;
-    }
+    // With no blending anywhere, the whole blending path can be left out.
+    modification.pixel.set_fsi_no_blending(!any_blending);
   }
-  return translation.is_valid() ? &translation : nullptr;
-}
 
-Shader::Translation* GuestSpirvShaderCache::EnsureAndTranslate(
-    SpirvShader& shader, uint64_t modification) {
-  Shader::Translation* translation = EnsureTranslation(shader, modification);
-  return TranslateSpirv(*translator_, *translation, /*use_try_claim=*/false);
+  return modification.value;
 }
 
 bool GuestSpirvShaderCache::GetGeometryShaderKey(
@@ -269,20 +255,6 @@ bool GuestSpirvShaderCache::GetGeometryShaderKey(
   key.has_point_coordinates = pixel_mod.pixel.param_gen_point;
   key_out = key;
   return true;
-}
-
-std::vector<uint32_t> GuestSpirvShaderCache::BuildGeometryShaderSpirv(
-    GeometryShaderKey key, uint32_t user_clip_plane_count_for_build) const {
-  // Build with the same float controls as the guest vertex/pixel shaders so the
-  // stages link.
-  const SpirvShaderTranslator::Features& features = translator_->features();
-  return BuildGuestPrimitiveGeometryShaderSpirv(
-      BuiltinGeometryShaderType(uint32_t(key.type)), key.interpolator_count,
-      user_clip_plane_count_for_build, key.user_clip_plane_cull,
-      key.has_vertex_kill_and, key.has_point_size, key.has_point_coordinates,
-      features.spirv_version, features.denorm_flush_to_zero_float32,
-      features.signed_zero_inf_nan_preserve_float32,
-      features.rounding_mode_rte_float32);
 }
 
 }  // namespace gpu

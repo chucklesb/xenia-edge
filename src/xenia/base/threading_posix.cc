@@ -14,6 +14,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/threading_timer_queue.h"
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -26,6 +27,7 @@
 #include <cstring>
 #include <ctime>
 #include <limits>
+#include <memory>
 
 #if defined(__GLIBCXX__)
 #include <cxxabi.h>
@@ -47,6 +49,22 @@
 
 #include "xenia/base/main_android.h"
 #include "xenia/base/string_util.h"
+#endif
+
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/auxv.h>
+
+#include "xenia/base/cvar.h"
+#ifndef HWCAP_EVTSTRM
+#define HWCAP_EVTSTRM (1 << 2)
+#endif
+
+DEFINE_bool(wfe_precise_sleep, false,
+            "ARM64: busy-wait PreciseSleep's sub-millisecond tail on the "
+            "generic-timer event stream (WFE) for exact deadlines. Off by "
+            "default: the spin holds threads on-CPU (~18% in profiling) for "
+            "frame-pacing precision that plain nanosleep matches in practice.",
+            "CPU");
 #endif
 
 #if XE_PLATFORM_LINUX
@@ -195,8 +213,7 @@ void MaybeYield() {
 
 void SyncMemory() { __sync_synchronize(); }
 
-void Sleep(std::chrono::microseconds duration) {
-  timespec rqtp = DurationToTimeSpec(duration);
+static void SleepFor(timespec rqtp) {
   timespec rmtp = {};
   auto p_rqtp = &rqtp;
   auto p_rmtp = &rmtp;
@@ -209,7 +226,59 @@ void Sleep(std::chrono::microseconds duration) {
   } while (ret == -1 && errno == EINTR);
 }
 
-void NanoSleep(int64_t duration) { Sleep(std::chrono::nanoseconds(duration)); }
+void Sleep(std::chrono::microseconds duration) {
+  SleepFor(DurationToTimeSpec(duration));
+}
+
+void NanoSleep(int64_t duration) {
+  // Sleep(microseconds) would truncate a sub-microsecond request to zero.
+  if (duration <= 0) {
+    return;
+  }
+  SleepFor({static_cast<time_t>(duration / 1000000000LL),
+            static_cast<long>(duration % 1000000000LL)});
+}
+
+void PreciseSleep(std::chrono::nanoseconds duration) {
+  if (duration.count() <= 0) {
+    return;
+  }
+#if defined(__aarch64__) && defined(__linux__)
+  static const bool use_wfe =
+      cvars::wfe_precise_sleep && (getauxval(AT_HWCAP) & HWCAP_EVTSTRM) != 0;
+  if (use_wfe) {
+    uint64_t freq, now;
+    __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(now));
+    // 128-bit intermediate: at a 1GHz counter the 64-bit product wraps for
+    // durations beyond ~18s, which would silently drop the precise tail.
+    const uint64_t deadline =
+        now +
+        static_cast<uint64_t>(static_cast<unsigned __int128>(duration.count()) *
+                              freq / 1000000000u);
+    // Sleep the bulk conventionally and absorb the scheduler's wakeup error
+    // in the event-stream tail. The tail must exceed the worst wakeup
+    // latency being corrected for; 1.5ms covers CFS + timer slack here.
+    constexpr int64_t kTailNs = 1500000;
+    if (duration.count() > 2 * kTailNs) {
+      Sleep(std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::nanoseconds(duration.count() - kTailNs)));
+    }
+    for (;;) {
+      __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(now));
+      if (now >= deadline) {
+        break;
+      }
+      __asm__ __volatile__("wfe" ::: "memory");
+    }
+    // The old path always crossed a syscall (a de-facto full barrier); keep
+    // that visible-ordering parity on the pure-WFE return.
+    __sync_synchronize();
+    return;
+  }
+#endif
+  Sleep(std::chrono::duration_cast<std::chrono::microseconds>(duration));
+}
 
 void NanoSleepPrecise(int64_t ns) {
 #if XE_PLATFORM_MAC
@@ -268,6 +337,150 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
   return pthread_setspecific(handle, reinterpret_cast<void*>(value)) == 0;
 }
 
+// Multi-object waits: each signal bumps a generation and notifies this
+// condvar so WaitMultiple wakes at once; the timeout cap covers a miss.
+static std::mutex g_multi_wait_mutex;
+static std::condition_variable g_multi_wait_cv;
+static std::atomic<uint64_t> g_multi_wait_gen{0};
+static std::atomic<uint32_t> g_multi_waiters{0};
+static void PokeMultiWaiters() {
+  // Bump before reading the count so a waiter that re-checks gen after
+  // registering sees it. Not a guarantee: neither this nor the notify below is
+  // ordered against a waiter mid-park. The waiter's 1ms cap is the real bound.
+  g_multi_wait_gen.fetch_add(1, std::memory_order_release);
+  if (g_multi_waiters.load(std::memory_order_acquire) == 0) {
+    // Nobody is parked, so skip the process-global mutex entirely. This path
+    // runs from the realtime audio callback, where blocking on a lock held by
+    // an ordinary guest thread costs an audio deadline.
+    return;
+  }
+  // Notified without holding the mutex, so a realtime caller never blocks on
+  // it. A wakeup lost to the register/sleep race costs at most the 1ms park
+  // cap the waiter already applies.
+  g_multi_wait_cv.notify_all();
+}
+
+// Scopes the parked-waiter count; a cancelled wait must not leak it.
+struct ScopedMultiWaiter {
+  ScopedMultiWaiter() {
+    g_multi_waiters.fetch_add(1, std::memory_order_release);
+  }
+  ~ScopedMultiWaiter() {
+    g_multi_waiters.fetch_sub(1, std::memory_order_release);
+  }
+};
+
+// Parked on from the suspend signal handler, so it must stay async-signal-safe.
+class SuspendGate {
+ public:
+  SuspendGate() {
+#if !XE_PLATFORM_MAC
+    sem_ok_ = sem_init(&sem_, 0, 0) == 0;
+#endif
+  }
+  ~SuspendGate() { Destroy(); }
+
+  SuspendGate(const SuspendGate&) = delete;
+  SuspendGate& operator=(const SuspendGate&) = delete;
+
+  // Must run before the signal is raised, never inside the handler.
+  bool Arm() {
+#if XE_PLATFORM_MAC
+    std::lock_guard guard(create_mutex_);
+    if (destroyed_) {
+      return false;
+    }
+    if (fds_[0] >= 0) {
+      return true;
+    }
+    if (pipe(fds_) != 0) {
+      XELOGE("SuspendGate: pipe() failed: {}", strerror(errno));
+      fds_[0] = fds_[1] = -1;
+      return false;
+    }
+    fcntl(fds_[0], F_SETFD, FD_CLOEXEC);
+    fcntl(fds_[1], F_SETFD, FD_CLOEXEC);
+    // Post() writes under state_mutex_, so the write end must never block.
+    fcntl(fds_[1], F_SETFL, fcntl(fds_[1], F_GETFL, 0) | O_NONBLOCK);
+    return true;
+#else
+    return sem_ok_ && !destroyed_;
+#endif
+  }
+
+  bool Wait() {
+#if XE_PLATFORM_MAC
+    if (fds_[0] < 0) {
+      return false;
+    }
+    uint8_t token;
+    ssize_t n;
+    do {
+      n = read(fds_[0], &token, 1);  // Flawfinder: ignore
+    } while (n < 0 && errno == EINTR);
+#else
+    if (!sem_ok_) {
+      return false;
+    }
+    int ret;
+    do {
+      ret = sem_wait(&sem_);
+    } while (ret == -1 && errno == EINTR);
+#endif
+    return true;
+  }
+
+  void Post() {
+#if XE_PLATFORM_MAC
+    if (fds_[1] < 0) {
+      return;
+    }
+    const uint8_t token = 1;
+    ssize_t n;
+    do {
+      n = write(fds_[1], &token, 1);
+    } while (n < 0 && errno == EINTR);
+    // EAGAIN means a token is already pending, which wakes the gate just as
+    // well; WaitSuspended loops on suspend_count_, so an extra one is fine.
+#else
+    if (sem_ok_) {
+      sem_post(&sem_);
+    }
+#endif
+  }
+
+  void Destroy() {
+#if XE_PLATFORM_MAC
+    std::lock_guard guard(create_mutex_);
+    destroyed_ = true;
+    if (fds_[0] >= 0) {
+      close(fds_[0]);
+      fds_[0] = -1;
+    }
+    if (fds_[1] >= 0) {
+      close(fds_[1]);
+      fds_[1] = -1;
+    }
+#else
+    if (!destroyed_ && sem_ok_) {
+      destroyed_ = true;
+      sem_destroy(&sem_);
+    }
+#endif
+  }
+
+ private:
+#if XE_PLATFORM_MAC
+  int fds_[2] = {-1, -1};
+  bool destroyed_ = false;
+  std::mutex create_mutex_;
+#else
+  sem_t sem_;
+  bool sem_ok_ = false;
+  bool destroyed_ = false;
+#endif
+};
+
 class PosixConditionBase {
  public:
   PosixConditionBase() {
@@ -308,6 +521,7 @@ class PosixConditionBase {
     if (predicate()) {
       executed = true;
     } else {
+      ScopedParked parked(*this);
       if (timeout == std::chrono::milliseconds::max()) {
         cond_.wait(lock, predicate);
         executed = true;  // Did not time out;
@@ -317,10 +531,52 @@ class PosixConditionBase {
     }
     if (executed) {
       post_execution();
+      lock.unlock();
+      post_execution_unlocked();
       return WaitResult::kSuccess;
     }
     return WaitResult::kTimeout;
   }
+
+  // The shared condvar is a notify_all, so poking it for an object nobody
+  // multi-waits on wakes every parked thread to re-check handles it does not
+  // care about.
+  void NotifyAll() {
+    // bionic's pthread_cond_broadcast issues the futex syscall even with no
+    // sleeper. Under the cooperative scheduler guest waits are fibers, so
+    // nearly every signal is uncontended and paid a syscall for nothing.
+    // parked_waiters_ is only touched under mutex_, held by every caller.
+    if (parked_waiters_ != 0) {
+      cond_.notify_all();
+    }
+    if (multi_wait_refs_.load(std::memory_order_acquire) != 0) {
+      PokeMultiWaiters();
+    }
+  }
+
+  // Number of parked WaitMultiple threads that include this object.
+  std::atomic<uint32_t> multi_wait_refs_{0};
+
+  // Registers the caller against every handle it is waiting on, so a signal
+  // knows whether waking the shared condvar can possibly help.
+  class MultiWaitRegistration {
+   public:
+    explicit MultiWaitRegistration(
+        const std::vector<PosixConditionBase*>& handles)
+        : handles_(handles) {
+      for (auto* h : handles_) {
+        h->multi_wait_refs_.fetch_add(1, std::memory_order_release);
+      }
+    }
+    ~MultiWaitRegistration() {
+      for (auto* h : handles_) {
+        h->multi_wait_refs_.fetch_sub(1, std::memory_order_release);
+      }
+    }
+
+   private:
+    const std::vector<PosixConditionBase*>& handles_;
+  };
 
   static std::pair<WaitResult, size_t> WaitMultiple(
       std::vector<PosixConditionBase*>&& handles, bool wait_all,
@@ -332,6 +588,8 @@ class PosixConditionBase {
       auto result = handles[0]->Wait(timeout);
       return std::make_pair(result, 0);
     }
+
+    MultiWaitRegistration registration(handles);
 
     // For multiple handles, we need to poll since we can't wait on multiple
     // condition variables simultaneously. This is a limitation of the POSIX
@@ -346,6 +604,8 @@ class PosixConditionBase {
       // Cancellation point, clear of the alloc below.
       pthread_testcancel();
 #endif
+      // Snapshot the gen before checking so a racing signal isn't missed.
+      uint64_t wait_gen = g_multi_wait_gen.load(std::memory_order_acquire);
 
       // Check all handles to see if any/all are signaled.
       // Use try_lock to avoid deadlocks from lock ordering issues.
@@ -424,6 +684,14 @@ class PosixConditionBase {
         } else {
           handles[first_signaled]->post_execution();
         }
+        locks.clear();
+        if (wait_all) {
+          for (size_t i = 0; i < handles.size(); ++i) {
+            handles[i]->post_execution_unlocked();
+          }
+        } else {
+          handles[first_signaled]->post_execution_unlocked();
+        }
         return std::make_pair(WaitResult::kSuccess, first_signaled);
       }
 
@@ -436,11 +704,17 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
-      // Sleep for a short time before polling again.
+      // Park on the shared condvar (any signal wakes us); 1ms caps a lost poke.
       auto remaining =
           std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-      auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-      std::this_thread::sleep_for(sleep_time);
+      auto park = std::min(remaining, std::chrono::milliseconds(1));
+      {
+        ScopedMultiWaiter parked;
+        std::unique_lock<std::mutex> mw_lock(g_multi_wait_mutex);
+        g_multi_wait_cv.wait_for(mw_lock, park, [&] {
+          return g_multi_wait_gen.load(std::memory_order_acquire) != wait_gen;
+        });
+      }
     }
   }
 
@@ -451,6 +725,21 @@ class PosixConditionBase {
  protected:
   [[nodiscard]] inline virtual bool signaled() const = 0;
   inline virtual void post_execution() = 0;
+  // Threads currently inside a cond_ wait on this object. Guarded by mutex_
+  // (the wait sites hold it on both sides of the park, so the counter is
+  // exact whenever NotifyAll reads it).
+  uint32_t parked_waiters_ = 0;
+  // Scopes a cond_ wait for the parked-waiter count.
+  struct ScopedParked {
+    explicit ScopedParked(PosixConditionBase& c) : c_(c) {
+      ++c_.parked_waiters_;
+    }
+    ~ScopedParked() { --c_.parked_waiters_; }
+    PosixConditionBase& c_;
+  };
+
+  // Runs after mutex_ is released.
+  inline virtual void post_execution_unlocked() {}
   std::condition_variable cond_;
   std::mutex mutex_;
 };
@@ -472,7 +761,7 @@ class PosixCondition<Event> : public PosixConditionBase {
   bool Signal() override {
     auto lock = std::unique_lock(mutex_);
     signal_ = true;
-    cond_.notify_all();
+    NotifyAll();
     return true;
   }
 
@@ -510,7 +799,7 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
       *out_previous_count = count_;
     }
     count_ += release_count;
-    cond_.notify_all();
+    NotifyAll();
     return true;
   }
 
@@ -518,7 +807,7 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
   [[nodiscard]] bool signaled() const override { return count_ > 0; }
   void post_execution() override {
     count_--;
-    cond_.notify_all();
+    NotifyAll();
   }
   uint32_t count_;
   const uint32_t maximum_count_;
@@ -542,7 +831,7 @@ class PosixCondition<Mutant> final : public PosixConditionBase {
       --count_;
       // Free to be acquired by another thread
       if (count_ == 0) {
-        cond_.notify_all();
+        NotifyAll();
       }
       return true;
     }
@@ -576,7 +865,7 @@ class PosixCondition<Timer> final : public PosixConditionBase {
   bool Signal() override {
     std::lock_guard lock(mutex_);
     signal_ = true;
-    cond_.notify_all();
+    NotifyAll();
     return true;
   }
 
@@ -666,9 +955,6 @@ class PosixCondition<Thread> final : public PosixConditionBase {
         state_(State::kUninitialized),
         suspend_count_(0),
         joined_(false) {
-#if XE_PLATFORM_LINUX
-    sem_init(&suspend_sem_, 0, 0);
-#endif
 #if XE_PLATFORM_ANDROID
     android_pre_api_26_name_[0] = '\0';
 #endif
@@ -676,6 +962,11 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   bool Initialize(Thread::CreationParameters params,
                   ThreadStartData* start_data) {
     start_data->create_suspended = params.create_suspended;
+
+    if (params.create_suspended && !suspend_gate_.Arm()) {
+      XELOGE("Thread::Create: could not arm the suspend gate");
+      return false;
+    }
 
     auto attempt_create = [&](size_t stack_size, bool use_custom_stack_size) {
       pthread_attr_t attr;
@@ -774,9 +1065,6 @@ class PosixCondition<Thread> final : public PosixConditionBase {
         state_(State::kRunning),
         suspend_count_(0),
         joined_(false) {
-#if XE_PLATFORM_LINUX
-    sem_init(&suspend_sem_, 0, 0);
-#endif
 #if XE_PLATFORM_ANDROID
     android_pre_api_26_name_[0] = '\0';
 #endif
@@ -891,8 +1179,9 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     uint64_t result = 0;
     auto cpu_count = std::min(CPU_SETSIZE, 64);
     for (auto i = 0u; i < cpu_count; i++) {
-      auto set = CPU_ISSET(i, &cpu_set);
-      result |= set << i;
+      if (CPU_ISSET(i, &cpu_set)) {
+        result |= uint64_t(1) << i;
+      }
     }
     return result;
 #endif
@@ -908,7 +1197,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     cpu_set_t cpu_set;
     CPU_ZERO(&cpu_set);
     for (auto i = 0u; i < 64; i++) {
-      if (mask & (1 << i)) {
+      if (mask & (uint64_t(1) << i)) {
         CPU_SET(i, &cpu_set);
       }
     }
@@ -1049,11 +1338,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     --suspend_count_;
     if (suspend_count_ == 0) {
       state_ = State::kRunning;
-#if XE_PLATFORM_LINUX
-      // sem_post is async-signal-safe and wakes the thread from sem_wait
-      // inside the suspend signal handler without taking any locks.
-      sem_post(&suspend_sem_);
-#endif
+      suspend_gate_.Post();
     }
     state_signal_.notify_all();
     return true;
@@ -1068,6 +1353,10 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     // Check if we're trying to suspend ourselves.
     bool is_current_thread = pthread_self() == thread_;
     bool already_suspended = false;
+
+    if (!suspend_gate_.Arm()) {
+      return false;
+    }
 
     {
       std::unique_lock lock(state_mutex_);
@@ -1109,12 +1398,13 @@ class PosixCondition<Thread> final : public PosixConditionBase {
       std::unique_lock lock(state_mutex_);
       if (state_ == State::kFinished) {
         if (is_current_thread) {
-          // This is really bad. Some thread must have called Terminate() on us
-          // just before we decided to terminate ourselves
-          assert_always();
-          for (;;) {
-            // Wait for pthread_cancel() to actually happen.
-          }
+          // The other thread's pthread_cancel may never arrive; exit here.
+          XELOGW("Terminate: thread was already marked finished; exiting");
+          lock.unlock();
+#if XE_PLATFORM_MAC && defined(__aarch64__)
+          pthread_jit_write_protect_np(1);
+#endif
+          pthread_exit(nullptr);
         }
         return;
       }
@@ -1126,7 +1416,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
 
       exit_code_ = exit_code;
       signaled_ = true;
-      cond_.notify_all();
+      NotifyAll();
     }
     if (is_current_thread) {
 #if XE_PLATFORM_MAC && defined(__aarch64__)
@@ -1152,23 +1442,15 @@ class PosixCondition<Thread> final : public PosixConditionBase {
                        [this] { return state_ != State::kUninitialized; });
   }
 
-  /// Set state to suspended and wait until it is reset by another thread.
-  /// On Linux/Android this uses sem_wait, which is async-signal-safe, so it
-  /// can be called from the suspend signal handler without deadlocking on
-  /// non-reentrant mutex/condvar operations. macOS has no unnamed
-  /// semaphores (sem_init returns ENOSYS), so we fall back to the condvar
-  /// path there.
+  /// Runs in the signal handler: only SuspendGate may block here.
   void WaitSuspended() {
-#if XE_PLATFORM_LINUX
-    int ret;
-    do {
-      ret = sem_wait(&suspend_sem_);
-    } while (ret == -1 && errno == EINTR);
-#else
-    std::unique_lock lock(state_mutex_);
-    state_signal_.wait(lock, [this] { return suspend_count_ == 0; });
-    state_ = State::kRunning;
-#endif
+    // SIGUSR1 does not queue, so a spare token is possible: re-check the count.
+    while (suspend_count_.load(std::memory_order_acquire) > 0) {
+      if (!suspend_gate_.Wait()) {
+        struct timespec ts = {0, 1000 * 1000};
+        nanosleep(&ts, nullptr);
+      }
+    }
   }
 
   void* native_handle() const override {
@@ -1178,14 +1460,15 @@ class PosixCondition<Thread> final : public PosixConditionBase {
  private:
   static void* ThreadStartRoutine(void* parameter);
   bool signaled() const override { return signaled_; }
-  void post_execution() override {
-    if (thread_ && !joined_) {
-      joined_ = true;
+  void post_execution() override {}
+
+  void post_execution_unlocked() override {
+    // Terminate() can signal before the thread exits; join unlocked, once.
+    bool expected = false;
+    if (thread_ && joined_.compare_exchange_strong(expected, true)) {
       pthread_join(thread_, nullptr);
+      suspend_gate_.Destroy();
     }
-#if XE_PLATFORM_LINUX
-    sem_destroy(&suspend_sem_);
-#endif
   }
   pthread_t thread_;
 #if XE_PLATFORM_LINUX
@@ -1194,12 +1477,11 @@ class PosixCondition<Thread> final : public PosixConditionBase {
 #endif
   bool signaled_;
   int exit_code_;
-  State state_;             // Protected by state_mutex_
-  uint32_t suspend_count_;  // Protected by state_mutex_
-  bool joined_;             // Prevents double pthread_join
-#if XE_PLATFORM_LINUX
-  sem_t suspend_sem_;  // Async-signal-safe suspend/resume semaphore.
-#endif
+  State state_;  // Protected by state_mutex_
+  // Atomic: read from the signal handler.
+  std::atomic<uint32_t> suspend_count_;
+  std::atomic<bool> joined_;
+  SuspendGate suspend_gate_;
   mutable std::mutex state_mutex_;
   mutable std::mutex callback_mutex_;
   mutable std::condition_variable state_signal_;
@@ -1523,6 +1805,15 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   assert_not_null(start_data);
   assert_not_null(start_data->thread_obj);
 
+  // Signal handlers must be able to run when a fiber stack is exhausted, so
+  // give every thread an alternate signal stack.
+  static thread_local std::unique_ptr<uint8_t[]> signal_stack(
+      new uint8_t[64 * 1024]);
+  stack_t altstack = {};
+  altstack.ss_sp = signal_stack.get();
+  altstack.ss_size = 64 * 1024;
+  sigaltstack(&altstack, nullptr);
+
   auto thread = dynamic_cast<PosixThread*>(start_data->thread_obj);
   auto start_routine = std::move(start_data->start_routine);
   auto create_suspended = start_data->create_suspended;
@@ -1561,7 +1852,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 #endif
   catch (const std::exception& e) {
     XELOGE("Host thread '{}' terminated by uncaught exception: {}",
-           thread->handle_.name(), e.what());
+           thread->handle_.name(), xe::strip_pii(e.what()));
   } catch (...) {
     XELOGE("Host thread '{}' terminated by unknown exception",
            thread->handle_.name());
@@ -1575,7 +1866,8 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   std::unique_lock lock(thread->handle_.mutex_);
   thread->handle_.exit_code_ = 0;
   thread->handle_.signaled_ = true;
-  thread->handle_.cond_.notify_all();
+  // Not cond_ directly: a WaitMultiple on this thread handle needs the poke.
+  thread->handle_.NotifyAll();
 
   current_thread_ = nullptr;
   return nullptr;

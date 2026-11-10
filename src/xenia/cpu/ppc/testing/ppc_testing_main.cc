@@ -21,6 +21,7 @@
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/raw_module.h"
 
+#include <algorithm>
 #include <chrono>
 #include <unordered_set>
 
@@ -34,22 +35,19 @@
 #include "xenia/base/platform_win.h"
 #endif  // XE_COMPILER_MSVC
 
-DEFINE_bool(mount_scratch, false, "Enable scratch mount", "Storage");
-DEFINE_bool(mount_cache, false, "Enable cache mount", "Storage");
-DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount",
-            "Storage");
-
-// xenia-core's Emulator::SetupSubsystems pulls in these cvars; provide stubs
-// so the test runner links without depending on xenia_main.cc.
-DEFINE_string(apu, "nop", "Audio system stub for tests.", "APU");
-DEFINE_string(gpu, "null", "Graphics system stub for tests.", "GPU");
-
 DEFINE_path(test_path, "src/xenia/cpu/ppc/testing/",
             "Directory scanned for test files.", "Other");
 DEFINE_path(test_bin_path, "src/xenia/cpu/ppc/testing/bin/",
             "Directory with binary outputs of the test files.", "Other");
 DEFINE_path(test_skip_file, "src/xenia/cpu/ppc/testing/skip.txt",
             "File containing test case names to skip (one per line).", "Other");
+DEFINE_bool(test_only_skipped, false,
+            "Invert the skip list: run only the test cases it names. Entries "
+            "that pass are stale and can be deleted from it.",
+            "Other");
+DEFINE_path(test_passed_file, "",
+            "Write the name of every passing test case here, one per line.",
+            "Other");
 DEFINE_transient_string(test_name, "", "Test suite name.", "General");
 
 namespace xe {
@@ -96,6 +94,75 @@ std::unordered_set<std::string> LoadSkipList(
   return skip_list;
 }
 
+// Accepts hex pairs ("AABB CC") or a bracketed list ("[AA, BB, CC]").
+bool ParseAnnotationBytes(std::string_view text, std::vector<uint8_t>& bytes) {
+  auto hex_digit = [](char c) -> int {
+    if (c >= '0' && c <= '9') {
+      return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+      return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+      return c - 'A' + 10;
+    }
+    return -1;
+  };
+  size_t i = 0;
+  auto skip_whitespace = [&]() {
+    while (i < text.size() &&
+           (text[i] == ' ' || text[i] == '\t' || text[i] == '\r')) {
+      ++i;
+    }
+  };
+
+  bytes.clear();
+  skip_whitespace();
+  if (i < text.size() && text[i] == '[') {
+    ++i;
+    while (true) {
+      skip_whitespace();
+      int value = 0;
+      size_t digits = 0;
+      while (i < text.size() && digits < 2 && hex_digit(text[i]) >= 0) {
+        value = value * 16 + hex_digit(text[i]);
+        ++i;
+        ++digits;
+      }
+      if (!digits) {
+        return false;
+      }
+      bytes.push_back(static_cast<uint8_t>(value));
+      skip_whitespace();
+      if (i < text.size() && text[i] == ',') {
+        ++i;
+      } else if (i < text.size() && text[i] == ']') {
+        ++i;
+        break;
+      } else {
+        return false;
+      }
+    }
+    skip_whitespace();
+    return i == text.size();
+  }
+
+  while (true) {
+    skip_whitespace();
+    if (i == text.size()) {
+      break;
+    }
+    if (i + 1 >= text.size() || hex_digit(text[i]) < 0 ||
+        hex_digit(text[i + 1]) < 0) {
+      return false;
+    }
+    bytes.push_back(
+        static_cast<uint8_t>(hex_digit(text[i]) * 16 + hex_digit(text[i + 1])));
+    i += 2;
+  }
+  return !bytes.empty();
+}
+
 struct TestCase {
   TestCase(uint32_t address, std::string& name)
       : address(address), name(name) {}
@@ -112,17 +179,21 @@ class TestSuite {
     name = name.replace_extension();
 
     name_ = xe::path_to_utf8(name);
-    map_file_path_ = cvars::test_bin_path / name.replace_extension(".map");
-    bin_file_path_ = cvars::test_bin_path / name.replace_extension(".bin");
+    map_file_path_ = std::filesystem::path(XE_SOURCE_ROOT) /
+                     cvars::test_bin_path / name.replace_extension(".map");
+    bin_file_path_ = std::filesystem::path(XE_SOURCE_ROOT) /
+                     cvars::test_bin_path / name.replace_extension(".bin");
   }
 
   bool Load() {
     if (!ReadMap()) {
-      XELOGE("Unable to read map for test {}", src_file_path_);
+      XELOGE("Unable to read map for test {}",
+             xe::strip_pii(xe::path_to_utf8(src_file_path_)));
       return false;
     }
     if (!ReadAnnotations()) {
-      XELOGE("Unable to read annotations for test {}", src_file_path_);
+      XELOGE("Unable to read annotations for test {}",
+             xe::strip_pii(xe::path_to_utf8(src_file_path_)));
       return false;
     }
     return true;
@@ -200,7 +271,7 @@ class TestSuite {
         current_test_case = FindTestCase(label);
         if (!current_test_case) {
           XELOGE("Test case {} not found in corresponding map for {}", label,
-                 src_file_path_);
+                 xe::strip_pii(xe::path_to_utf8(src_file_path_)));
           return false;
         }
       } else if (strlen(start) > 3 && start[0] == '#' && start[1] == '_') {
@@ -215,7 +286,8 @@ class TestSuite {
             value.erase(value.end() - 1);
           }
           if (!current_test_case) {
-            XELOGE("Annotation outside of test case in {}", src_file_path_);
+            XELOGE("Annotation outside of test case in {}",
+                   xe::strip_pii(xe::path_to_utf8(src_file_path_)));
             return false;
           }
           current_test_case->annotations.emplace_back(key, value);
@@ -269,7 +341,8 @@ class TestRunner {
 
       auto module = std::make_unique<xe::cpu::RawModule>(processor_.get());
       if (!module->LoadFile(START_ADDRESS, suite.bin_file_path())) {
-        XELOGE("Unable to load test binary {}", suite.bin_file_path());
+        XELOGE("Unable to load test binary {}",
+               xe::strip_pii(xe::path_to_utf8(suite.bin_file_path())));
         return false;
       }
       processor_->AddModule(std::move(module));
@@ -299,11 +372,13 @@ class TestRunner {
                   bin_size_);
     }
 
-    // Add dummy space for memory.
+    // Add dummy space for memory. Heap resets keep host page contents, so
+    // clear it to stop tests seeing bytes written by earlier ones.
     processor_->memory()->LookupHeap(0)->AllocFixed(
         0x10001000, 0xEFFF, 0,
         kMemoryAllocationReserve | kMemoryAllocationCommit,
         kMemoryProtectRead | kMemoryProtectWrite);
+    std::memset(memory_->TranslateVirtual(0x10001000), 0, 0xEFFF);
 
     // Simulate a thread.
     uint32_t stack_size = 64 * 1024;
@@ -333,7 +408,10 @@ class TestRunner {
           processor_->backend());
       auto* bctx =
           x64_backend->BackendContextForGuestContext(thread_state_->context());
-      bctx->flags &= ~(1U << xe::cpu::backend::x64::kX64BackendMXCSRModeBit);
+      // Also drop any reservation a previous test left behind, so stwcx.
+      // tests don't depend on file/test ordering.
+      bctx->flags &= ~((1U << xe::cpu::backend::x64::kX64BackendMXCSRModeBit) |
+                       (1U << xe::cpu::backend::x64::kX64BackendHasReserveBit));
     }
 #elif XE_ARCH_ARM64
     // Reset FPCR and backend flags to default FPU state before each test.
@@ -342,7 +420,10 @@ class TestRunner {
           processor_->backend());
       auto* bctx =
           a64_backend->BackendContextForGuestContext(thread_state_->context());
-      bctx->flags &= ~(1U << xe::cpu::backend::a64::kA64BackendFPCRModeBit);
+      // Also drop any reservation a previous test left behind, so stwcx.
+      // tests don't depend on file/test ordering.
+      bctx->flags &= ~((1U << xe::cpu::backend::a64::kA64BackendFPCRModeBit) |
+                       (1U << xe::cpu::backend::a64::kA64BackendHasReserveBit));
       // Explicitly reset the hardware FPCR to default FPU mode (0 = round
       // nearest, no flush-to-zero, no default-NaN). Without this, a previous
       // test that set VMX mode (FZ|DN) leaves the hardware FPCR dirty, and
@@ -390,23 +471,15 @@ class TestRunner {
         auto address_str = it.second.substr(0, space_pos);
         auto bytes_str = it.second.substr(space_pos + 1);
         uint32_t address = std::strtoul(address_str.c_str(), nullptr, 16);
-        auto p = memory_->TranslateVirtual(address);
-        const char* c = bytes_str.c_str();
-        while (*c) {
-          while (*c == ' ') {
-            ++c;
-          }
-          // Need at least two chars for a hex pair; otherwise c+=2 below
-          // would jump past the null terminator into adjacent heap.
-          if (!*c || !c[1]) {
-            break;
-          }
-          char ccs[3] = {c[0], c[1], 0};
-          c += 2;
-          uint32_t b = std::strtoul(ccs, nullptr, 16);
-          *p = static_cast<uint8_t>(b);
-          ++p;
+        std::vector<uint8_t> bytes;
+        if (!ParseAnnotationBytes(bytes_str, bytes)) {
+          fprintf(stderr, "    [%s] Malformed MEMORY_IN bytes: %s\n",
+                  test_case.name.c_str(), bytes_str.c_str());
+          fflush(stderr);
+          return false;
         }
+        std::memcpy(memory_->TranslateVirtual(address), bytes.data(),
+                    bytes.size());
       }
     }
     return true;
@@ -438,21 +511,19 @@ class TestRunner {
         auto address_str = it.second.substr(0, space_pos);
         auto bytes_str = it.second.substr(space_pos + 1);
         uint32_t address = std::strtoul(address_str.c_str(), nullptr, 16);
+        std::vector<uint8_t> expected_bytes;
+        if (!ParseAnnotationBytes(bytes_str, expected_bytes)) {
+          any_failed = true;
+          fprintf(stderr, "    [%s] Malformed MEMORY_OUT bytes: %s\n",
+                  test_case.name.c_str(), bytes_str.c_str());
+          fflush(stderr);
+          continue;
+        }
         auto p = memory_->TranslateVirtual(address);
-        const char* c = bytes_str.c_str();
         bool failed = false;
         StringBuffer expecteds;
         StringBuffer actuals;
-        while (*c) {
-          while (*c == ' ') {
-            ++c;
-          }
-          if (!*c || !c[1]) {
-            break;
-          }
-          char ccs[3] = {c[0], c[1], 0};
-          c += 2;
-          uint32_t expected = std::strtoul(ccs, nullptr, 16);
+        for (uint8_t expected : expected_bytes) {
           uint8_t actual = *p;
 
           expecteds.AppendFormat(" {:02X}", expected);
@@ -489,7 +560,8 @@ class TestRunner {
 
 bool DiscoverTests(const std::filesystem::path& test_path,
                    std::vector<std::filesystem::path>& test_files) {
-  auto file_infos = xe::filesystem::ListFiles(test_path);
+  auto file_infos = xe::filesystem::ListFiles(
+      std::filesystem::path(XE_SOURCE_ROOT) / test_path);
   for (auto& file_info : file_infos) {
     if (file_info.name.extension() == ".s") {
       // Only include test files (instr_*.s), not helper files
@@ -512,8 +584,8 @@ int filter(unsigned int code) {
 #endif  // XE_COMPILER_MSVC
 
 void ProtectedRunTest(TestSuite& test_suite, TestRunner& runner,
-                      TestCase& test_case, int& failed_count,
-                      int& passed_count) {
+                      TestCase& test_case, int& failed_count, int& passed_count,
+                      std::vector<std::string>& passed_names) {
 #if XE_COMPILER_MSVC
   try {
     if (!runner.Setup(test_suite)) {
@@ -524,6 +596,7 @@ void ProtectedRunTest(TestSuite& test_suite, TestRunner& runner,
     }
     if (runner.Run(test_case)) {
       ++passed_count;
+      passed_names.push_back(test_case.name);
     } else {
       fprintf(stderr, "  [%s] FAILED\n", test_case.name.c_str());
       fflush(stderr);
@@ -546,6 +619,7 @@ void ProtectedRunTest(TestSuite& test_suite, TestRunner& runner,
   }
   if (runner.Run(test_case)) {
     ++passed_count;
+    passed_names.push_back(test_case.name);
   } else {
     fprintf(stderr, "  [%s] FAILED\n", test_case.name.c_str());
     fflush(stderr);
@@ -566,12 +640,19 @@ bool RunTests(const std::vector<std::string>& test_names) {
   // Load skip list
   auto skip_list = LoadSkipList(cvars::test_skip_file);
   if (!skip_list.empty()) {
-    fprintf(stderr, "Loaded skip list with %zu test cases to skip.\n",
-            skip_list.size());
+    fprintf(stderr, "Loaded skip list with %zu test cases to %s.\n",
+            skip_list.size(), cvars::test_only_skipped ? "run" : "skip");
   } else {
     fprintf(stderr, "Warning: skip list is empty (path: %s)\n",
             cvars::test_skip_file.string().c_str());
   }
+  // Inverted, the skip list becomes the run list: whatever passes is a stale
+  // entry that can be deleted from it.
+  auto should_run = [&skip_list](const std::string& name) {
+    return (skip_list.find(name) != skip_list.end()) ==
+           cvars::test_only_skipped;
+  };
+  std::vector<std::string> passed_names;
 
   // Build a set of requested test names for fast lookup
   std::unordered_set<std::string> test_name_filter(test_names.begin(),
@@ -592,13 +673,14 @@ bool RunTests(const std::vector<std::string>& test_names) {
   std::vector<TestSuite> test_suites;
   bool load_failed = false;
   for (auto& test_path : test_files) {
-    TestSuite test_suite(test_path);
+    TestSuite test_suite(std::filesystem::path(XE_SOURCE_ROOT) / test_path);
     if (!test_name_filter.empty() &&
         test_name_filter.find(test_suite.name()) == test_name_filter.end()) {
       continue;
     }
     if (!test_suite.Load()) {
-      XELOGE("TEST SUITE {} FAILED TO LOAD", test_path);
+      XELOGE("TEST SUITE {} FAILED TO LOAD",
+             xe::strip_pii(xe::path_to_utf8(test_path)));
       load_failed = true;
       continue;
     }
@@ -615,7 +697,7 @@ bool RunTests(const std::vector<std::string>& test_names) {
   int skipped_count = 0;
   for (auto& test_suite : test_suites) {
     for (auto& test_case : test_suite.test_cases()) {
-      if (skip_list.find(test_case.name) != skip_list.end()) {
+      if (!should_run(test_case.name)) {
         ++skipped_count;
         continue;
       }
@@ -624,7 +706,7 @@ bool RunTests(const std::vector<std::string>& test_names) {
   }
 
   if (skipped_count > 0) {
-    fprintf(stderr, "Skipped %d test cases based on skip list.\n",
+    fprintf(stderr, "Filtered out %d test cases based on skip list.\n",
             skipped_count);
   }
   fprintf(stderr, "Running %zu test suites, %zu test cases...\n",
@@ -641,7 +723,7 @@ bool RunTests(const std::vector<std::string>& test_names) {
   size_t total_tests = all_tests.size();
   for (auto& test_suite : test_suites) {
     for (auto& test_case : test_suite.test_cases()) {
-      if (skip_list.find(test_case.name) == skip_list.end()) {
+      if (should_run(test_case.name)) {
         ++suite_total;
         break;
       }
@@ -651,7 +733,7 @@ bool RunTests(const std::vector<std::string>& test_names) {
     // Collect non-skipped test cases for this suite
     std::vector<TestCase*> suite_tests;
     for (auto& test_case : test_suite.test_cases()) {
-      if (skip_list.find(test_case.name) == skip_list.end()) {
+      if (should_run(test_case.name)) {
         suite_tests.push_back(&test_case);
       }
     }
@@ -667,7 +749,7 @@ bool RunTests(const std::vector<std::string>& test_names) {
     fflush(stdout);
     for (size_t i = 0; i < suite_tests.size(); i++) {
       ProtectedRunTest(test_suite, runner, *suite_tests[i], failed_count,
-                       passed_count);
+                       passed_count, passed_names);
       ++tests_done;
       if ((i + 1) % 500 == 0 && i + 1 < suite_tests.size()) {
         pct = static_cast<int>(tests_done * 100 / total_tests);
@@ -689,6 +771,22 @@ bool RunTests(const std::vector<std::string>& test_names) {
   fprintf(stderr, "Failed: %d\n", failed_count);
   fprintf(stderr, "Time: %dm %ds\n", minutes, seconds);
   fflush(stderr);
+
+  if (!cvars::test_passed_file.empty()) {
+    std::sort(passed_names.begin(), passed_names.end());
+    FILE* f = filesystem::OpenFile(cvars::test_passed_file, "w");
+    if (f) {
+      for (const auto& name : passed_names) {
+        fprintf(f, "%s\n", name.c_str());
+      }
+      fclose(f);
+      fprintf(stderr, "Wrote %zu passing test names to %s\n",
+              passed_names.size(), cvars::test_passed_file.string().c_str());
+    } else {
+      fprintf(stderr, "Failed to open %s for writing\n",
+              cvars::test_passed_file.string().c_str());
+    }
+  }
 
   return failed_count ? false : true;
 }

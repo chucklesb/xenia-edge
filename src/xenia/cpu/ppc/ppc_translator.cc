@@ -7,6 +7,10 @@
  ******************************************************************************
  */
 
+#include <atomic>
+
+#include "xenia/base/logging.h"
+
 #include "xenia/cpu/ppc/ppc_translator.h"
 
 #include "xenia/base/assert.h"
@@ -35,6 +39,7 @@ DEFINE_bool(disable_context_promotion, false,
             "CPU");
 
 DECLARE_bool(debug);
+DECLARE_bool(store_all_context_values);
 
 namespace xe {
 namespace cpu {
@@ -60,11 +65,29 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   compiler_->AddPass(std::make_unique<passes::ControlFlowAnalysisPass>());
   compiler_->AddPass(std::make_unique<passes::ControlFlowSimplificationPass>());
 
+  // Preemption safepoints for the guest scheduler. No-op when it is off.
+  compiler_->AddPass(std::make_unique<passes::PreemptCheckInjectionPass>());
+
   // Passes are executed in the order they are added. Multiple of the same
   // pass type may be used.
 
   // Disable context promotion for debug, otherwise register changes won't apply
   // correctly
+  {
+    // The pass list is fixed when a translator is built from the pool, so
+    // report what this one actually got.
+    static std::atomic<bool> reported{false};
+    bool expected = false;
+    if (reported.compare_exchange_strong(expected, true)) {
+      XELOGI(
+          "PPCTranslator: context promotion {} (disable_context_promotion={}, "
+          "debug={}, store_all_context_values={})",
+          (!cvars::disable_context_promotion && !cvars::debug) ? "ENABLED"
+                                                               : "DISABLED",
+          cvars::disable_context_promotion, cvars::debug,
+          cvars::store_all_context_values);
+    }
+  }
   if (!cvars::disable_context_promotion && !cvars::debug) {
     if (validate) {
       compiler_->AddPass(std::make_unique<passes::ValidationPass>());
@@ -105,6 +128,9 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   // compiler_->AddPass(std::make_unique<passes::DeadStoreEliminationPass>());
   // if (validate)
   // compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+  // After context promotion, which turned same-block CR loads into SSA uses,
+  // so only reads that cross blocks keep a CR store live.
+  compiler_->AddPass(std::make_unique<passes::DeadCRStoreEliminationPass>());
   compiler_->AddPass(std::make_unique<passes::DeadCodeEliminationPass>());
   if (validate) {
     compiler_->AddPass(std::make_unique<passes::ValidationPass>());
@@ -200,17 +226,13 @@ bool PPCTranslator::Translate(GuestFunction* function,
   if (cvars::disassemble_functions) {
     debug_info_flags |= DebugInfoFlags::kDebugInfoAllDisasm;
   }
-  if (cvars::trace_functions) {
-    debug_info_flags |= DebugInfoFlags::kDebugInfoTraceFunctions;
-  }
-  if (cvars::trace_function_coverage) {
+  // Sourced from the processor's latched value, not the cvar. Every thread is
+  // handed an arena at creation on the strength of that latch, so coverage
+  // must not appear here through any other route.
+  if (frontend_->processor()->trace_counts_enabled()) {
     debug_info_flags |= DebugInfoFlags::kDebugInfoTraceFunctionCoverage;
-  }
-  if (cvars::trace_function_references) {
-    debug_info_flags |= DebugInfoFlags::kDebugInfoTraceFunctionReferences;
-  }
-  if (cvars::trace_function_data) {
-    debug_info_flags |= DebugInfoFlags::kDebugInfoTraceFunctionData;
+  } else {
+    debug_info_flags &= ~DebugInfoFlags::kDebugInfoTraceFunctionCoverage;
   }
   std::unique_ptr<FunctionDebugInfo> debug_info;
   if (debug_info_flags) {
@@ -222,24 +244,21 @@ bool PPCTranslator::Translate(GuestFunction* function,
     return false;
   }
 
-  // Setup trace data, if needed.
-  if (debug_info_flags & DebugInfoFlags::kDebugInfoTraceFunctions) {
-    // Base trace data.
-    size_t trace_data_size = FunctionTraceData::SizeOfHeader();
-    if (debug_info_flags & DebugInfoFlags::kDebugInfoTraceFunctionCoverage) {
-      // Additional space for instruction coverage counts.
-      trace_data_size += FunctionTraceData::SizeOfInstructionCounts(
-          function->address(), function->end_address());
-    }
-    uint8_t* trace_data =
-        frontend_->processor()->AllocateFunctionTraceData(trace_data_size);
-    if (trace_data) {
-      function->trace_data().Reset(trace_data, trace_data_size,
-                                   function->address(),
-                                   function->end_address());
-    } else {
-      debug_info_flags &= ~(DebugInfoFlags::kDebugInfoTraceFunctions |
-                            DebugInfoFlags::kDebugInfoTraceFunctionCoverage);
+  // Reserve this function's slice of the per-thread coverage arenas. The
+  // arena is finite, so a title large enough to exhaust it just stops being
+  // counted from that point on.
+  if (debug_info_flags & DebugInfoFlags::kDebugInfoTraceFunctionCoverage) {
+    // Must match what the emitter uses to index the slice.
+    uint32_t instruction_count =
+        function->has_end_address()
+            ? (function->end_address() - function->address()) / 4 + 1
+            : 0;
+    function->set_coverage_offset(
+        instruction_count ? frontend_->processor()->AllocateTraceCountsOffset(
+                                function->address(), instruction_count)
+                          : GuestFunction::kInvalidCoverageOffset);
+    if (function->coverage_offset() == GuestFunction::kInvalidCoverageOffset) {
+      debug_info_flags &= ~DebugInfoFlags::kDebugInfoTraceFunctionCoverage;
     }
   }
 
@@ -295,11 +314,11 @@ bool PPCTranslator::Translate(GuestFunction* function,
 void PPCTranslator::Reset() { builder_->ResetPools(); }
 void PPCTranslator::DumpSource(GuestFunction* function,
                                StringBuffer* string_buffer) {
-  Memory* memory = frontend_->memory();
+  Module* module = function->module();
 
   string_buffer->AppendFormat(
-      "{} fn {:08X}-{:08X} {}\n", function->module()->name().c_str(),
-      function->address(), function->end_address(), function->name().c_str());
+      "{} fn {:08X}-{:08X} {}\n", module->name().c_str(), function->address(),
+      function->end_address(), function->name().c_str());
 
   auto blocks = scanner_->FindBlocks(function);
 
@@ -308,8 +327,7 @@ void PPCTranslator::DumpSource(GuestFunction* function,
   auto block_it = blocks.begin();
   for (uint32_t address = start_address, offset = 0; address <= end_address;
        address += 4, offset++) {
-    uint32_t code =
-        xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
+    uint32_t code = xe::load_and_swap<uint32_t>(module->TranslateCode(address));
 
     // Check labels.
     if (block_it != blocks.end() && block_it->start_address == address) {

@@ -51,6 +51,19 @@ class Fence {
     cond_.notify_all();
   }
 
+  // Consumes a pending signal and returns true, or returns false. For a single
+  // waiter, since it does not track the waiter count Wait() coordinates on.
+  bool TryWait() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!(signal_state_ & SIGMASK_)) {
+      return false;
+    }
+    // Only the signal. The low bits count threads inside Wait(), and clearing
+    // those would strand one and trip Wait()'s count assert on the next Signal.
+    signal_state_ &= ~SIGMASK_;
+    return true;
+  }
+
   // Wait for the Fence to be signaled. Clears the signal on return.
   void Wait() {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -116,6 +129,10 @@ void SyncMemory();
 // Sleeps the current thread for at least as long as the given duration.
 void Sleep(std::chrono::microseconds duration);
 void NanoSleep(int64_t ns);
+// Sleeps on the ARM64 generic-timer event stream (<=100us quantization, core
+// parked) where available, a plain sleep otherwise. For guest-visible delays on
+// a latency-critical path, where wakeup overshoot extends guest frame time.
+void PreciseSleep(std::chrono::nanoseconds duration);
 // Like NanoSleep but trades a brief busy-wait tail for sub-millisecond
 // precision. Use only where wake-up jitter would miss a frame budget; the
 // spin costs CPU.
@@ -526,6 +543,10 @@ class Fiber {
   // the thread has not been adopted via CreateFromThread()/a switch.
   static Fiber* GetCurrentFiber();
 
+  // True when |address| lies in a live fiber stack's floor page, meaning the
+  // fault is a stack overflow. For crash handlers to label the failure.
+  static bool IsStackOverflowFault(const void* address);
+
   virtual ~Fiber() = default;
 
   // Switches execution from the current fiber to this one. Returns (on the
@@ -535,6 +556,11 @@ class Fiber {
   // Marks a fiber whose start routine has returned so teardown does not try to
   // resume it. Switching to a terminated fiber is undefined.
   virtual void SetTerminated() = 0;
+
+  // Runs the start routine again on the same stack, abandoning the frames on
+  // it without unwinding them, so nothing they hold is released. Not valid on
+  // the current fiber or one adopted by CreateFromThread.
+  virtual void Restart() = 0;
 
   virtual void set_name(std::string name) { name_ = std::move(name); }
   const std::string& name() const { return name_; }

@@ -16,10 +16,10 @@ target_link_libraries(xenia-gpu-vulkan PUBLIC
 xe_target_defaults(xenia-gpu-vulkan)
 
 if(XENIA_BUILD_MISC)
-  add_executable(xenia-gpu-vulkan-trace-viewer
+  add_executable(xenia-gpu-vulkan-trace-viewer WIN32
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_trace_viewer_main.cc
-    ${PROJECT_SOURCE_DIR}/src/xenia/ui/windowed_app_main_qt.cc
   )
+  xe_windowed_app_main(xenia-gpu-vulkan-trace-viewer)
   target_include_directories(xenia-gpu-vulkan-trace-viewer PRIVATE
     ${PROJECT_SOURCE_DIR}/third_party/Vulkan-Headers/include
     ${PROJECT_SOURCE_DIR}/third_party/glslang
@@ -28,10 +28,13 @@ if(XENIA_BUILD_MISC)
     xenia-apu xenia-apu-nop xenia-base xenia-core xenia-cpu
     xenia-gpu xenia-gpu-vulkan xenia-hid xenia-hid-nop xenia-hid-portal
     xenia-kernel xenia-patcher xenia-ui xenia-ui-vulkan xenia-vfs
-    aes_128 capstone fmt glslang-spirv imgui libavcodec libavutil mspack snappy xxhash
+    capstone fmt glslang-spirv imgui libavcodec libavutil mspack snappy xxhash
   )
   if(XE_TARGET_X86_64)
     target_link_libraries(xenia-gpu-vulkan-trace-viewer PRIVATE xenia-cpu-backend-x64)
+  endif()
+  if(XE_TARGET_AARCH64)
+    target_link_libraries(xenia-gpu-vulkan-trace-viewer PRIVATE xenia-cpu-backend-a64)
   endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(xenia-gpu-vulkan-trace-viewer PRIVATE X11 xcb X11-xcb xenia-apu-sdl)
@@ -57,10 +60,13 @@ if(XENIA_BUILD_MISC)
     xenia-apu xenia-apu-nop xenia-base xenia-core xenia-cpu
     xenia-gpu xenia-gpu-vulkan xenia-hid xenia-hid-nop xenia-hid-portal
     xenia-kernel xenia-patcher xenia-ui xenia-ui-vulkan xenia-vfs
-    aes_128 capstone fmt glslang-spirv imgui libavcodec libavutil mspack snappy xxhash
+    capstone fmt glslang-spirv imgui libavcodec libavutil mspack snappy xxhash
   )
   if(XE_TARGET_X86_64)
     target_link_libraries(xenia-gpu-vulkan-trace-dump PRIVATE xenia-cpu-backend-x64)
+  endif()
+  if(XE_TARGET_AARCH64)
+    target_link_libraries(xenia-gpu-vulkan-trace-dump PRIVATE xenia-cpu-backend-a64)
   endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(xenia-gpu-vulkan-trace-dump PRIVATE xenia-apu-sdl)

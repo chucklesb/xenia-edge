@@ -7,11 +7,15 @@
  ******************************************************************************
  */
 
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/math.h"
+#include "xenia/base/utf8.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/info/volume.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_ob.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xfile.h"
 #include "xenia/vfs/device.h"
@@ -103,21 +107,45 @@ dword_result_t NtQueryInformationFile_entry(
       break;
     }
     case XFileXctdCompressionInformation: {
-      XELOGE(
-          "NtQueryInformationFile(XFileXctdCompressionInformation) "
-          "unimplemented");
-      // Files that are XCTD compressed begin with the magic 0x0FF512ED but we
-      // shouldn't detect this that way. There's probably a flag somewhere
-      // (attributes?) that defines if it's compressed or not.
-      status = X_STATUS_INVALID_PARAMETER;
-      out_length = 0;
+      // Only disc file systems answer. Their directory entries flag compressed
+      // files but rebuilt images can lose the flag, unlike the magic those
+      // files start with.
+      if (!file->device()->is_gdfx()) {
+        status = X_STATUS_INVALID_PARAMETER;
+        out_length = 0;
+        break;
+      }
+      constexpr uint32_t kXctdMagic = 0x0FF512ED;
+      uint8_t magic[4] = {};
+      size_t bytes_read = 0;
+      if (!(file->entry()->attributes() & vfs::kFileAttributeDirectory)) {
+        kernel_state()->RunBlockingIo(
+            [&]() {
+              if (file->file()->ReadSync(magic, 0, &bytes_read) !=
+                  X_STATUS_SUCCESS) {
+                bytes_read = 0;
+              }
+            },
+            file->device()->supports_concurrent_io()
+                ? GuestScheduler::BlockingCallClass::kConcurrent
+                : GuestScheduler::BlockingCallClass::kSerial);
+      }
+      auto info = info_ptr.as<X_FILE_XCTD_COMPRESSION_INFORMATION*>();
+      info->flags = bytes_read == sizeof(magic) &&
+                            xe::load_and_swap<uint32_t>(magic) == kXctdMagic
+                        ? 1
+                        : 0;
+      out_length = sizeof(*info);
       break;
-    };
+    }
     case XFileNetworkOpenInformation: {
       // Make sure we're working with up-to-date information, just in case the
       // file size has changed via something other than NtSetInfoFile
-      // (eg. seems NtWriteFile might extend the file in some cases)
-      file->entry()->update();
+      // (eg. seems NtWriteFile might extend the file in some cases). The host
+      // lookup can block on a slow drive.
+      kernel_state()->RunBlockingIo(
+          [&]() { file->entry()->update(); },
+          GuestScheduler::BlockingCallClass::kConcurrent);
 
       auto info = info_ptr.as<X_FILE_NETWORK_OPEN_INFORMATION*>();
       info->creation_time = file->entry()->create_timestamp();
@@ -130,6 +158,11 @@ dword_result_t NtQueryInformationFile_entry(
       out_length = sizeof(*info);
       break;
     }
+    case XFileBasicInformation:
+      // The file system takes it to set but not to query.
+      status = X_STATUS_INVALID_PARAMETER;
+      out_length = 0;
+      break;
     default: {
       // Unsupported, for now.
       assert_always();
@@ -139,7 +172,8 @@ dword_result_t NtQueryInformationFile_entry(
     }
   }
 
-  if (io_status_block_ptr) {
+  // A failed request leaves the status block alone.
+  if (io_status_block_ptr && XSUCCEEDED(status)) {
     io_status_block_ptr->status = status;
     io_status_block_ptr->information = out_length;
   }
@@ -197,42 +231,36 @@ dword_result_t NtSetInformationFile_entry(
   }
 
   X_STATUS result = X_STATUS_SUCCESS;
-  uint32_t out_length;
 
   switch (info_class) {
     case XFileBasicInformation: {
       auto info = info_ptr.as<X_FILE_BASIC_INFORMATION*>();
-
-      bool basic_result = true;
-      if (info->creation_time) {
-        basic_result &= file->entry()->SetCreateTimestamp(info->creation_time);
+      // Of the attributes only the directory bit is kept, which a file can't
+      // take.
+      if ((info->attributes & vfs::kFileAttributeDirectory) &&
+          !(file->entry()->attributes() & vfs::kFileAttributeDirectory)) {
+        result = X_STATUS_INVALID_PARAMETER;
+        break;
       }
 
-      if (info->last_access_time) {
-        basic_result &=
-            file->entry()->SetAccessTimestamp(info->last_access_time);
+      // The change time follows the write time.
+      if (info->creation_time || info->last_access_time ||
+          info->last_write_time) {
+        result = file->SetTimes(info->creation_time, info->last_access_time,
+                                info->last_write_time);
       }
-
-      if (info->last_write_time) {
-        basic_result &= file->entry()->SetWriteTimestamp(info->last_write_time);
-      }
-
-      basic_result &= file->entry()->SetAttributes(info->attributes);
-      if (!basic_result) {
-        result = X_STATUS_UNSUCCESSFUL;
-      }
-
-      out_length = sizeof(*info);
       break;
     }
     case XFileRenameInformation: {
       auto info = info_ptr.as<X_FILE_RENAME_INFORMATION*>();
       // Compute path, possibly attrs relative.
-      std::filesystem::path target_path =
+      auto target_name =
           util::TranslateAnsiPath(kernel_memory(), &info->ansi_string);
+      xeObStripDosDevicesPrefix(target_name);
+      std::filesystem::path target_path = target_name;
 
       // Place IsValidPath in path from where it can be accessed everywhere
-      if (!IsValidPath(target_path.string(), false)) {
+      if (!IsValidPath(xe::path_to_utf8(target_path), false)) {
         return X_STATUS_OBJECT_NAME_INVALID;
       }
 
@@ -240,15 +268,13 @@ dword_result_t NtSetInformationFile_entry(
         return X_STATUS_INVALID_PARAMETER;
       }
 
-      file->Rename(target_path);
-      out_length = sizeof(*info);
+      result = file->Rename(target_path, info->replace_existing != 0);
       break;
     }
     case XFileDispositionInformation: {
       auto info = info_ptr.as<X_FILE_DISPOSITION_INFORMATION*>();
       bool delete_on_close = info->delete_file ? true : false;
       file->entry()->SetForDeletion(static_cast<bool>(info->delete_file));
-      out_length = 0;
       XELOGW("NtSetInformationFile set deleting flag for {} on close to: {}",
              file->name(), delete_on_close);
       break;
@@ -256,25 +282,47 @@ dword_result_t NtSetInformationFile_entry(
     case XFilePositionInformation: {
       auto info = info_ptr.as<X_FILE_POSITION_INFORMATION*>();
       file->set_position(info->current_byte_offset);
-      out_length = sizeof(*info);
       break;
     }
     case XFileAllocationInformation: {
       auto info = info_ptr.as<X_FILE_ALLOCATION_INFORMATION*>();
-      result = file->SetLength(info->allocation_size);
-      out_length = sizeof(*info);
-
-      // Update the files vfs::Entry information
-      file->entry()->update();
+      if (!(file->file_access() &
+            (xe::filesystem::FileAccess::kGenericWrite |
+             xe::filesystem::FileAccess::kFileWriteData))) {
+        result = X_STATUS_ACCESS_DENIED;
+        break;
+      }
+      // The allocation rounds up to whole allocation units. A larger one
+      // leaves the file size alone. A smaller one cuts the file to it.
+      auto device = file->device();
+      uint64_t allocation_size =
+          xe::round_up(uint64_t(info->allocation_size),
+                       uint64_t(file->entry()->sectors_per_allocation_unit()) *
+                           device->bytes_per_sector(),
+                       false);
+      uint64_t file_size = 0;
+      kernel_state()->RunBlockingIo(
+          [&]() {
+            file->entry()->update();
+            file_size = file->entry()->size();
+          },
+          GuestScheduler::BlockingCallClass::kConcurrent);
+      if (allocation_size < file_size) {
+        result = file->SetLength(allocation_size);
+        kernel_state()->RunBlockingIo(
+            [&]() { file->entry()->update(); },
+            GuestScheduler::BlockingCallClass::kConcurrent);
+      }
       break;
     }
     case XFileEndOfFileInformation: {
       auto info = info_ptr.as<X_FILE_END_OF_FILE_INFORMATION*>();
       result = file->SetLength(info->end_of_file);
-      out_length = sizeof(*info);
 
       // Update the files vfs::Entry information
-      file->entry()->update();
+      kernel_state()->RunBlockingIo(
+          [&]() { file->entry()->update(); },
+          GuestScheduler::BlockingCallClass::kConcurrent);
       break;
     }
     case XFileCompletionInformation: {
@@ -282,26 +330,28 @@ dword_result_t NtSetInformationFile_entry(
       auto info = info_ptr.as<X_FILE_COMPLETION_INFORMATION*>();
       auto handle = uint32_t(info->handle);
       auto key = uint32_t(info->key);
-      out_length = sizeof(*info);
       auto port =
           kernel_state()->object_table()->LookupObject<XIOCompletion>(handle);
-      if (!port) {
+      // Only an async handle binds to a port. It binds once.
+      if (file->is_synchronous() || file->HasCompletionPort()) {
+        result = X_STATUS_INVALID_PARAMETER;
+      } else if (!port) {
         result = X_STATUS_INVALID_HANDLE;
-      } else {
-        file->RegisterIOCompletionPort(key, port);
+      } else if (!file->RegisterIOCompletionPort(key, port)) {
+        result = X_STATUS_INVALID_PARAMETER;
       }
       break;
     }
     default:
       // Unsupported, for now.
       assert_always();
-      out_length = 0;
       break;
   }
 
-  if (io_status_block) {
+  // A failed request leaves the status block alone.
+  if (io_status_block && XSUCCEEDED(result)) {
     io_status_block->status = result;
-    io_status_block->information = out_length;
+    io_status_block->information = 0;
   }
 
   return result;
@@ -363,7 +413,8 @@ dword_result_t NtQueryVolumeInformationFile_entry(
       auto info = info_ptr.as<X_FILE_FS_SIZE_INFORMATION*>();
       info->total_allocation_units = device->total_allocation_units();
       info->available_allocation_units = device->available_allocation_units();
-      info->sectors_per_allocation_unit = device->sectors_per_allocation_unit();
+      info->sectors_per_allocation_unit =
+          file->entry()->sectors_per_allocation_unit();
       info->bytes_per_sector = device->bytes_per_sector();
       // TODO(gibbed): sanity check, XCTD userland code seems to require this.
       assert_true(info->bytes_per_sector == 0x200);
@@ -393,7 +444,11 @@ dword_result_t NtQueryVolumeInformationFile_entry(
       XELOGW("Stub XFileFsDeviceInformation!");
       info->device_type =
           FILE_DEVICE_UNKNOWN;  // 415608D8 checks for FILE_DEVICE_EHSTOR;
-      info->characteristics = 0;
+      // 58480880 deletes a content package it reopens unless its volume
+      // reports exactly 2. What the value means isn't known.
+      const bool is_content_package = xe::utf8::starts_with(
+          file_device->mount_path(), "\\Device\\Content\\");
+      info->characteristics = is_content_package ? 2 : 0;
       out_length = sizeof(X_FILE_FS_DEVICE_INFORMATION);
       break;
     }

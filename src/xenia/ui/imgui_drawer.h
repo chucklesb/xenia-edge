@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 #include "third_party/imgui/imgui.h"
@@ -64,7 +65,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   void Draw(UIDrawContext& ui_draw_context) override;
 
+  // Destroys every dialog, which wakes anyone waiting on one.
   void ClearDialogs();
+  // Drops every queued notification.
+  void ClearNotifications();
   void EnableNotifications(bool enable) { are_notifications_enabled_ = enable; }
 
   std::unique_ptr<ImmediateTexture> LoadImGuiIcon(
@@ -92,7 +96,6 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   bool HasOpenDialogs() const { return !dialogs_.empty(); }
   void LoadInputSystem(hid::InputSystem* input_system);
-  void SetGuideButtonAction(std::function<void(uint8_t)> func);
 
   // Post a callback to be executed after the current frame completes
   void PostDeferredCallback(std::function<void()> callback);
@@ -126,6 +129,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   void SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e);
 
   bool IsDrawingDialogs() const { return dialog_loop_next_index_ != SIZE_MAX; }
+  void ResetFrameTimeIfIdle();
   void DetachIfLastWindowRemoved();
   void UpdateGamepads();
 
@@ -137,7 +141,6 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   ImGuiContext* internal_state_ = nullptr;
   hid::InputSystem* input_system_ = nullptr;
 
-  std::function<void(uint8_t)> onGuidePressFunction_;
   // All currently-attached dialogs that get drawn.
   std::vector<ImGuiDialog*> dialogs_;
 
@@ -171,6 +174,13 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   bool reset_mouse_position_after_next_frame_ = false;
 
   uint32_t mouse_buttons_held_ = 0;
+  // Keys pressed while attached.
+  std::unordered_set<VirtualKey> keys_down_;
+
+  // Dialogs force the cursor visible since it auto-hides during gameplay
+  Window::CursorVisibility cursor_visibility_before_dialogs_ =
+      Window::CursorVisibility::kVisible;
+  bool cursor_visibility_overridden_ = false;
 
   double frame_time_tick_frequency_;
   uint64_t last_frame_time_ticks_;

@@ -11,39 +11,13 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"கோப்பைத் தேடவா?"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   %zu ஏற்கனவே நிறுவப்பட்டுள்ளது"
 
-#: src/xenia/ui/game_list_panel_wx.cc:1240
-msgid " (%zu discs)"
-msgstr " (%zu வட்டுகள்)"
-
 #: src/xenia/ui/install_progress_dialog_wx.cc:185
 msgid " - %s (%08X)"
 msgstr " — %s (%08X)"
-
-#: src/xenia/ui/game_config_dialog_wx.cc:285
-msgid "%08X - Config Overrides"
-msgstr ""
-
-#: src/xenia/ui/patches_dialog_wx.cc:37
-msgid "%s (%08X)"
-msgstr "%s (%08X)"
-
-#: src/xenia/ui/game_config_dialog_wx.cc:286
-msgid "%s (%08X) - Config Overrides"
-msgstr "%s (%08X) — கட்டமைப்பு மேலெழுதல்கள்"
 
 #: src/xenia/app/emulator_window.cc:1995
 msgid "%s (Slot %d)"
@@ -72,8 +46,8 @@ msgid "&Configuration"
 msgstr "கட்டமைப்பு(&C)"
 
 #: src/xenia/app/emulator_window.cc:898
-msgid "&Controllers"
-msgstr "கட்டுப்படுத்திகள்(&C)"
+msgid "C&ontrollers"
+msgstr "கட்டுப்படுத்திகள்(&O)"
 
 #: src/xenia/app/emulator_window.cc:786
 msgid "&File"
@@ -114,10 +88,6 @@ msgstr "காட்சி(&V)"
 #: src/xenia/app/emulator_window.cc:867
 msgid "&Volume"
 msgstr "ஒலி அளவு(&V)"
-
-#: src/xenia/ui/game_scan_progress_dialog_wx.cc:276
-msgid "(Installed) "
-msgstr "(நிறுவப்பட்டது) "
 
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:62
 msgid "(unknown title)"
@@ -191,14 +161,6 @@ msgstr "அர்ஜென்டினா"
 #: src/xenia/ui/profile_editor_dialog_wx.cc:68
 msgid "Armenia"
 msgstr "ஆர்மீனியா"
-
-#: src/xenia/ui/quick_settings_dialog_wx.cc:252
-msgid "Audio"
-msgstr "ஆடியோ"
-
-#: src/xenia/ui/quick_settings_dialog_wx.cc:258
-msgid "Audio Backend:"
-msgstr "ஆடியோ பின்நிலை:"
 
 #: src/xenia/app/emulator_window.cc:2402
 msgid "Auto (%s)"
@@ -313,10 +275,6 @@ msgstr "இணக்கத்தன்மை"
 msgid "Complete"
 msgstr "முடிந்தது"
 
-#: src/xenia/ui/game_list_panel_wx.cc:1028
-msgid "Config Overrides..."
-msgstr "கட்டமைப்பு மேலெழுதல்கள்…"
-
 #: src/xenia/ui/advanced_settings_dialog_wx.cc:104
 #: src/xenia/ui/advanced_settings_dialog_wx.cc:419
 msgid "Configuration Manager"
@@ -365,22 +323,9 @@ msgstr "குரோஷியா"
 msgid "Czech Republic"
 msgstr "செக் குடியரசு"
 
-#: src/xenia/ui/game_list_panel_wx.cc:990
-msgid "DLC"
-msgstr "DLC"
-
 #: src/xenia/app/emulator_window.cc:335
 msgid "Dance Pad"
 msgstr "டான்ஸ் பேட்"
-
-#: src/xenia/ui/game_list_panel_wx.cc:690
-#: src/xenia/ui/game_list_panel_wx.cc:693
-msgid "Default"
-msgstr "இயல்பு"
-
-#: src/xenia/ui/quick_settings_dialog_wx.cc:263
-msgid "Default Volume:"
-msgstr "இயல்பு ஒலி அளவு:"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:90
 msgid "Denmark"
@@ -421,14 +366,6 @@ msgstr "வெளியேறு(&X)"
 msgid "Ecuador"
 msgstr "ஈக்வடார்"
 
-#: src/xenia/ui/game_list_panel_wx.cc:648
-msgid "Edit Discs"
-msgstr "வட்டுகளைத் திருத்து"
-
-#: src/xenia/ui/game_list_panel_wx.cc:937
-msgid "Edit Discs..."
-msgstr "வட்டுகளைத் திருத்து…"
-
 #: src/xenia/app/emulator_window.cc:2053
 msgid "Edit..."
 msgstr "திருத்து…"
@@ -457,43 +394,9 @@ msgstr "ஆங்கிலம்"
 msgid "Enter gamertag for new profile:"
 msgstr "புதிய சுயவிவரத்திற்கான கேமர்டாக்கை உள்ளிடவும்:"
 
-#: src/xenia/ui/game_list_panel_wx.cc:754
-msgid "Enter new label:"
-msgstr "புதிய லேபிளை உள்ளிடவும்:"
-
-#: src/xenia/ui/game_config_dialog_wx.cc:435
-msgid "Error"
-msgstr "பிழை"
-
 #: src/xenia/ui/profile_editor_dialog_wx.cc:94
 msgid "Estonia"
 msgstr "எஸ்டோனியா"
-
-#: src/xenia/app/emulator_window.cc:2421
-msgid ""
-"Experimental fork of Xenia Canary.\n"
-"\n"
-"https://github.com/has207/xenia-edge\n"
-"\n"
-"Branch: %s\n"
-"Commit: %s\n"
-"Build Date: %s\n"
-"\n"
-"UI font: Inter by Rasmus Andersson (https://rsms.me/inter/, SIL Open Font "
-"License 1.1).\n"
-"Icons by Icons8 (https://icons8.com)."
-msgstr ""
-"Xenia Canary-ன் சோதனை ஃபோர்க்.\n"
-"\n"
-"https://github.com/has207/xenia-edge\n"
-"\n"
-"கிளை: %s\n"
-"கமிட்: %s\n"
-"உருவாக்க தேதி: %s\n"
-"\n"
-"UI எழுத்துரு: Inter by Rasmus Andersson (https://rsms.me/inter/, SIL Open "
-"Font License 1.1).\n"
-"சின்னங்கள் Icons8 (https://icons8.com) வழங்கியவை."
 
 #: src/xenia/app/emulator_window.cc:887
 msgid "FA&Q..."
@@ -502,14 +405,6 @@ msgstr "FAQ(&Q)…"
 #: src/xenia/ui/patches_dialog_wx.cc:225
 msgid "Failed to save changes."
 msgstr "மாற்றங்களைச் சேமிப்பதில் தோல்வி."
-
-#: src/xenia/ui/game_config_dialog_wx.cc:434
-msgid "Failed to save: %s"
-msgstr "சேமிப்பதில் தோல்வி: %s"
-
-#: src/xenia/ui/patches_dialog_wx.cc:214
-msgid "Failed to update patch state."
-msgstr "திட்டுநிலையைப் புதுப்பிப்பதில் தோல்வி."
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:181
 #: src/xenia/ui/profile_editor_dialog_wx.cc:185
@@ -581,8 +476,8 @@ msgid "Gamepad"
 msgstr "கேம்பேட்"
 
 #: src/xenia/ui/game_list_panel_wx.cc:96
-msgid "Gameplay"
-msgstr "விளையாட்டுமுறை"
+msgid "Gets in game"
+msgstr "விளையாட்டுக்குள் நுழைகிறது"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:458
 msgid "Gamer Bio:"
@@ -676,10 +571,6 @@ msgstr "ஹங்கேரி"
 msgid "Iceland"
 msgstr "ஐஸ்லாந்து"
 
-#: src/xenia/ui/game_list_panel_wx.cc:302
-msgid "Icon"
-msgstr "சின்னம்"
-
 #: src/xenia/ui/profile_editor_dialog_wx.cc:396
 msgid "Icon change is disabled while a title is running."
 msgstr "தலைப்பு இயங்கும்போது சின்னத்தை மாற்றுவது முடக்கப்பட்டுள்ளது."
@@ -715,10 +606,6 @@ msgstr "நிறுவல் பாதை: "
 #: src/xenia/ui/install_progress_dialog_wx.cc:45
 msgid "Installation Progress"
 msgstr "நிறுவல் முன்னேற்றம்"
-
-#: src/xenia/ui/game_list_panel_wx.cc:761
-msgid "Invalid Label"
-msgstr "தவறான லேபிள்"
 
 #: src/xenia/ui/profile_editor_dialog_wx.cc:594
 #: src/xenia/ui/profile_editor_dialog_wx.cc:602
@@ -801,15 +688,6 @@ msgstr "குவைத்"
 msgid "Kyrgyzstan"
 msgstr "கிர்கிஸ்தான்"
 
-#: src/xenia/ui/game_list_panel_wx.cc:691
-#: src/xenia/ui/game_list_panel_wx.cc:695
-msgid "Label"
-msgstr "லேபிள்"
-
-#: src/xenia/ui/game_list_panel_wx.cc:761
-msgid "Label cannot contain '::'."
-msgstr "லேபிளில் '::' இருக்கக் கூடாது."
-
 #: src/xenia/ui/profile_editor_dialog_wx.cc:464
 #: src/xenia/ui/quick_settings_dialog_wx.cc:311
 msgid "Language:"
@@ -866,7 +744,7 @@ msgstr "தலைப்புகள் ஏற்றப்படுகின்�
 
 #: src/xenia/ui/game_list_panel_wx.cc:98
 msgid "Loads"
-msgstr "ஏற்றல்கள்"
+msgstr "தொடங்குகிறது"
 
 #: src/xenia/app/emulator_window.cc:2003
 msgid "Login"
@@ -965,6 +843,14 @@ msgstr "சுயவிவரங்கள் இல்லை"
 msgid "No file path is set for this title."
 msgstr "இந்தத் தலைப்புக்கு கோப்புப் பாதை எதுவும் அமைக்கப்படவில்லை."
 
+#: src/xenia/ui/game_scan_progress_dialog_wx.cc:376
+msgid "No games found."
+msgstr "விளையாட்டுகள் எதுவும் கிடைக்கவில்லை."
+
+#: src/xenia/ui/game_scan_progress_dialog_wx.cc:376
+msgid "No new games found."
+msgstr "புதிய விளையாட்டுகள் எதுவும் கிடைக்கவில்லை."
+
 #: src/xenia/ui/profile_editor_dialog_wx.cc:178
 #: src/xenia/ui/profile_editor_dialog_wx.cc:184
 #: src/xenia/ui/quick_settings_dialog_wx.cc:279
@@ -1012,10 +898,6 @@ msgstr "திற"
 #: src/xenia/app/emulator_window.cc:951 src/xenia/app/emulator_window.cc:1716
 msgid "Open a title"
 msgstr "தலைப்பைத் திற"
-
-#: src/xenia/ui/game_list_panel_wx.cc:949
-msgid "Open containing folder"
-msgstr "உள்ளடக்கிய கோப்புறையைத் திற"
 
 #: src/xenia/ui/quick_settings_dialog_wx.cc:285
 msgid "Open using Rosetta"
@@ -1154,14 +1036,6 @@ msgstr "பட்டியலில் இருந்து அகற்று"
 #: src/xenia/ui/game_config_dialog_wx.cc:346
 msgid "Remove this override"
 msgstr "இந்த மேலெழுதலை அகற்று"
-
-#: src/xenia/ui/game_list_panel_wx.cc:754
-msgid "Rename Label"
-msgstr "லேபிளுக்கு மறுபெயரிடு"
-
-#: src/xenia/ui/game_list_panel_wx.cc:728
-msgid "Rename Label..."
-msgstr "லேபிளுக்கு மறுபெயரிடு…"
 
 #: src/xenia/ui/quick_settings_dialog_wx.cc:169
 msgid "Rendering:"
@@ -1317,10 +1191,6 @@ msgstr "நிலை"
 msgid "Status: %s"
 msgstr "நிலை: %s"
 
-#: src/xenia/ui/game_scan_progress_dialog_wx.cc:239
-msgid "Status: Installed"
-msgstr "நிலை: நிறுவப்பட்டது"
-
 #: src/xenia/app/emulator_window.cc:1713
 msgid "Stop the running title and return to the list"
 msgstr "இயங்கும் தலைப்பை நிறுத்தி பட்டியலுக்குத் திரும்பு"
@@ -1374,10 +1244,6 @@ msgstr ""
 #: src/xenia/ui/game_list_panel_wx.cc:303
 msgid "Title"
 msgstr "தலைப்பு"
-
-#: src/xenia/ui/game_list_panel_wx.cc:985
-msgid "Title Updates"
-msgstr "தலைப்பு புதுப்பிப்புகள்"
 
 #: src/xenia/ui/game_list_panel_wx.cc:597
 msgid "Title not found"
@@ -1537,8 +1403,8 @@ msgstr "தலைப்பு %08X"
 
 
 #: src/xenia/ui/redist_installer_wx.cc:396
-msgid "dxcompiler.dll and dxil.dll not found, required for Direct3D 12 shaders. Download now (~26 MB)?"
-msgstr "dxcompiler.dll மற்றும் dxil.dll கிடைக்கவில்லை; Direct3D 12 ஷேடர்களுக்கு இவை தேவை. இப்போது பதிவிறக்கவா (~26 MB)?"
+msgid "dxil.dll not found, required for Direct3D 12 shaders. Download now (~26 MB)?"
+msgstr "dxil.dll கிடைக்கவில்லை; Direct3D 12 ஷேடர்களுக்கு இது தேவை. இப்போது பதிவிறக்கவா (~26 MB)?"
 
 #: src/xenia/ui/redist_installer_wx.cc:438
 msgid "D3D12Core.dll not found, required for Shader Model 6.6. Download now (~35 MB) and restart?"
@@ -1583,3 +1449,382 @@ msgstr "Direct3D 12 பிழைத்திருத்த அடுக்க�
 #: src/xenia/ui/redist_installer_wx.cc:746
 msgid "vulkan-1.dll not found, required for the Vulkan graphics backend. Download now (~20 MB)?"
 msgstr "vulkan-1.dll கிடைக்கவில்லை; Vulkan வரைகலை பின்தளத்துக்கு இது தேவை. இப்போது பதிவிறக்கவா (~20 MB)?"
+
+
+#: src/xenia/ui/game_info_panel_wx.cc:681
+msgid "%s belongs to title %08X."
+msgstr "%s என்பது %08X தலைப்பைச் சேர்ந்தது."
+
+#: src/xenia/ui/game_info_panel_wx.cc:720
+msgid "%s could not be copied: %s"
+msgstr "%s ஐ நகலெடுக்க முடியவில்லை: %s"
+
+#: src/xenia/ui/game_info_panel_wx.cc:694
+msgid "%s is a different kind of content."
+msgstr "%s வேறு வகையான உள்ளடக்கம்."
+
+#: src/xenia/ui/game_info_panel_wx.cc:707
+msgid "%s is for a different release of this game."
+msgstr "%s இந்த விளையாட்டின் வேறொரு பதிப்புக்கானது."
+
+#: src/xenia/ui/game_info_panel_wx.cc:675
+msgid "%s is not a content package."
+msgstr "%s ஒரு உள்ளடக்கத் தொகுப்பு அல்ல."
+
+#: src/xenia/ui/game_list_panel_wx.cc:773
+msgid "(%zu discs)"
+msgstr "(%zu வட்டுகள்)"
+
+#: src/xenia/ui/game_info_panel_wx.cc:656
+msgid "All Files (*.*)|*.*"
+msgstr "அனைத்து கோப்புகளும் (*.*)|*.*"
+
+#: src/xenia/app/emulator_window.cc:439
+msgid "BSD 3-Clause License"
+msgstr "BSD 3-Clause உரிமம்"
+
+#: src/xenia/app/emulator_window.cc:434
+msgid ""
+"Branch: %s\n"
+"Commit: %s\n"
+"Build Date: %s"
+msgstr ""
+"கிளை: %s\n"
+"கமிட்: %s\n"
+"உருவாக்கிய தேதி: %s"
+
+#: src/xenia/ui/game_info_panel_wx.cc:232
+msgid "Close the info pane"
+msgstr "தகவல் பலகத்தை மூடு"
+
+#: src/xenia/ui/game_info_panel_wx.cc:215
+msgid "Configuration"
+msgstr "கட்டமைப்பு"
+
+#: src/xenia/ui/game_info_panel_wx.cc:437
+msgid "Details"
+msgstr "விவரங்கள்"
+
+#: src/xenia/ui/game_info_panel_wx.cc:560
+msgid "Discs (%zu)"
+msgstr "வட்டுகள் (%zu)"
+
+#: src/xenia/ui/game_info_panel_wx.cc:830
+msgid "Enter a name for this version:"
+msgstr "இந்தப் பதிப்புக்கு ஒரு பெயரை உள்ளிடவும்:"
+
+#: src/xenia/app/emulator_window.cc:3011
+msgid "Experimental fork of Xenia Canary."
+msgstr "Xenia Canary இன் சோதனை ஃபோர்க்."
+
+#: src/xenia/ui/game_config_panel_wx.cc:334
+msgid "Failed to save."
+msgstr "சேமிக்க முடியவில்லை."
+
+#: src/xenia/ui/game_info_panel_wx.cc:410
+msgid "Give this version its own name"
+msgstr "இந்தப் பதிப்புக்குச் சொந்தப் பெயரை வழங்கு"
+
+#: src/xenia/app/emulator_window.cc:444
+msgid "Icons by %s"
+msgstr "சின்னங்கள்: %s"
+
+#: src/xenia/app/emulator_window.cc:444
+msgid "Icons8"
+msgstr "Icons8"
+
+#: src/xenia/ui/game_info_panel_wx.cc:211
+msgid "Info"
+msgstr "தகவல்"
+
+#: src/xenia/ui/game_info_panel_wx.cc:349
+msgid "Installed Content (%zu)"
+msgstr "நிறுவப்பட்ட உள்ளடக்கம் (%zu)"
+
+#: src/xenia/app/emulator_window.cc:443
+msgid "Inter by Rasmus Andersson"
+msgstr "Inter, உருவாக்கியவர் Rasmus Andersson"
+
+#: src/xenia/app/emulator_window.cc:607
+msgid "Library updated"
+msgstr "நூலகம் புதுப்பிக்கப்பட்டது"
+
+#: src/xenia/ui/game_info_panel_wx.cc:153
+msgid "Never"
+msgstr "ஒருபோதும் இல்லை"
+
+#: src/xenia/ui/game_info_panel_wx.cc:391
+msgid "No art"
+msgstr "படம் இல்லை"
+
+#: src/xenia/ui/game_info_panel_wx.cc:472
+msgid "No compatibility report is linked."
+msgstr "இணக்கத்தன்மை அறிக்கை எதுவும் இணைக்கப்படவில்லை."
+
+#: src/xenia/ui/game_info_panel_wx.cc:625
+msgid "No patches are bundled for this title."
+msgstr "இந்தத் தலைப்புக்கு எந்தத் திட்டும் இணைக்கப்படவில்லை."
+
+#: src/xenia/ui/game_info_panel_wx.cc:361
+msgid "No profile is signed in."
+msgstr "எந்தச் சுயவிவரமும் உள்நுழையவில்லை."
+
+#: src/xenia/ui/quick_settings_dialog_wx.cc:331
+msgid "Not supported on macOS"
+msgstr "macOS இல் ஆதரிக்கப்படவில்லை"
+
+#: src/xenia/ui/game_info_panel_wx.cc:607
+msgid "Nothing installed."
+msgstr "எதுவும் நிறுவப்படவில்லை."
+
+#: src/xenia/ui/game_info_panel_wx.cc:757
+msgid "Open folder"
+msgstr "கோப்புறையைத் திற"
+
+#: src/xenia/ui/game_info_panel_wx.cc:830
+msgid "Rename Game"
+msgstr "விளையாட்டின் பெயரை மாற்று"
+
+#: src/xenia/ui/game_info_panel_wx.cc:408
+msgid "Rename..."
+msgstr "பெயரை மாற்று..."
+
+#: src/xenia/ui/game_list_panel_wx.cc:130
+msgid "Reverse the sort order"
+msgstr "வரிசைப்படுத்தும் வரிசையை மாற்று"
+
+#: src/xenia/ui/game_config_panel_wx.cc:334
+msgid "Saved."
+msgstr "சேமிக்கப்பட்டது."
+
+#: src/xenia/ui/game_info_panel_wx.cc:359
+msgid "Saves (%zu)"
+msgstr "சேமிப்புகள் (%zu)"
+
+#: src/xenia/ui/game_info_panel_wx.cc:308
+msgid "Select a game for details."
+msgstr "விவரங்களைக் காண ஒரு விளையாட்டைத் தேர்ந்தெடுக்கவும்."
+
+#: src/xenia/ui/game_info_panel_wx.cc:655
+msgid "Select content packages"
+msgstr "உள்ளடக்கத் தொகுப்புகளைத் தேர்ந்தெடுக்கவும்"
+
+#: src/xenia/ui/game_info_panel_wx.cc:728
+msgid "Some packages were not added"
+msgstr "சில தொகுப்புகள் சேர்க்கப்படவில்லை"
+
+#: src/xenia/app/emulator_window.cc:599
+msgid ""
+"These games were found in more than one version, and each version now has its own entry in the list. Saves and updates belong to a single version, so they are kept apart.\n"
+"\n"
+"%s"
+msgstr ""
+"இந்த விளையாட்டுகள் ஒன்றுக்கு மேற்பட்ட பதிப்புகளில் கிடைத்தன, இப்போது ஒவ்வொரு பதிப்புக்கும் பட்டியலில் தனி உள்ளீடு உள்ளது. சேமிப்புகளும் புதுப்பிப்புகளும் ஒரே பதிப்பைச் சேர்ந்தவை, எனவே அவை தனித்தனியாக வைக்கப்படுகின்றன.\n"
+"\n"
+"%s"
+
+#: src/xenia/ui/game_info_panel_wx.cc:464
+msgid "This title is not in the compatibility database."
+msgstr "இந்தத் தலைப்பு இணக்கத்தன்மை தரவுத்தளத்தில் இல்லை."
+
+#: src/xenia/ui/game_info_panel_wx.cc:344
+msgid "Title Updates (%zu)"
+msgstr "தலைப்பு புதுப்பிப்புகள் (%zu)"
+
+#: src/xenia/app/emulator_window.cc:442
+msgid "UI font: %s (SIL Open Font License 1.1)"
+msgstr "இடைமுக எழுத்துரு: %s (SIL Open Font License 1.1)"
+
+#: src/xenia/ui/game_info_panel_wx.cc:399
+msgid "Unknown title"
+msgstr "தெரியாத தலைப்பு"
+
+#: src/xenia/ui/game_info_panel_wx.cc:452
+msgid "Version"
+msgstr "பதிப்பு"
+
+#: src/xenia/app/emulator_window.cc:438
+msgid "Xenia is distributed under the %s"
+msgstr "Xenia %s இன் கீழ் விநியோகிக்கப்படுகிறது"
+
+#: src/xenia/ui/game_info_panel_wx.cc:212
+msgid "Content"
+msgstr "உள்ளடக்கம்"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "மாற்று கிட்டார்"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "பேஸ் கிட்டார்"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"அசல் Xbox கேம்கள் Xbox 360-இன் பின்னோக்கிய இணக்கத்தன்மை எமுலேட்டரான XeFu மூலம் இயங்குகின்றன, ஆனால் அதன் கோப்புறையில் %s இல்லை:\n"
+"\n"
+"%s\n"
+"\n"
+"Xbox 360 வன் இயக்ககத்தின் Compatibility கோப்புறையிலிருந்து xbox.xex மற்றும் xefu*.xex கோப்புகளை இந்தக் கோப்புறைக்கு நகலெடுக்கவும்."
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "XeFu கிடைக்கவில்லை"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"தலைப்பைத் தொடங்க முடியவில்லை.\n"
+"\n"
+"தொழில்நுட்ப விவரங்களுக்கு xenia.log-ஐப் பார்க்கவும்."
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "தலைப்பைத் தொடங்க முடியவில்லை!"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "தரவு மாற்றம்"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"உங்கள் தற்போதைய தரவில் சிலவற்றை புதிய சுயவிவரத்திற்கு மாற்ற முடியவில்லை. தோல்வியடைந்த உருப்படிகள்: %u\n"
+"\n"
+"தொழில்நுட்ப விவரங்களுக்கு xenia.log-ஐப் பார்க்கவும்."
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "உங்கள் தற்போதைய தரவு புதிய சுயவிவரத்திற்கு மாற்றப்பட்டது."
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"இந்தத் தலைப்புக்கு கோப்புப் பாதை எதுவும் அமைக்கப்படவில்லை.\n"
+"\n"
+"கோப்பைத் தேடவா?"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"கோப்பு கிடைக்கவில்லை:\n"
+"%s\n"
+"\n"
+"கோப்பைத் தேடவா?"
+
+#: src/xenia/app/emulator_window.cc:2325
+msgid "Failed to read the system update."
+msgstr "முறைமைப் புதுப்பிப்பைப் படிக்க முடியவில்லை."
+
+#: src/xenia/app/emulator_window.cc:2329
+msgid "Failed to write the system files."
+msgstr "முறைமைக் கோப்புகளை எழுத முடியவில்லை."
+
+#: src/xenia/app/emulator_window.cc:2296
+#: src/xenia/app/emulator_window.cc:2319
+#: src/xenia/app/emulator_window.cc:2324
+#: src/xenia/app/emulator_window.cc:2328
+#: src/xenia/app/emulator_window.cc:2333
+msgid "Install System Files"
+msgstr "முறைமைக் கோப்புகளை நிறுவு"
+
+#: src/xenia/app/emulator_window.cc:2297
+msgid "Installing the system files..."
+msgstr "முறைமைக் கோப்புகள் நிறுவப்படுகின்றன…"
+
+#: src/xenia/app/emulator_window.cc:2282
+msgid "Select a USB System Update"
+msgstr "USB முறைமைப் புதுப்பிப்பைத் தேர்ந்தெடு"
+
+#: src/xenia/app/emulator_window.cc:2310
+msgid "System files installed"
+msgstr "முறைமைக் கோப்புகள் நிறுவப்பட்டன"
+
+#: src/xenia/app/emulator_window.cc:2335
+msgid ""
+"The previous system files couldn't be put back in place. Move their folders back or delete them to install again. They are in:\n"
+"%s"
+msgstr ""
+"முந்தைய முறைமைக் கோப்புகளை அவற்றின் இடத்தில் மீண்டும் வைக்க முடியவில்லை. மீண்டும் நிறுவ, அவற்றின் கோப்புறைகளைப் பழைய இடத்திற்கு நகர்த்தவும் அல்லது நீக்கவும். அவை இங்கு உள்ளன:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2311
+msgid ""
+"The system files are installed in:\n"
+"%s"
+msgstr ""
+"முறைமைக் கோப்புகள் இங்கு நிறுவப்பட்டுள்ளன:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2320
+msgid "This file isn't a USB system update."
+msgstr "இந்தக் கோப்பு USB முறைமைப் புதுப்பிப்பு அல்ல."
+
+#: src/xenia/app/emulator_window.cc:1035
+msgid "Start Dashboard"
+msgstr "Xbox கட்டுப்பாட்டகத்தைத் தொடங்கு"
+
+#: src/xenia/app/emulator_window.cc:1171
+msgid "Download && Install..."
+msgstr "பதிவிறக்கி நிறுவு…"
+
+#: src/xenia/app/emulator_window.cc:1174
+msgid "Select File..."
+msgstr "கோப்பைத் தேர்ந்தெடு…"
+
+#: src/xenia/app/emulator_window.cc:2455
+msgid "Downloading the system update..."
+msgstr "முறைமைப் புதுப்பிப்பு பதிவிறக்கப்படுகிறது…"
+
+#: src/xenia/app/emulator_window.cc:2441
+msgid "System files are already installed. Do you want to replace them?"
+msgstr "முறைமைக் கோப்புகள் ஏற்கனவே நிறுவப்பட்டுள்ளன. அவற்றை மாற்ற விரும்புகிறீர்களா?"
+
+#: src/xenia/app/emulator_window.cc:1178
+msgid "Download Cover Art..."
+msgstr "அட்டைப் படங்களைப் பதிவிறக்கு…"
+
+#: src/xenia/app/emulator_window.cc:2393
+#: src/xenia/app/emulator_window.cc:2402
+#: src/xenia/app/emulator_window.cc:2430
+msgid "Download Cover Art"
+msgstr "அட்டைப் படங்களைப் பதிவிறக்கு"
+
+#: src/xenia/app/emulator_window.cc:2394
+msgid "There's no cover art to download."
+msgstr "பதிவிறக்க அட்டைப் படங்கள் எதுவும் இல்லை."
+
+#: src/xenia/app/emulator_window.cc:2403
+msgid "Downloading cover art..."
+msgstr "அட்டைப் படங்கள் பதிவிறக்கப்படுகின்றன…"
+
+#: src/xenia/app/emulator_window.cc:2418
+msgid "Covers downloaded: %d"
+msgstr "பதிவிறக்கப்பட்ட அட்டைகள்: %d"
+
+#: src/xenia/app/emulator_window.cc:2422
+msgid "Games whose cover couldn't be downloaded: %d"
+msgstr "அட்டையைப் பதிவிறக்க முடியாத விளையாட்டுகள்: %d"
+
+#: src/xenia/app/emulator_window.cc:2427
+msgid "Covers that couldn't be saved: %d"
+msgstr "சேமிக்க முடியாத அட்டைகள்: %d"

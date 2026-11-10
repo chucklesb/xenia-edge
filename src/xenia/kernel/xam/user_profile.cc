@@ -10,6 +10,7 @@
 #include "xenia/kernel/xam/user_profile.h"
 
 #include "third_party/fmt/include/fmt/format.h"
+#include "xenia/base/png_utils.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xdbf/gpd_info.h"
@@ -37,6 +38,12 @@ UserProfile::UserProfile(const uint64_t xuid,
   // present.
   LoadProfileIcon(XTileType::kPersonalGamerTile);
   LoadProfileIcon(XTileType::kPersonalGamerTileSmall);
+
+  // A picture on disk in one size gets the other here, since titles can ask
+  // for either.
+  AddMissingIconSize(XTileType::kGamerTile, XTileType::kGamerTileSmall);
+  AddMissingIconSize(XTileType::kPersonalGamerTile,
+                     XTileType::kPersonalGamerTileSmall);
 }
 
 GpdInfo* UserProfile::GetGpd(const uint32_t title_id) {
@@ -103,6 +110,30 @@ void UserProfile::LoadProfileIcon(XTileType tile_type) {
   file->Destroy();
 
   profile_images_.insert_or_assign(tile_type, data);
+}
+
+void UserProfile::AddMissingIconSize(XTileType large_type,
+                                     XTileType small_type) {
+  const bool has_large = profile_images_.contains(large_type);
+  if (has_large == profile_images_.contains(small_type)) {
+    return;
+  }
+  const auto [width, height] =
+      has_large ? kProfileIconSizeSmall : kProfileIconSize;
+  auto resized = ResizePng(
+      profile_images_.at(has_large ? large_type : small_type), width, height);
+  if (!resized.empty()) {
+    profile_images_.insert_or_assign(has_large ? small_type : large_type,
+                                     std::move(resized));
+  }
+}
+
+void UserProfile::ClearProfileIcon(XTileType icon_type) {
+  profile_images_.erase(icon_type);
+  if (kTileFileNames.contains(icon_type)) {
+    kernel_state()->file_system()->DeletePath(
+        fmt::format("User_{:016X}:\\{}", xuid_, kTileFileNames.at(icon_type)));
+  }
 }
 
 void UserProfile::WriteProfileIcon(XTileType tile_type,
@@ -207,6 +238,23 @@ bool UserProfile::WriteGpd(const uint32_t title_id) {
   file->WriteSync(std::span<uint8_t>(data.data(), data.size()), 0,
                   &written_bytes);
   file->Destroy();
+  return true;
+}
+
+bool UserProfile::RemoveGpd(const uint32_t title_id) {
+  auto it = games_gpd_.find(title_id);
+  if (it == games_gpd_.end()) {
+    return false;
+  }
+
+  const std::string mounted_path =
+      fmt::format("User_{:016X}:\\{:08X}.gpd", xuid_, title_id);
+
+  if (!kernel_state()->file_system()->DeletePath(mounted_path)) {
+    return false;
+  }
+
+  games_gpd_.erase(it);
   return true;
 }
 

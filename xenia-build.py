@@ -11,13 +11,17 @@ from functools import partial
 from argparse import ArgumentParser, ArgumentTypeError
 from glob import glob
 from json import loads as jsonloads
+import hashlib
 import os
+from re import fullmatch as re_fullmatch
 import platform
-from shutil import rmtree, which as shutil_which
+from shutil import rmtree, copy2, which as shutil_which
 import subprocess
 import sys
 import stat
 import tarfile
+import time
+from urllib.parse import urlparse
 import urllib.request
 import zipfile
 import enum
@@ -106,6 +110,48 @@ def import_subprocess_environment(args):
                     break
 
 VSVERSION_MINIMUM = 2022
+VS_GENERATOR_MAP = {
+    2022: "Visual Studio 17 2022",
+    2026: "Visual Studio 18 2026",
+}
+vs_install_path = None
+
+
+def get_vs_generator(vs_path, product_line_version, platform_type):
+    """Returns the CMake Visual Studio generator and optional platform toolset.
+
+    For newer VS versions, use the latest generator in the table with the newest
+    toolset found in the installation.
+    """
+    vs_generator = VS_GENERATOR_MAP.get(product_line_version)
+    if vs_generator:
+        return vs_generator, None
+    latest_known = max(VS_GENERATOR_MAP.keys())
+    vs_generator = VS_GENERATOR_MAP[latest_known]
+    print(f"  Note: VS {product_line_version} detected.")
+    print(f"  Using \"{vs_generator}\" generator with that instance.")
+    toolset = None
+    vc_dir = os.path.join(vs_path or "", "MSBuild", "Microsoft", "VC")
+    if os.path.isdir(vc_dir):
+        # Newest VC targets folder (e.g. v180)
+        vc_versions = sorted(
+            (d for d in os.listdir(vc_dir) if re_fullmatch(r"v\d+", d)),
+            key=lambda d: int(d[1:]))
+        for vc_version in reversed(vc_versions):
+            toolsets_dir = os.path.join(
+                vc_dir, vc_version, "Platforms", platform_type, "PlatformToolsets")
+            if not os.path.isdir(toolsets_dir):
+                continue
+            toolsets = sorted(
+                (d for d in os.listdir(toolsets_dir) if re_fullmatch(r"v\d+", d)),
+                key=lambda d: int(d[1:]))
+            if toolsets:
+                toolset = toolsets[-1]
+                break
+    print(f"  Using \"{toolset}\" toolset.")
+    return vs_generator, toolset
+
+
 def import_vs_environment():
     """Finds the installed Visual Studio version and imports
     interesting environment variables into os.environ.
@@ -121,21 +167,24 @@ def import_vs_environment():
     install_path = None
     env_tool_args = None
 
+    # Absolute: with NoDefaultCurrentDirectoryInExePath set, Windows doesn't
+    # look in the working directory for a relative path without a backslash.
     vswhere = subprocess.check_output(
-        "tools/vswhere/vswhere.exe -version \"[17,)\" -latest -prerelease -format json -utf8 -products"
-        " Microsoft.VisualStudio.Product.Enterprise"
-        " Microsoft.VisualStudio.Product.Professional"
-        " Microsoft.VisualStudio.Product.Community"
-        " Microsoft.VisualStudio.Product.BuildTools",
+        [
+            os.path.join(self_path, "tools", "vswhere", "vswhere.exe"),
+            "-version", "[17,)", "-latest", "-prerelease",
+            "-format", "json", "-utf8", "-products",
+            "Microsoft.VisualStudio.Product.Enterprise",
+            "Microsoft.VisualStudio.Product.Professional",
+            "Microsoft.VisualStudio.Product.Community",
+            "Microsoft.VisualStudio.Product.BuildTools",
+        ],
         encoding="utf-8",
     )
     if vswhere:
         vswhere = jsonloads(vswhere)
     if vswhere and len(vswhere) > 0:
-        # Map internal version to year version: 17->2022, 18->2026, etc.
-        internal_version = int(vswhere[0].get("catalog", {}).get("productLineVersion", 17))
-        version_map = {17: 2022, 18: 2026}
-        version = version_map.get(internal_version, VSVERSION_MINIMUM)
+        version = int(vswhere[0].get("catalog", {}).get("productLineVersion", VSVERSION_MINIMUM))
         install_path = vswhere[0].get("installationPath", None)
 
     vsdevcmd_path = os.path.join(install_path, "Common7", "Tools", "VsDevCmd.bat")
@@ -147,6 +196,9 @@ def import_vs_environment():
 
     if not version:
         return None
+
+    global vs_install_path
+    vs_install_path = install_path
 
     import_subprocess_environment(env_tool_args)
     os.environ["VSVERSION"] = f"{version}"
@@ -448,6 +500,22 @@ def git_submodule_update():
             ])
 
 
+def download_github_release_asset(repo, tag, name, path):
+    """Downloads a release asset through the GitHub API, which redirects to a
+    freshly signed URL. GitHub's CDN can keep serving a cached error for the
+    plain release download URL for hours."""
+    with urllib.request.urlopen(
+            f"https://api.github.com/repos/{repo}/releases/tags/{tag}") as r:
+        assets = jsonloads(r.read())["assets"]
+    asset = next((a for a in assets if a["name"] == name), None)
+    if asset is None:
+        raise OSError(f"{name} is not in release {tag} of {repo}")
+    request = urllib.request.Request(
+        asset["url"], headers={"Accept": "application/octet-stream"})
+    with urllib.request.urlopen(request) as r, open(path, "wb") as f:
+        f.write(r.read())
+
+
 def fetch_data_repos():
     """Fetches data repositories (game-patches, game-compat, controller db)
     into build/data_repos/.
@@ -473,15 +541,6 @@ def fetch_data_repos():
             "name": "game-patches",
             "url": "https://github.com/xenia-canary/game-patches.git",
             "branch": "main",
-        },
-        {
-            "name": "xenia-manager-database",
-            "url": "https://github.com/xenia-manager/database.git",
-            "branch": "main",
-            "sparse_paths": [
-                "data/game-compatibility/canary.json",
-                "data/game-compatibility/stable.json",
-            ],
         },
         {
             "name": "x360db",
@@ -525,6 +584,54 @@ def fetch_data_repos():
                 repo_path,
             ])
 
+    # Assemble the game-compatibility bake dir. compatibility_data.json comes
+    # from the xenia-canary/game-compatibility release. master.json is vendored.
+    compat_dir = os.path.join(data_dir, "game-compatibility")
+    os.makedirs(compat_dir, exist_ok=True)
+
+    vendored_master = os.path.join("assets", "game-compatibility", "master.json")
+    if os.path.isfile(vendored_master):
+        copy2(vendored_master, os.path.join(compat_dir, "master.json"))
+    else:
+        print_warning("vendored master.json not found at " + vendored_master)
+
+    compat_repo = "xenia-canary/game-compatibility"
+    compat_tag = "game-compatibility"
+    compat_url = (
+        f"https://github.com/{compat_repo}/releases/download/{compat_tag}/"
+        "compatibility_data.json"
+    )
+    compat_url_parsed = urlparse(compat_url)
+    compat_path = os.path.join(compat_dir, "compatibility_data.json")
+    print("  - downloading compatibility_data.json...")
+    max_attempts = 3
+    if compat_url_parsed.scheme != "https":
+        print_error("compatibility_data URL is not https")
+        sys.exit(1)
+    else:
+        for attempt in range(1, max_attempts + 1):
+            tmp_path = compat_path + ".tmp"
+            try:
+                try:
+                    urllib.request.urlretrieve(compat_url, tmp_path)
+                except urllib.error.HTTPError as e:
+                    print(f"  - {e}, downloading through the GitHub API...")
+                    download_github_release_asset(compat_repo, compat_tag,
+                                                  "compatibility_data.json",
+                                                  tmp_path)
+                os.replace(tmp_path, compat_path)
+                break
+            except (urllib.error.URLError, OSError) as e:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                if attempt < max_attempts:
+                    print(f"  - attempt {attempt}/{max_attempts} failed: {e}, retrying...")
+                    time.sleep(2 * attempt)
+                else:
+                    print_error(f"compatibility_data.json download failed after "
+                                f"{max_attempts} attempts: {e}")
+                    sys.exit(1)
+
 
 def get_cc(cc=None):
     """Resolve the (C, C++) compiler binaries to configure CMake with.
@@ -540,15 +647,60 @@ def get_cc(cc=None):
         return (cc, cc + "++")
     return (os.environ.get("CC", "clang"), os.environ.get("CXX", "clang++"))
 
+def resolve_python_launcher(binary):
+    """Maps a pip console-script .exe to the native binary it wraps.
+
+    These launchers restart Python on every call, which dominates the runtime
+    of per-file loops. Returns None when binary is not such a launcher or the
+    wheel ships no native binary.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        # Real toolchain binaries are megabytes, the launcher stub is ~100 KB.
+        if os.path.getsize(binary) > 512 * 1024:
+            return None
+        with zipfile.ZipFile(binary) as launcher:
+            entry = launcher.read("__main__.py").decode("utf-8", "replace")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return None
+    module = None
+    for line in entry.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[0] == "from" and parts[2] == "import":
+            module = parts[1]
+            break
+    # A dotted import means a Python entry point, so there is nothing to skip to.
+    if not module or "." in module:
+        return None
+    # Wheels carrying a binary place it in <module>/data/bin.
+    scripts_dir = os.path.dirname(os.path.abspath(binary))
+    for site_dir in ("site-packages", os.path.join("Lib", "site-packages")):
+        native = os.path.join(os.path.dirname(scripts_dir), site_dir, module,
+                              "data", "bin", os.path.basename(binary))
+        if os.path.isfile(native):
+            return native
+    return None
+
+
 def get_clang_format_binary():
     # Use pre-vsvars PATH so VS's bundled Llvm clang-format doesn't shadow the user's.
     binary = shutil_which("clang-format", path=_user_path) or "clang-format"
     try:
         out = subprocess.check_output([binary, "--version"], text=True)
-        print(out)
     except (subprocess.CalledProcessError, OSError):
         print_error("clang-format is not on PATH")
         sys.exit(1)
+    native = resolve_python_launcher(binary)
+    if native:
+        try:
+            # Only skip the launcher if it really fronts this binary.
+            if subprocess.check_output([native, "--version"], text=True) == out:
+                binary = native
+                print(f"- skipping Python launcher, using {native}")
+        except (subprocess.CalledProcessError, OSError):
+            pass
+    print(out)
     return binary
 
 
@@ -623,6 +775,82 @@ def find_slangc(slang_dir, slangc_relpath):
     return direct
 
 
+# Apple's Metal Shader Converter turns the DXIL that spirv_to_dxil emits into
+# the AIR the Metal backend runs. Apple's own download needs a developer login,
+# so the dylib is mirrored as a release asset (Apache 2.0 permits it), versioned
+# by the label on Apple's download page.
+MSC_VERSION = "4.0-beta2"
+MSC_SHA256 = "4b007174a7d67d7122d4b0230781ce344b6ee5273c8c27cd2b1ab20c0537ea69"
+MSC_RELEASE_URL = ("https://github.com/has207/xenia-edge/releases/download/"
+                   f"deps-metal-shader-converter-{MSC_VERSION}")
+MSC_DYLIB_NAME = "libmetalirconverter.dylib"
+
+
+def download_metal_shader_converter():
+    """Downloads the pinned Metal Shader Converter dylib into
+    .metal-shader-converter/<version>/.
+
+    Skips the download if the pinned version is already present. Any other
+    (stale) version is removed so the tree holds only the pinned one (cmake
+    globs .metal-shader-converter/*/libmetalirconverter.dylib to find it).
+    macOS only - the dylib is the Metal backend's shader compiler.
+    """
+    if sys.platform != "darwin":
+        print("- Metal Shader Converter is macOS only; skipping.")
+        return None
+
+    root = os.path.abspath(".metal-shader-converter")
+    msc_dir = os.path.join(root, MSC_VERSION)
+    dylib_path = os.path.join(msc_dir, MSC_DYLIB_NAME)
+    if os.path.exists(dylib_path):
+        print(f"- Metal Shader Converter {MSC_VERSION} already present: "
+              f"{dylib_path}")
+        return dylib_path
+
+    if os.path.isdir(root):
+        rmtree(root, onerror=remove_readonly)
+    os.makedirs(msc_dir)
+
+    archive_name = f"libmetalirconverter-{MSC_VERSION}-macos.zip"
+    url = f"{MSC_RELEASE_URL}/{archive_name}"
+    print(f"- downloading Metal Shader Converter {MSC_VERSION} "
+          f"({archive_name})...")
+    archive_path = os.path.join(msc_dir, archive_name)
+    try:
+        urllib.request.urlretrieve(url, archive_path)
+        digest = hashlib.sha256()
+        with open(archive_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != MSC_SHA256:
+            print_error(f"{archive_name} sha256 is {digest.hexdigest()}, "
+                        f"expected {MSC_SHA256}.")
+            sys.exit(1)
+        with zipfile.ZipFile(archive_path) as zf:
+            zf.extractall(msc_dir)
+    finally:
+        if os.path.exists(archive_path):
+            os.remove(archive_path)
+
+    if not os.path.exists(dylib_path):
+        print_error(f"The download did not produce {MSC_DYLIB_NAME} under "
+                    f"{msc_dir}.")
+        sys.exit(1)
+
+    # The dylib carries Apple's own signature, so this proves the mirrored copy
+    # is Apple's untampered binary rather than merely the bytes we uploaded.
+    result = subprocess.run(["codesign", "--verify", "--strict", dylib_path],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        print_error(f"{MSC_DYLIB_NAME} failed Apple signature verification: "
+                    f"{result.stderr.strip()}")
+        sys.exit(1)
+
+    os.chmod(dylib_path, os.stat(dylib_path).st_mode | stat.S_IEXEC)
+    print(f"- Metal Shader Converter: {dylib_path}")
+    return dylib_path
+
+
 def download_slang():
     """Downloads the pinned Slang release into .slang/<version>/.
 
@@ -678,7 +906,8 @@ def download_slang():
 def run_cmake_configure(cc=None, generator=None, build_tests=False,
                         disable_lto=False, enable_profiler=False,
                         enable_itrace=False, enable_dtrace=False,
-                        enable_ftrace=False,
+                        enable_ftrace=False, enable_gpu_trace=False,
+                        build_misc=False,
                         target_arch=None, config=None):
     """Runs `cmake` to (re)configure build/ from the source root.
 
@@ -689,7 +918,11 @@ def run_cmake_configure(cc=None, generator=None, build_tests=False,
     (faster Release link, at the cost of LTO's whole-program opts);
     enable_profiler toggles -DXENIA_ENABLE_PROFILER=ON (microprofile
     instrumentation; UI overlay only in Debug, profile.html dump on
-    shutdown otherwise). target_arch enables cross-compilation on
+    shutdown otherwise); enable_gpu_trace toggles
+    -DXENIA_ENABLE_GPU_TRACE=ON (GPU trace capture in Release, which
+    Debug always has); build_misc toggles -DXENIA_BUILD_MISC=ON (trace
+    viewers and dumps, shader compiler, vfs-dump, demos).
+    target_arch enables cross-compilation on
     Windows (arm64↔x64 via the MSVC cross-compiler) and macOS
     (arm64↔x86_64 via clang's -arch and CMAKE_OSX_ARCHITECTURES) into a
     separate build-<arch>/ tree; Linux rejects non-native target_arch.
@@ -783,6 +1016,9 @@ def run_cmake_configure(cc=None, generator=None, build_tests=False,
     args += [f"-DXENIA_ENABLE_ITRACE={'ON' if enable_itrace else 'OFF'}"]
     args += [f"-DXENIA_ENABLE_DTRACE={'ON' if enable_dtrace else 'OFF'}"]
     args += [f"-DXENIA_ENABLE_FTRACE={'ON' if enable_ftrace else 'OFF'}"]
+    args += [
+        f"-DXENIA_ENABLE_GPU_TRACE={'ON' if enable_gpu_trace else 'OFF'}"]
+    args += [f"-DXENIA_BUILD_MISC={'ON' if build_misc else 'OFF'}"]
     if config:
         args += [f"-DCMAKE_BUILD_TYPE={config.title()}"]
     ret = subprocess.call(args)
@@ -862,6 +1098,7 @@ def discover_commands(subparsers):
         "setup": SetupCommand(subparsers),
         "fetchdata": FetchDataCommand(subparsers),
         "slang": SlangCommand(subparsers),
+        "msc": MetalShaderConverterCommand(subparsers),
         "build": BuildCommand(subparsers),
         "devenv": DevenvCommand(subparsers),
         "gentests": GenTestsCommand(subparsers),
@@ -985,6 +1222,25 @@ class SlangCommand(Command):
         return 0
 
 
+class MetalShaderConverterCommand(Command):
+    """'msc' command.
+    """
+
+    def __init__(self, subparsers, *args, **kwargs):
+        super(MetalShaderConverterCommand, self).__init__(
+            subparsers,
+            name="msc",
+            help_short="Downloads Apple's Metal Shader Converter (macOS build "
+                       "dependency).",
+            *args, **kwargs)
+
+    def execute(self, args, pass_args, cwd):
+        print("Downloading Apple's Metal Shader Converter...\n")
+        download_metal_shader_converter()
+        print("\nSuccess!")
+        return 0
+
+
 class BaseBuildCommand(Command):
     """Base command for things that require building.
     """
@@ -1040,6 +1296,18 @@ class BaseBuildCommand(Command):
             help="Enables JIT per-function-call tracing to the log (sets "
                  "-DXENIA_ENABLE_FTRACE=ON). For debugging only.")
         self.parser.add_argument(
+            "--enable-gpu-trace", dest="enable_gpu_trace",
+            action="store_true", default=False,
+            help="Enables GPU trace capture in Release builds (sets "
+                 "-DXENIA_ENABLE_GPU_TRACE=ON). Debug always has it. Costs "
+                 "0.40-0.60%% CPU from the trace hooks.")
+        self.parser.add_argument(
+            "--build-misc", dest="build_misc", action="store_true",
+            default=False,
+            help="Enables building the misc subprojects (sets "
+                 "-DXENIA_BUILD_MISC=ON): trace viewers and trace dumps, "
+                 "the shader compiler, vfs-dump and the demos.")
+        self.parser.add_argument(
             "--target-arch", type=normalize_target_arch, default=None,
             help="Target architecture (arm64/aarch64/a64, x64/amd64/x86_64/x86). "
                  "On Windows and macOS, non-native values enable cross-compilation "
@@ -1057,6 +1325,8 @@ class BaseBuildCommand(Command):
                 enable_itrace=args["enable_itrace"],
                 enable_dtrace=args["enable_dtrace"],
                 enable_ftrace=args["enable_ftrace"],
+                enable_gpu_trace=args["enable_gpu_trace"],
+                build_misc=args["build_misc"],
                 target_arch=target_arch,
                 config=args["config"],
             )
@@ -1110,7 +1380,7 @@ class TestCommand(BaseBuildCommand):
         super(TestCommand, self).__init__(
             subparsers,
             name="test",
-            help_short="Runs automated tests that have been built with `xb build`.",
+            help_short="Builds and runs automated tests.",
             help_long="""
             To pass arguments to the test executables separate them with `--`.
             For example, you can run only the instr_foo.s tests with:
@@ -1136,6 +1406,8 @@ class TestCommand(BaseBuildCommand):
             "xenia-cpu-ppc-tests"
             ]
         args["target"] = test_targets
+        # Test targets only exist when XENIA_BUILD_TESTS is enabled.
+        args["build_tests"] = True
 
         # Build all targets (if desired).
         if not args["no_build"]:
@@ -1318,12 +1590,28 @@ class GenTestsCommand(Command):
                 shell_call([f"./{shell_script}"])
                 os.chdir(original_dir)
             elif sys.platform == "win32":
-                # On Windows, add Cygwin to PATH and run bash
-                cygwin_bin = r"C:\cygwin64\bin"
-                os.environ["PATH"] = f"{cygwin_bin}{os.pathsep}{os.environ['PATH']}"
+                # Absolute bash path: a bare "bash" may resolve to WSL and
+                # build Linux binaries.
+                msys2_bash = r"C:\msys64\usr\bin\bash.exe"
+                cygwin_bash = r"C:\cygwin64\bin\bash.exe"
+                env = os.environ.copy()
+                if os.path.exists(msys2_bash):
+                    env["MSYSTEM"] = "MINGW64"
+                    env["CHERE_INVOKING"] = "1"
+                    command = [msys2_bash, "-l", shell_script]
+                elif os.path.exists(cygwin_bash):
+                    env["PATH"] = f"{os.path.dirname(cygwin_bash)}{os.pathsep}{env['PATH']}"
+                    command = [cygwin_bash, "-o", "igncr", shell_script]
+                else:
+                    print_error("binutils build requires MSYS2 (C:\\msys64) or Cygwin (C:\\cygwin64).")
+                    return 1
                 os.chdir(binutils_dir)
-                shell_call(["bash", shell_script])
+                subprocess.check_call(command, env=env)
                 os.chdir(original_dir)
+
+            if not os.path.exists(ppc_as_check):
+                print_error(f"binutils build did not produce {ppc_as_check}.")
+                return 1
 
         test_src = os.path.join("src", "xenia", "cpu", "ppc", "testing")
         test_bin = os.path.join(test_src, "bin")
@@ -1692,13 +1980,21 @@ class DevenvCommand(Command):
         vs_build_dir = "build-vs" if effective_arch == ("arm64" if is_native_arm64 else "x64") else f"build-vs-{effective_arch}"
         config_title = config.title()
         print(f"Configuring Visual Studio build tree ({vs_arch}, {config_title}) in {vs_build_dir}...")
-        # -A <arch> without -G lets CMake pick whichever VS generator matches
-        # the installed toolchain (VS 2022, 2026, ...).
-        ret = subprocess.call([
+        cmake_args = [
             "cmake", "-S", ".", "-B", vs_build_dir, "-A", vs_arch,
             f"-DCMAKE_BUILD_TYPE={config_title}",
             f"-DCMAKE_CONFIGURATION_TYPES={config_title}",
-        ])
+        ]
+        # Without -G, CMake falls back to the CMAKE_GENERATOR environment
+        # variable, commonly Ninja, which rejects -A.
+        vs_generator, toolset = get_vs_generator(vs_install_path, vs_version,
+                                                 vs_arch)
+        cmake_args += ["-G", vs_generator]
+        if toolset:
+            cmake_args += ["-T", toolset]
+        if vs_install_path:
+            cmake_args.append(f"-DCMAKE_GENERATOR_INSTANCE={vs_install_path}")
+        ret = subprocess.call(cmake_args)
         if ret != 0:
             print_error("cmake configure failed for the VS build tree")
             return ret

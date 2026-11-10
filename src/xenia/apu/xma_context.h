@@ -15,7 +15,6 @@
 #include <mutex>
 #include <queue>
 
-#include "xenia/base/threading.h"
 #include "xenia/memory.h"
 #include "xenia/xbox.h"
 
@@ -63,20 +62,16 @@ struct XMA_CONTEXT_DATA {
   uint32_t input_buffer_1_packet_count : 12;  // XMASetInputBuffer1, number of
                                               // 2KB packets. Max 4095 packets.
                                               // These packets form a block.
-  uint32_t loop_subframe_start : 2;           // +12bit, XMASetLoopData
-  uint32_t loop_subframe_end : 3;             // +14bit, XMASetLoopData
-  uint32_t loop_subframe_skip : 3;            // +17bit, XMASetLoopData might be
-                                              // subframe_decode_count
+  uint32_t loop_subframe_end : 2;             // +12bit, XMASetLoopData
+  uint32_t unk_dword_1_a : 3;                 // +14bit
+  uint32_t loop_subframe_skip : 3;            // +17bit, XMASetLoopData
   uint32_t subframe_decode_count : 4;         // +20bit
-  uint32_t output_buffer_padding : 3;  // +24bit, extra output buffer blocks
-                                       // reserved per decoded frame
-                                       // NOTE(has207): this is pure guess
-                                       // but that's how we're using it
-                                       // currently
-  uint32_t sample_rate : 2;            // +27bit enum of sample rates
-  uint32_t is_stereo : 1;              // +29bit
-  uint32_t unk_dword_1_c : 1;          // +30bit
-  uint32_t output_buffer_valid : 1;    // +31bit, XMAIsOutputBufferValid
+  uint32_t decode_subframe : 3;      // +24bit, subframe of the frame at
+                                     // input_buffer_read_offset to decode from
+  uint32_t sample_rate : 2;          // +27bit enum of sample rates
+  uint32_t is_stereo : 1;            // +29bit
+  uint32_t unk_dword_1_c : 1;        // +30bit
+  uint32_t output_buffer_valid : 1;  // +31bit, XMAIsOutputBufferValid
 
   // DWORD 2
   uint32_t input_buffer_read_offset : 26;  // XMAGetInputBufferReadOffset
@@ -231,19 +226,6 @@ class XmaContext {
     is_enabled_.store(is_enabled, std::memory_order_release);
   }
 
-  // Signals that the worker has finished processing this context after a kick.
-  void SignalWorkDone() {
-    if (work_completion_event_) {
-      work_completion_event_->Set();
-    }
-  }
-  // Blocks until the worker has finished processing this context.
-  void WaitForWorkDone() {
-    if (work_completion_event_) {
-      xe::threading::Wait(work_completion_event_.get(), false);
-    }
-  }
-
  protected:
   static void DumpRaw(AVFrame* frame, int id);
   // Convert sample format and swap bytes
@@ -257,7 +239,6 @@ class XmaContext {
   xe_mutex lock_;
   std::atomic<bool> is_allocated_ = false;
   std::atomic<bool> is_enabled_ = false;
-  std::unique_ptr<xe::threading::Event> work_completion_event_;
 
   // ffmpeg structures
   AVPacket* av_packet_ = nullptr;

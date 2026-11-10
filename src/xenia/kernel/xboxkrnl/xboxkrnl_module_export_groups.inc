@@ -10,6 +10,7 @@
 // This is a partial file designed to be included by other files when
 // constructing various tables.
 
+XE_MODULE_EXPORT_GROUP(xboxkrnl, Ani)
 XE_MODULE_EXPORT_GROUP(xboxkrnl, Audio)
 XE_MODULE_EXPORT_GROUP(xboxkrnl, AudioXma)
 XE_MODULE_EXPORT_GROUP(xboxkrnl, Crypt)
@@ -27,5 +28,6 @@ XE_MODULE_EXPORT_GROUP(xboxkrnl, Rtl)
 XE_MODULE_EXPORT_GROUP(xboxkrnl, String)
 XE_MODULE_EXPORT_GROUP(xboxkrnl, Threading)
 XE_MODULE_EXPORT_GROUP(xboxkrnl, Usbcam)
+XE_MODULE_EXPORT_GROUP(xboxkrnl, UserMode)
 XE_MODULE_EXPORT_GROUP(xboxkrnl, Video)
 XE_MODULE_EXPORT_GROUP(xboxkrnl, XConfig)

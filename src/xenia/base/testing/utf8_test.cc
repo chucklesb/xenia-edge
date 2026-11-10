@@ -220,10 +220,25 @@ TEST_CASE("UTF-8 Count", "[utf8]") {
   TEST_LANGUAGE_EXAMPLES(utf8::count, results);
 }
 
-// TODO(gibbed): lower_ascii
-// TODO(gibbed): upper_ascii
+TEST_CASE("UTF-8 Lower ASCII", "[utf8]") {
+  REQUIRE(utf8::lower_ascii("Hello, World 123") == "hello, world 123");
+  REQUIRE(utf8::lower_ascii("ÆBLE ÅB") == "Æble Åb");
+}
+
 // TODO(gibbed): hash_fnv1a
 // TODO(gibbed): hash_fnv1a_case
+
+TEST_CASE("UTF-8 Upper ASCII", "[utf8]") {
+  REQUIRE(utf8::upper_ascii("abcxyz") == "ABCXYZ");
+  REQUIRE(utf8::upper_ascii("ABCXYZ") == "ABCXYZ");
+  REQUIRE(utf8::upper_ascii("MiXeD 123") == "MIXED 123");
+  // Bytes either side of the letters must survive untouched, the sort
+  // order of names starting with _ or ` depends on it.
+  REQUIRE(utf8::upper_ascii("_`[]^{}") == "_`[]^{}");
+  // Non-ascii is left alone.
+  REQUIRE(utf8::upper_ascii(examples::kGreekValues[0]) ==
+          examples::kGreekValues[0]);
+}
 
 TEST_CASE("UTF-8 Split", "[utf8]") {
   std::vector<std::string_view> parts;
@@ -312,7 +327,6 @@ TEST_CASE("UTF-8 Equal Case Z", "[utf8]") {
 // TODO(gibbed): starts_with
 // TODO(gibbed): starts_with_case
 // TODO(gibbed): ends_with
-// TODO(gibbed): ends_with_case
 // TODO(gibbed): split_path
 
 #define TEST_PATH(func, input, output)                                 \
@@ -344,6 +358,17 @@ TEST_CASE("UTF-8 Equal Case Z", "[utf8]") {
     std::replace(output_value.begin(), output_value.end(), '/', '\\');     \
     REQUIRE(func(input_values, '\\') == output_value);                     \
   } while (0)
+
+TEST_CASE("UTF-8 Ends With Case", "[utf8]") {
+  REQUIRE(utf8::ends_with_case("xenonjklatin.xttp", ".xttp"));
+  REQUIRE(utf8::ends_with_case("aac.xexp", ".XEXP"));
+  REQUIRE(utf8::ends_with_case("El pingüino", "üINO"));
+  REQUIRE(utf8::ends_with_case("foo", "foo"));
+  REQUIRE(utf8::ends_with_case("foo", ""));
+  REQUIRE_FALSE(utf8::ends_with_case("foo.xttp", ".xex"));
+  REQUIRE_FALSE(utf8::ends_with_case("foo", "o.foo"));
+  REQUIRE_FALSE(utf8::ends_with_case("", "foo"));
+}
 
 TEST_CASE("UTF-8 Join Paths", "[utf8]") {
   TEST_PATHS(utf8::join_paths, "");

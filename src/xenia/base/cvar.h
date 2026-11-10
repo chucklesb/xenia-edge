@@ -53,6 +53,7 @@ class IConfigVar : virtual public ICommandVar {
   virtual bool is_advanced() const = 0;
   virtual bool is_transient() const = 0;
   virtual std::string config_value() const = 0;
+  virtual std::string default_value() const = 0;
   virtual std::string commandline_value() const = 0;
   virtual void LoadConfigValue(const toml::node* result) = 0;
   virtual void LoadGameConfigValue(const toml::node* result) = 0;
@@ -95,6 +96,7 @@ class ConfigVar : public CommandVar<T>, virtual public IConfigVar {
                const char* display_name, const char* category, bool is_advanced,
                bool is_transient);
   std::string config_value() const override;
+  std::string default_value() const override;
   std::string commandline_value() const override;
   const T& GetTypedConfigValue() const;
   const std::string& category() const override;
@@ -163,7 +165,7 @@ template <>
 inline void CommandVar<std::filesystem::path>::LoadFromLaunchOptions(
     cxxopts::ParseResult* result) {
   std::string value = (*result)[name_].template as<std::string>();
-  SetCommandLineValue(value);
+  SetCommandLineValue(xe::to_path(value));
 }
 template <class T>
 void ConfigVar<T>::LoadConfigValue(const toml::node* result) {
@@ -305,6 +307,10 @@ std::string ConfigVar<T>::config_value() const {
   if (config_value_) {
     return this->ToString(*config_value_);
   }
+  return this->ToString(this->default_value_);
+}
+template <class T>
+std::string ConfigVar<T>::default_value() const {
   return this->ToString(this->default_value_);
 }
 template <class T>
@@ -653,7 +659,7 @@ class IConfigVarUpdate {
   // If you're reviewing a pull request with a change here, check if 1) has been
   // done by the submitter before merging.
   static constexpr uint32_t kLastCommittedUpdateDate =
-      MakeConfigVarUpdateDate(2026, 6, 28, 12);
+      MakeConfigVarUpdateDate(2026, 10, 15, 4);
 
   virtual ~IConfigVarUpdate() = default;
 
@@ -743,8 +749,9 @@ class ConfigVarUpdate : public IConfigVarUpdate {
       "updating config variable defaults.");                                  \
   namespace cv {                                                              \
   static const cvar::ConfigVarUpdateFromAny                                   \
-      update_##name_##year_##month_##day_##utc_hour(cv_##name, year, month,   \
-                                                    day, utc_hour);           \
+      update_##name##_##year##_##month##_##day##_##utc_hour(cv_##name, year,  \
+                                                            month, day,       \
+                                                            utc_hour);        \
   }
 
 #define UPDATE_CVar(name, year, month, day, utc_hour, old_default_value, type) \
@@ -757,9 +764,8 @@ class ConfigVarUpdate : public IConfigVarUpdate {
       "updating config variable defaults.");                                   \
   namespace cv {                                                               \
   static const cvar::ConfigVarUpdate<type>                                     \
-      update_##name_##year_##month_##day_##utc_hour(cv_##name, year, month,    \
-                                                    day, utc_hour,             \
-                                                    old_default_value);        \
+      update_##name##_##year##_##month##_##day##_##utc_hour(                   \
+          cv_##name, year, month, day, utc_hour, old_default_value);           \
   }
 
 #define UPDATE_from_bool(name, year, month, day, utc_hour, old_default_value) \

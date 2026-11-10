@@ -18,7 +18,10 @@ namespace xe {
 namespace kernel {
 
 // IOCTL_, used by NtDeviceIoControlFile
+constexpr uint32_t X_IOCTL_CDROM_AUTHENTICATE_DISC = 0x24080;
 constexpr uint32_t X_IOCTL_DISK_GET_DRIVE_GEOMETRY = 0x70000;
+constexpr uint32_t X_IOCTL_DISK_UNK =
+    0x70042;  // used when accessing storage in dash
 constexpr uint32_t X_IOCTL_DISK_GET_PARTITION_INFO = 0x74004;
 
 // MEM_*, used by NtAllocateVirtualMemory
@@ -80,10 +83,6 @@ inline void XOverlappedSetLength(void* ptr, uint32_t value) {
   auto p = reinterpret_cast<uint32_t*>(ptr);
   xe::store_and_swap<uint32_t>(&p[1], value);
 }
-inline uint32_t XOverlappedGetContext(void* ptr) {
-  auto p = reinterpret_cast<uint32_t*>(ptr);
-  return xe::load_and_swap<uint32_t>(&p[2]);
-}
 inline void XOverlappedSetContext(void* ptr, uint32_t value) {
   auto p = reinterpret_cast<uint32_t*>(ptr);
   xe::store_and_swap<uint32_t>(&p[2], value);
@@ -131,7 +130,6 @@ struct X_UNICODE_STRING {
 };
 static_assert_size(X_UNICODE_STRING, 8);
 
-// https://github.com/CodeAsm/ffplay360/blob/master/Common/XTLOnPC.h
 struct X_VIDEO_MODE {
   be<uint32_t> display_width;
   be<uint32_t> display_height;

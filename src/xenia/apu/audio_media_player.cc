@@ -8,10 +8,15 @@
  */
 
 #include "xenia/apu/audio_media_player.h"
+
+#include <random>
+
 #include "xenia/apu/audio_driver.h"
 #include "xenia/apu/audio_system.h"
+#include "xenia/apu/pacing_audio_driver.h"
 #include "xenia/apu/xma_context.h"
 #include "xenia/base/logging.h"
+#include "xenia/kernel/guest_scheduler.h"
 
 extern "C" {
 #if XE_COMPILER_MSVC
@@ -211,8 +216,8 @@ X_STATUS AudioMediaPlayer::Play(uint32_t playlist_handle, uint32_t song_handle,
     return X_STATUS_SUCCESS;
   }
 
-  auto song_itr = std::find_if(
-      active_playlist_->songs.cbegin(), active_playlist_->songs.cend(),
+  auto song_itr = std::ranges::find_if(
+      std::as_const(active_playlist_->songs),
       [song_handle](const std::unique_ptr<XmpApp::Song>& song) {
         return song->handle == song_handle;
       });
@@ -321,7 +326,10 @@ void AudioMediaPlayer::Stop(bool change_state, bool force) {
   active_song_ = nullptr;
 
   if (!force) {
-    processing_end_fence_.Wait();
+    // Reachable from the guest XMP shim, so on a fiber this must park rather
+    // than block: a plain fence wait would stall the whole dispatch CPU,
+    // including the fibers that could satisfy it.
+    kernel::GuestScheduler::WaitOnFence(processing_end_fence_);
   }
 
   if (change_state) {
@@ -351,11 +359,11 @@ X_STATUS AudioMediaPlayer::Next() {
     Stop(false, false);
   }
 
-  auto itr = std::find_if(active_playlist_->songs.cbegin(),
-                          active_playlist_->songs.cend(),
-                          [this](const std::unique_ptr<XmpApp::Song>& song) {
-                            return song->handle == current_song_handle_;
-                          });
+  auto itr =
+      std::ranges::find_if(std::as_const(active_playlist_->songs),
+                           [this](const std::unique_ptr<XmpApp::Song>& song) {
+                             return song->handle == current_song_handle_;
+                           });
 
   // There is no song with such ID?
   if (itr == active_playlist_->songs.cend()) {
@@ -384,11 +392,11 @@ X_STATUS AudioMediaPlayer::Previous() {
     Stop(false, false);
   }
 
-  auto itr = std::find_if(active_playlist_->songs.cbegin(),
-                          active_playlist_->songs.cend(),
-                          [this](const std::unique_ptr<XmpApp::Song>& song) {
-                            return song->handle == current_song_handle_;
-                          });
+  auto itr =
+      std::ranges::find_if(std::as_const(active_playlist_->songs),
+                           [this](const std::unique_ptr<XmpApp::Song>& song) {
+                             return song->handle == current_song_handle_;
+                           });
 
   // We're at the first entry, we need to go to the end.
   if (itr == active_playlist_->songs.cbegin()) {
@@ -420,19 +428,21 @@ std::span<uint8_t> AudioMediaPlayer::LoadSongToMemory() {
     return {};
   }
 
-  std::span<uint8_t> buffer = {
-      static_cast<uint8_t*>(av_malloc(vfs_file->entry()->size())),
-      vfs_file->entry()->size()};
-
-  if (buffer.empty()) {
+  const size_t file_size = vfs_file->entry()->size();
+  uint8_t* data =
+      file_size ? static_cast<uint8_t*>(av_malloc(file_size)) : nullptr;
+  if (!data) {
+    vfs_file->Destroy();
     return {};
   }
+  std::span<uint8_t> buffer = {data, file_size};
 
   size_t bytes_read = 0;
   result = vfs_file->ReadSync(buffer, 0, &bytes_read);
+  vfs_file->Destroy();
   if (result != X_ERROR_SUCCESS) {
     // Read failed. We need to manually release resources from av_malloc.
-    av_freep(buffer.data());
+    av_free(data);
     return {};
   }
 
@@ -447,7 +457,7 @@ void AudioMediaPlayer::AddPlaylist(uint32_t handle,
 
   if (playback_mode_ == XmpApp::PlaybackMode::kShuffle) {
     auto rng = std::default_random_engine{};
-    std::shuffle(playlist->songs.begin(), playlist->songs.end(), rng);
+    std::ranges::shuffle(playlist->songs, rng);
   }
 
   playlists_.insert({handle, std::move(playlist)});
@@ -479,16 +489,45 @@ X_STATUS AudioMediaPlayer::SetVolume(float volume) {
   return X_STATUS_SUCCESS;
 }
 
+AudioMediaPlayer::ControllerSettings& AudioMediaPlayer::GetControllerSettings(
+    XmpClient xmp_client) {
+  PlaybackController controller = PlaybackController::kUser;
+  if (xmp_client == XmpClient::kGame) {
+    controller = PlaybackController::kGame;
+  } else if (xmp_client == XmpClient::kMce) {
+    controller = PlaybackController::kMce;
+  }
+
+  return controller_settings_[uint32_t(controller)];
+}
+
+void AudioMediaPlayer::SetPlaybackController(
+    PlaybackController playback_controller) {
+  const bool changed = playback_controller != playback_controller_;
+  playback_controller_ = playback_controller;
+  if (!changed ||
+      uint32_t(playback_controller) >= xe::countof(controller_settings_)) {
+    return;
+  }
+
+  const ControllerSettings& settings =
+      controller_settings_[uint32_t(playback_controller)];
+  SetPlaybackMode(settings.playback_mode);
+  SetRepeatMode(settings.repeat_mode);
+  SetPlaybackFlags(settings.playback_flags);
+  SetVolume(settings.volume);
+}
+
 bool AudioMediaPlayer::IsLastSongInPlaylist() const {
   if (!active_playlist_) {
     return false;
   }
 
-  auto itr = std::find_if(active_playlist_->songs.cbegin(),
-                          active_playlist_->songs.cend(),
-                          [this](const std::unique_ptr<XmpApp::Song>& song) {
-                            return song->handle == current_song_handle_;
-                          });
+  auto itr =
+      std::ranges::find_if(std::as_const(active_playlist_->songs),
+                           [this](const std::unique_ptr<XmpApp::Song>& song) {
+                             return song->handle == current_song_handle_;
+                           });
   itr = std::next(itr);
   return itr == active_playlist_->songs.cend();
 }
@@ -537,6 +576,9 @@ bool AudioMediaPlayer::SetupDriver(uint32_t sample_rate, uint32_t channels) {
   DeleteDriver();
 
   std::unique_lock<xe_mutex> guard(driver_mutex_);
+  if (!sample_rate || !channels || channels > AudioDriver::kFrameSamplesMax) {
+    return false;
+  }
   driver_semaphore_ = xe::threading::Semaphore::Create(
       AudioSystem::kMaximumQueuedFrames, AudioSystem::kMaximumQueuedFrames);
 
@@ -544,20 +586,27 @@ bool AudioMediaPlayer::SetupDriver(uint32_t sample_rate, uint32_t channels) {
     return false;
   }
 
-  driver_ = std::unique_ptr<AudioDriver>(audio_system_->CreateDriver(
-      driver_semaphore_.get(), sample_rate, channels, false));
-
-  if (!driver_) {
-    driver_semaphore_.reset();
-    return false;
+  driver_.reset(audio_system_->CreateDriver(driver_semaphore_.get(),
+                                            sample_rate, channels, false));
+  if (driver_ && driver_->Initialize()) {
+    return true;
   }
-
-  if (!driver_->Initialize()) {
-    driver_semaphore_.reset();
+  if (driver_) {
     driver_->Shutdown();
     driver_.reset();
+  }
+  driver_ = std::make_unique<PacingAudioDriver>(
+      driver_semaphore_.get(), sample_rate,
+      AudioDriver::kFrameSamplesMax / channels);
+  if (!driver_->Initialize()) {
+    driver_.reset();
+    driver_semaphore_.reset();
     return false;
   }
+  XELOGW(
+      "APU: {} failed to create or initialize a media driver; "
+      "continuing silently",
+      audio_system_->name());
 
   return true;
 }
@@ -565,13 +614,11 @@ bool AudioMediaPlayer::SetupDriver(uint32_t sample_rate, uint32_t channels) {
 void AudioMediaPlayer::DeleteDriver() {
   std::unique_lock<xe_mutex> guard(driver_mutex_);
   if (driver_) {
-    if (driver_semaphore_) {
-      driver_semaphore_.reset();
-    }
-
+    // Stop the driver before destroying the semaphore used by its callbacks.
     driver_->Shutdown();
     driver_.reset();
   }
+  driver_semaphore_.reset();
 }
 
 }  // namespace apu

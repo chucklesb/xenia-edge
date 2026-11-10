@@ -101,7 +101,7 @@ DiscImageDevice::Error DiscImageDevice::ReadAllEntries(
 }
 
 bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer,
-                                uint16_t entry_ordinal,
+                                uint32_t entry_ordinal,
                                 DiscImageEntry* parent) {
   const uint8_t* p = buffer + (entry_ordinal * 4);
 
@@ -113,6 +113,11 @@ bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer,
   uint8_t name_length = xe::load<uint8_t>(p + 13);
   auto name_buffer = reinterpret_cast<const char*>(p + 14);
 
+  if (node_l == kGdfxPaddingOffset) {
+    const uint32_t padded_ordinal = GdfxPaddedEntryOrdinal(entry_ordinal);
+    return !padded_ordinal || ReadEntry(state, buffer, padded_ordinal, parent);
+  }
+
   if (node_l && !ReadEntry(state, buffer, node_l, parent)) {
     return false;
   }
@@ -120,11 +125,6 @@ bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer,
   // Filename is stored as Windows-1252, convert it to UTF-8.
   auto ansi_name = std::string(name_buffer, name_length);
   auto name = xe::win1252_to_utf8(ansi_name);
-  // Fallback to normal name if for whatever reason conversion from 1252 code
-  // page failed.
-  if (name.empty()) {
-    name = ansi_name;
-  }
 
   auto entry = DiscImageEntry::Create(this, parent, name, mmap_.get());
   entry->attributes_ = attributes | kFileAttributeReadOnly;

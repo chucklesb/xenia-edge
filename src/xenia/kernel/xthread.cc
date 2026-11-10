@@ -48,6 +48,7 @@ namespace kernel {
 const uint32_t XAPC::kSize;
 const uint32_t XAPC::kDummyKernelRoutine;
 const uint32_t XAPC::kDummyRundownRoutine;
+const uint32_t XAPC::kOwnedKernelRoutine;
 
 using namespace xe::literals;
 
@@ -60,7 +61,11 @@ XThread::XThread(KernelState* kernel_state, uint32_t stack_size,
                  uint32_t xapi_thread_startup, uint32_t start_address,
                  uint32_t start_context, uint32_t creation_flags,
                  bool guest_thread, bool main_thread, uint32_t guest_process)
-    : XObject(kernel_state, kObjectType, !guest_thread),
+    // Neither the loader's main thread nor a thread created for its KTHREAD
+    // pointer takes a title handle.
+    : XObject(kernel_state, kObjectType,
+              !guest_thread || main_thread ||
+                  (creation_flags & xboxkrnl::ReturnKThreadPtr)),
       thread_id_(++next_xthread_id_),
       guest_thread_(guest_thread),
       main_thread_(main_thread) {
@@ -90,6 +95,21 @@ XThread::~XThread() {
   emulator()->processor()->OnThreadDestroyed(thread_id_);
 
   thread_.reset();
+
+  if (user_mode_) {
+    auto backend = emulator()->processor()->backend();
+    for (auto& user_fiber : user_mode_->fibers) {
+      backend->DestroyStackpointState(user_fiber->stackpoint_state);
+    }
+    backend->DestroyStackpointState(user_mode_->handler_stackpoint_state);
+    kernel_state()->memory()->SystemHeapFree(user_mode_->kframes);
+    kernel_state()->memory()->SystemHeapFree(user_mode_->exception_record);
+    kernel_state()->memory()->SystemHeapFree(user_mode_->interrupt_frame);
+    user_mode_.reset();
+  }
+  for (const auto& dispatch : exception_dispatches_) {
+    kernel_state()->memory()->SystemHeapFree(dispatch.records);
+  }
 
   if (thread_state_) {
     delete thread_state_;
@@ -203,7 +223,7 @@ static uint8_t GetFakeCpuNumber(uint8_t proc_mask) {
 void XThread::InitializeGuestObject() {
   auto guest_thread = guest_object<X_KTHREAD>();
   auto thread_guest_ptr = guest_object();
-  guest_thread->header.type = X_DISPATCHER_FLAGS::DISPATCHER_THREAD;
+  guest_thread->header.type = X_OBJECT_TYPES::ThreadObject;
   guest_thread->suspend_count =
       (creation_params_.creation_flags & X_CREATE_SUSPENDED) ? 1 : 0;
 
@@ -439,12 +459,15 @@ X_STATUS XThread::Create() {
     // multiplexes onto its dispatch host thread instead of its own host OS
     // thread. The scheduler binds our TLS (SetCurrentThread) before switching
     // to this fiber, so the entry doesn't repeat it. Host-routine threads
-    // (XHostThread) stay real host threads, since they run host loops and
-    // blocking calls and their thread() is used elsewhere.
+    // (XHostThread) stay real host threads unless created on a fiber, since
+    // they run host loops and blocking calls and their thread() is used
+    // elsewhere.
     fiber_exit_event_ = xe::threading::Event::CreateManualResetEvent(false);
     xe::threading::Fiber::CreationParameters fiber_params;
     fiber_params.stack_size = 16_MiB;
     fiber_ = xe::threading::Fiber::Create(fiber_params, [this]() {
+      // Terminated before the first dispatch.
+      kernel_state()->guest_scheduler()->ExitIfTerminated();
       running_ = true;
       // Never returns: Execute() ends in Exit(), which hands us to the
       // scheduler and yields to the dispatcher forever.
@@ -454,9 +477,14 @@ X_STATUS XThread::Create() {
       XELOGE("CreateThread failed (fiber)");
       return X_STATUS_NO_MEMORY;
     }
+    // Held until the scheduler reclaims the exited fiber, so a guest handle
+    // release cannot free the stack out from under a running thread.
+    Retain();
     if (thread_name_.empty()) {
       set_name(fmt::format("XThread{:04X}", thread_id_));
     }
+    scheduler_links_.profiler_log =
+        xe::Profiler::CreateThreadLog(thread_name_.c_str());
     kernel_state()->guest_scheduler()->EnsureStarted();
   } else {
     xe::threading::Thread::CreationParameters params;
@@ -599,6 +627,35 @@ X_STATUS XThread::Exit(int exit_code) {
   return X_STATUS_SUCCESS;
 }
 
+void XThread::SaveInterruptedUserCr() {
+  if (!user_mode_ || !user_mode_->interrupt_frame) {
+    return;
+  }
+  const uint32_t cr = uint32_t(thread_state_->context()->cr());
+  user_mode_->interrupted_cr = cr;
+  xe::store_and_swap<uint32_t>(
+      memory()->TranslateVirtual(user_mode_->interrupt_frame +
+                                 UserMode::kInterruptFrameCr),
+      cr);
+}
+
+void XThread::RestoreInterruptedUserCr() {
+  if (!user_mode_ || !user_mode_->interrupt_frame) {
+    return;
+  }
+  const uint32_t frame_cr =
+      xe::load_and_swap<uint32_t>(memory()->TranslateVirtual(
+          user_mode_->interrupt_frame + UserMode::kInterruptFrameCr));
+  // Only the bits changed in the frame, as the context may hold a CR a trap
+  // handler returned since.
+  const uint32_t changed = frame_cr ^ user_mode_->interrupted_cr;
+  if (changed) {
+    auto context = thread_state_->context();
+    context->set_cr((uint32_t(context->cr()) & ~changed) |
+                    (frame_cr & changed));
+  }
+}
+
 X_STATUS XThread::Terminate(int exit_code) {
   // TODO(benvanik): inform the profiler that this thread is exiting.
 
@@ -634,15 +691,39 @@ X_STATUS XThread::Terminate(int exit_code) {
     ReleaseHandle();
 #endif
   } else {
-    // Fiber-backed guest thread terminated from another host thread. Yank it
-    // from the scheduler's ready queue before dropping the last handle, or the
-    // dispatcher could dereference a freed XThread.
+    // Fiber-backed guest thread terminated from another host thread. Signal
+    // the exit event first so waits on the thread object resolve.
     fiber_exit_event_->Set();
-    kernel_state()->guest_scheduler()->ForgetThread(this);
-    ReleaseHandle();
+    // It may be parked mid-wait, where nothing else will unwind its
+    // registration and a dead entry gates every other waiter on that object.
+    XObject::AbandonCooperativeWait(this);
+    if (kernel_state()->guest_scheduler()->TerminateThread(this)) {
+      // Nothing will ever run on its stack again, so free it here.
+      ReclaimExited();
+    }
+    // Otherwise its dispatcher runs it to a safepoint where it exits.
   }
 
   return X_STATUS_SUCCESS;
+}
+
+void XThread::ReclaimExited() {
+  // Scheduler reclaim and external Terminate both reach here for the same
+  // thread, and releasing twice would free it one reference early.
+  if (self_reference_dropped_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  // Nothing runs on the fiber again, so no dispatch thread can have its log
+  // installed. Retiring here rather than at the exit yield also covers a
+  // thread terminated before it ever ran.
+  xe::Profiler::RetireThreadLog(scheduler_links_.profiler_log);
+  scheduler_links_.profiler_log = nullptr;
+  // The guest may already have dropped its handle while the thread ran.
+  if (!handles().empty()) {
+    ReleaseHandle();
+  }
+  // Balances the self Retain in Create, so this is the delete point.
+  Release();
 }
 
 void XThread::Execute() {
@@ -771,19 +852,38 @@ void XThread::LeaveCriticalRegion() {
   auto apc_disable_count = ++kthread->apc_disable_count;
 }
 
-void XThread::EnqueueApc(uint32_t normal_routine, uint32_t normal_context,
-                         uint32_t arg1, uint32_t arg2) {
+cpu::ppc::PPCContext* XThread::ApcQueueContext() {
   // Most APC queue sites run on a guest thread and can use the caller's bound
   // PPC context. Host timer callbacks may run without a bound guest
   // ThreadState, so fall back to the target thread context in that case.
   auto* queue_thread_state = cpu::ThreadState::Get();
-  auto* queue_context = queue_thread_state ? queue_thread_state->context()
-                                           : thread_state_->context();
-  uint32_t success =
-      xboxkrnl::xeNtQueueApcThread(this->handle(), normal_routine,
-                                   normal_context, arg1, arg2, queue_context);
+  return queue_thread_state ? queue_thread_state->context()
+                            : thread_state_->context();
+}
 
-  xenia_assert(success == X_STATUS_SUCCESS);
+void XThread::EnqueueApc(uint32_t normal_routine, uint32_t normal_context,
+                         uint32_t arg1, uint32_t arg2, uint32_t apc_mode) {
+  uint32_t success = xboxkrnl::xeNtQueueApcThread(
+      this->handle(), normal_routine, normal_context, arg1, arg2, apc_mode,
+      ApcQueueContext());
+
+  if (success != X_STATUS_SUCCESS) {
+    XELOGE("EnqueueApc: queue to tid={:08X} failed ({:08X})", handle(),
+           success);
+  }
+}
+
+bool XThread::InsertOwnedApc(uint32_t apc_ptr, uint32_t arg1, uint32_t arg2) {
+  auto* context = ApcQueueContext();
+  return xboxkrnl::xeInsertQueueApcAndWake(
+             this, context->TranslateVirtual<XAPC*>(apc_ptr), arg1, arg2,
+             context) != 0;
+}
+
+void XThread::RemoveOwnedApc(uint32_t apc_ptr) {
+  auto* context = ApcQueueContext();
+  xboxkrnl::xeKeRemoveQueueApc(context->TranslateVirtual<XAPC*>(apc_ptr),
+                               context);
 }
 
 bool XThread::HasPendingUserApc() {
@@ -792,6 +892,18 @@ bool XThread::HasPendingUserApc() {
     return true;
   }
   return !kthread->apc_lists[1].empty(thread_state_->context());
+}
+
+bool XThread::HasDeliverableKernelApc() {
+  auto* kthread = guest_object<X_KTHREAD>();
+  if (kthread->apc_disable_count || kthread->executing_kernel_apc) {
+    return false;
+  }
+  auto* pcr = memory()->TranslateVirtual<X_KPCR*>(pcr_address_);
+  if (pcr->current_irql >= 1) {
+    return false;
+  }
+  return !kthread->apc_lists[0].empty(thread_state_->context());
 }
 
 void XThread::SetCurrentThread(XThread* thread) {
@@ -803,6 +915,9 @@ void XThread::SetCurrentThread(XThread* thread) {
     // must be re-set on every switch, not once at host-thread start.
     xe::threading::set_current_thread_id(thread->handle());
     cpu::ThreadState::Bind(thread->thread_state());
+  } else {
+    // Back on the idle fiber, attribute logging to the host thread again.
+    xe::threading::set_current_thread_id(UINT_MAX);
   }
 }
 
@@ -822,6 +937,17 @@ int32_t XThread::QueryPriority() {
   return thread_ ? thread_->priority() : priority_;
 }
 
+int32_t XThread::QueryBasePriority() {
+  // KiQueryBasePriorityThread, the increment being base minus class base, or
+  // +/-16 when the base is saturated.
+  auto* kt = guest_object<X_KTHREAD>();
+  int8_t sat = static_cast<int8_t>(kt->saturation_increment);
+  if (sat) {
+    return 16 * sat;
+  }
+  return int32_t(kt->base_priority) - int32_t(kt->base_priority_copy);
+}
+
 // Map Xenon's 0-31 priority range across the available host priority levels.
 // Priority 18 (0x12) is the Xenon real-time threshold — threads at or above
 // it don't get quantum decay on real hardware.
@@ -839,77 +965,100 @@ static int32_t GuestPriorityToHost(int32_t guest_priority) {
   }
 }
 
+void XThread::PublishPriority(int32_t priority) {
+  priority_ = priority;
+  if (is_guest_thread()) {
+    guest_object<X_KTHREAD>()->priority = static_cast<uint8_t>(priority);
+  }
+  // No host thread under the cooperative scheduler, which orders by priority_.
+  if (!cvars::ignore_thread_priorities && thread_) {
+    thread_->set_priority(GuestPriorityToHost(priority));
+  }
+  // The ready queue is indexed by priority, so a queued thread has to move.
+  if (GuestScheduler::enabled()) {
+    kernel_state()->guest_scheduler()->RequeueForPriority(this);
+  }
+}
+
 void XThread::SetPriority(int32_t increment) {
   // Clamp to valid Xenon priority range.  Negative values can arrive via
   // KeSetBasePriorityThread (signed offset from process base).
   int32_t clamped = std::max(increment, 0);
-  if (is_guest_thread()) {
-    guest_object<X_KTHREAD>()->priority = static_cast<uint8_t>(clamped);
-  }
-  priority_ = clamped;
   base_priority_ = clamped;
-  quantum_start_ms_ = Clock::QueryHostUptimeMillis();
-  // No host thread under the cooperative scheduler, which orders by the guest
-  // priority_ we just set.
-  if (!cvars::ignore_thread_priorities && thread_) {
-    thread_->set_priority(GuestPriorityToHost(clamped));
-  }
+  boost_amount_ = 0;
+  PublishPriority(clamped);
 }
 
-void XThread::CheckQuantumAndDecay() {
-  if (cvars::ignore_thread_priorities) {
-    return;
+int32_t XThread::SetBasePriority(int32_t increment) {
+  // Ported from decompiled xeKeSetBasePriorityThread. The base becomes
+  // class_base + increment clamped to [process class, max dynamic] and the
+  // current priority shifts by the same delta, an |increment| of 16 or more
+  // saturating it to the new base.
+  auto* kt = guest_object<X_KTHREAD>();
+  int class_base = kt->base_priority_copy;
+  int cur_base = kt->base_priority;
+  int32_t result = cur_base - class_base;  // previous increment
+  int8_t sat = static_cast<int8_t>(kt->saturation_increment);
+  if (sat) {
+    result = 16 * sat;
   }
-  // Real-time threads (current priority >= 0x12) don't decay on Xenon.
-  if (priority_ >= 18) {
-    return;
+  kt->saturation_increment = 0;
+  int abs_inc = increment < 0 ? -increment : increment;
+  if (abs_inc >= 16) {
+    kt->saturation_increment = increment <= 0 ? uint8_t(0xFF) : uint8_t(1);
   }
-
-  uint64_t now = Clock::QueryHostUptimeMillis();
-  uint64_t elapsed = now - quantum_start_ms_;
-  // On Xenon, the clock interrupt fires every ~1ms and decrements the
-  // thread's quantum by 3.  The process quantum is 60, so it takes ~20ms
-  // for quantum to expire.  When it does, the scheduler decays the
-  // effective priority by exactly 1 and resets quantum.  We approximate
-  // this by decaying 1 priority level per 20ms of elapsed wall-clock time.
-  constexpr uint64_t kQuantumPeriodMs = 20;
-  if (elapsed < kQuantumPeriodMs) {
-    return;
+  int max_dyn = kt->max_dynamic_priority;
+  int new_base = class_base + increment;
+  if (new_base <= max_dyn) {
+    if (new_base < kt->process_priority_class) {
+      new_base = kt->process_priority_class;
+    }
+  } else {
+    new_base = max_dyn;
   }
-
-  int32_t decay_steps = static_cast<int32_t>(elapsed / kQuantumPeriodMs);
-  // On the first decay step, drain the accumulated priority boost as well.
-  // The real kernel computes: new_prio = priority - boost_accumulator - 1
-  // then zeroes the accumulator.  Additional decay steps (if the timer
-  // callback was late) each subtract 1 more.
-  int32_t total_decay = boost_amount_ + decay_steps;
+  int new_cur;
+  if (kt->saturation_increment) {
+    new_cur = new_base;
+  } else {
+    new_cur = priority_ - kt->priority_decrement - cur_base + new_base;
+    if (new_cur > max_dyn) {
+      new_cur = max_dyn;
+    }
+  }
+  if (new_cur < 0) {
+    new_cur = 0;
+  }
+  kt->base_priority = static_cast<uint8_t>(new_base);
+  base_priority_ = new_base;
+  kt->priority_decrement = 0;
   boost_amount_ = 0;
+  if (new_cur != priority_) {
+    PublishPriority(new_cur);
+  }
+  return result;
+}
 
-  int32_t new_priority = priority_ - total_decay;
-  if (new_priority < base_priority_) {
-    new_priority = base_priority_;
+void XThread::OnQuantumEnd() {
+  // Real-time threads (priority >= 0x12) don't decay on Xenon.
+  if (priority_ >= 18) {
+    boost_amount_ = 0;
+    return;
   }
-  if (new_priority != priority_) {
-    priority_ = new_priority;
-    if (is_guest_thread()) {
-      guest_object<X_KTHREAD>()->priority = static_cast<uint8_t>(new_priority);
-    }
-    if (thread_) {
-      thread_->set_priority(GuestPriorityToHost(new_priority));
-    }
+  // KiQuantumEnd, boost_amount_ standing in for PriorityDecrement.
+  int32_t decayed = priority_ - boost_amount_ - 1;
+  if (decayed < base_priority_) {
+    decayed = base_priority_;
   }
-  quantum_start_ms_ = now;
+  boost_amount_ = 0;
+  if (decayed != priority_) {
+    PublishPriority(decayed);
+  }
 }
 
 void XThread::BoostOnWake(int32_t increment) {
-  if (cvars::ignore_thread_priorities) {
-    return;
-  }
-
-  // Real-time threads (priority >= 0x12) just get their quantum reset.
+  // Real-time threads (priority >= 0x12) don't boost.
   if (priority_ >= 18) {
     boost_amount_ = 0;
-    quantum_start_ms_ = Clock::QueryHostUptimeMillis();
     return;
   }
 
@@ -945,18 +1094,10 @@ void XThread::BoostOnWake(int32_t increment) {
     }
     // Only boost UP, never lower.
     if (boosted > priority_) {
-      priority_ = boosted;
-      boost_amount_ = priority_ - base_priority_;
-      if (is_guest_thread()) {
-        guest_object<X_KTHREAD>()->priority = static_cast<uint8_t>(priority_);
-      }
-      if (thread_) {
-        thread_->set_priority(GuestPriorityToHost(priority_));
-      }
+      boost_amount_ = boosted - base_priority_;
+      PublishPriority(boosted);
     }
   }
-
-  quantum_start_ms_ = Clock::QueryHostUptimeMillis();
 }
 
 void XThread::SetAffinity(uint32_t affinity) {
@@ -974,24 +1115,31 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
   assert_true(cpu_index < 6);
 
   X_KPCR& pcr = *memory()->TranslateVirtual<X_KPCR*>(pcr_address_);
+  const uint8_t previous_cpu = pcr.prcb_data.current_cpu;
   pcr.prcb_data.current_cpu = cpu_index;
 
-  if (is_guest_thread()) {
+  // The scheduler pins a fiber by KTHREAD current_cpu.
+  if (is_guest_thread() || fiber_) {
     X_KTHREAD& thread_object =
         *memory()->TranslateVirtual<X_KTHREAD*>(guest_object());
     thread_object.current_cpu = cpu_index;
   }
 
   if (xe::threading::logical_processor_count() >= 6) {
-    // No host thread under the cooperative scheduler (guest runs on a fiber),
-    // so host affinity does not apply.
-    if (!cvars::ignore_thread_affinities && thread_) {
+    // Pin only guest threads; host service threads (XHostThread) keep a
+    // thread_ under the cooperative scheduler and must not be pinned.
+    if (!cvars::ignore_thread_affinities && thread_ && is_guest_thread()) {
       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
     }
   } else {
     // there no good reason why we need to log this... we don't perfectly
     // emulate the 360's scheduler in any way
     // XELOGW("Too few processor cores - scheduling will be wonky");
+  }
+
+  // The ready queues are per CPU, so a queued thread has to move.
+  if (cpu_index != previous_cpu && GuestScheduler::enabled()) {
+    kernel_state()->guest_scheduler()->MigrateForAffinity(this);
   }
 }
 
@@ -1016,7 +1164,10 @@ bool XThread::SetTLSValue(uint32_t slot, uint32_t value) {
 }
 
 uint32_t XThread::suspend_count() {
-  return guest_object<X_KTHREAD>()->suspend_count;
+  // Atomic to match Suspend and Resume, which mutate it from other threads.
+  return reinterpret_cast<std::atomic_uint8_t*>(
+             &guest_object<X_KTHREAD>()->suspend_count)
+      ->load();
 }
 
 X_FILETIME XThread::creation_time() {
@@ -1032,19 +1183,19 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
   uint32_t unused_host_suspend_count = 0;
 
   if (fiber_) {
-    // Cooperative scheduler: no host thread to resume. Drop the guest suspend
-    // count and, only on a real suspended->runnable transition, hand the thread
-    // to the scheduler. Resuming a thread that wasn't suspended must NOT
-    // re-enqueue it (that would double-queue an already-running thread).
-    uint8_t previous = guest_thread->suspend_count;
-    if (previous > 0) {
-      guest_thread->suspend_count = previous - 1;
+    // No host thread to resume, so drop the guest suspend count and unpark on a
+    // real suspended to runnable transition.
+    auto* count =
+        reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count);
+    uint8_t previous = count->load();
+    while (previous > 0 && !count->compare_exchange_weak(
+                               previous, static_cast<uint8_t>(previous - 1))) {
     }
     if (out_suspend_count) {
       *out_suspend_count = previous;
     }
     if (previous == 1) {
-      kernel_state()->guest_scheduler()->MarkReady(this);
+      kernel_state()->guest_scheduler()->ResumeThread(this);
     }
     return X_STATUS_SUCCESS;
   }
@@ -1093,10 +1244,8 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
   X_KTHREAD* guest_thread = guest_object<X_KTHREAD>();
 
   if (fiber_) {
-    // Cooperative: bump the guest suspend count. A self-suspend yields to the
-    // dispatcher without re-queueing, and Resume re-readies us when the count
-    // hits zero. A cross-thread suspend of another running fiber only records
-    // the count, since forcibly descheduling a running fiber isn't modeled.
+    // Bump the guest suspend count and let the dispatcher act on it, at our
+    // next pick-up for a self-suspend or the target's next yield otherwise.
     uint8_t previous =
         reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count)
             ->fetch_add(1);
@@ -1104,7 +1253,7 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
       *out_suspend_count = previous;
     }
     if (this == XThread::GetCurrentFiberThread()) {
-      kernel_state()->guest_scheduler()->YieldToScheduler();
+      kernel_state()->guest_scheduler()->YieldCurrentThread(false);
     }
     return X_STATUS_SUCCESS;
   }
@@ -1134,6 +1283,12 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
 #if !XE_PLATFORM_WIN32
 uint32_t XThread::SelfSuspend() {
   auto guest_thread = guest_object<X_KTHREAD>();
+  if (fiber_) {
+    // Waiting on the condition variable would block the whole dispatch thread.
+    uint32_t previous = 0;
+    Suspend(&previous);
+    return previous;
+  }
   std::unique_lock<std::mutex> lock(suspend_mutex_);
   uint32_t previous = guest_thread->suspend_count;
   guest_thread->suspend_count++;
@@ -1167,28 +1322,49 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable,
     // deadline, returning early on a user APC when alertable.
     auto* scheduler = kernel_state()->guest_scheduler();
     if (timeout_ms == 0) {
-      scheduler->YieldCurrentThread();
+      scheduler->YieldExecution(false);
       return X_STATUS_SUCCESS;
     }
     uint64_t deadline = Clock::QueryHostUptimeMillis() + timeout_ms;
+    set_cooperative_wait_shape(CooperativeWaitKind::kDelay, nullptr, 0);
     while (Clock::QueryHostUptimeMillis() < deadline) {
+      // A kernel APC runs during the delay, which then goes on.
+      if (HasDeliverableKernelApc()) {
+        clear_cooperative_wait_shape();
+        xboxkrnl::xeProcessKernelApcs(thread_state_->context());
+        set_cooperative_wait_shape(CooperativeWaitKind::kDelay, nullptr, 0);
+        continue;
+      }
       if (alertable && HasPendingUserApc()) {
+        clear_cooperative_wait_shape();
         return X_STATUS_USER_APC;
       }
-      scheduler->BlockCurrentThread();
+      // Passing the deadline lets the re-poll gate park this fiber until it
+      // expires. Without it the sleep woke every kPollBackoffMs just to
+      // re-check a clock that nothing else can advance.
+      scheduler->BlockCurrentThread(deadline, 0, alertable != 0);
     }
+    clear_cooperative_wait_shape();
     return X_STATUS_SUCCESS;
   }
 
   if (alertable) {
-    auto result =
-        xe::threading::AlertableSleep(std::chrono::milliseconds(timeout_ms));
-    switch (result) {
-      default:
-      case xe::threading::SleepResult::kSuccess:
+    const uint64_t deadline = Clock::QueryHostUptimeMillis() + timeout_ms;
+    while (true) {
+      const uint64_t now = Clock::QueryHostUptimeMillis();
+      auto result = xe::threading::AlertableSleep(
+          std::chrono::milliseconds(deadline > now ? deadline - now : 0));
+      if (result != xe::threading::SleepResult::kAlerted) {
         return X_STATUS_SUCCESS;
-      case xe::threading::SleepResult::kAlerted:
+      }
+      // Woken for a kernel APC, which runs before the delay goes on. Only a
+      // user APC ends it.
+      if (HasDeliverableKernelApc()) {
+        xboxkrnl::xeProcessKernelApcs(thread_state_->context());
+      }
+      if (HasPendingUserApc()) {
         return X_STATUS_USER_APC;
+      }
     }
   } else {
     if (timeout_ms == 0) {
@@ -1420,10 +1596,11 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
 
 XHostThread::XHostThread(KernelState* kernel_state, uint32_t stack_size,
                          uint32_t creation_flags, std::function<int()> host_fn,
-                         uint32_t guest_process)
+                         uint32_t guest_process, bool on_fiber)
     : XThread(kernel_state, stack_size, 0, 0, 0, creation_flags, false, false,
               guest_process),
-      host_fn_(host_fn) {
+      host_fn_(host_fn),
+      on_fiber_(on_fiber) {
   // By default host threads are not debugger suspendable. If the thread runs
   // any guest code this must be overridden.
   can_debugger_suspend_ = false;
@@ -1432,7 +1609,7 @@ XHostThread::XHostThread(KernelState* kernel_state, uint32_t stack_size,
 void XHostThread::Execute() {
   XELOGD(
       "XThread::Execute thid {} (handle={:08X}, '{}', native={:08X}, <host>)",
-      thread_id_, handle(), thread_name_, thread_->system_id());
+      thread_id_, handle(), thread_name_, thread_ ? thread_->system_id() : 0);
   // Let the kernel know we are starting.
   kernel_state()->OnThreadExecute(this);
   int ret = host_fn_();

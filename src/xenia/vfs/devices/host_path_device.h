@@ -10,19 +10,28 @@
 #ifndef XENIA_VFS_DEVICES_HOST_PATH_DEVICE_H_
 #define XENIA_VFS_DEVICES_HOST_PATH_DEVICE_H_
 
+#include <filesystem>
 #include <string>
+#include <vector>
 
 #include "xenia/vfs/device.h"
 
 namespace xe {
 namespace vfs {
 
+// Xenia keeps a package thumbnail as a file inside the package directory.
+// The console holds it in the STFS header, so the guest never sees it.
+inline constexpr char kPackageThumbnailFileName[] = "__thumbnail.png";
+
 class HostPathEntry;
 
 class HostPathDevice : public Device {
  public:
+  // |name| is the file system the directory stands in for.
   HostPathDevice(const std::string_view mount_path,
-                 const std::filesystem::path& host_path, bool read_only);
+                 const std::filesystem::path& host_path, bool read_only,
+                 bool collapse_content_packages = false,
+                 const std::string_view name = "FATX");
   ~HostPathDevice() override;
 
   bool Initialize() override;
@@ -31,12 +40,16 @@ class HostPathDevice : public Device {
 
   bool is_read_only() const override { return read_only_; }
 
+  bool supports_concurrent_io() const override { return true; }
+
+  bool queues_all_requests() const override { return name_ == "STFS"; }
+
   const std::string& name() const override { return name_; }
   uint32_t attributes() const override { return 0; }
   uint32_t component_name_max_length() const override { return 255; }
 
-  uint32_t total_allocation_units() const override { return 128 * 1024; }
-  uint32_t available_allocation_units() const override { return 128 * 1024; }
+  uint32_t total_allocation_units() const override;
+  uint32_t available_allocation_units() const override;
   uint32_t sectors_per_allocation_unit() const override { return 1; }
   uint32_t bytes_per_sector() const override { return 0x200; }
 
@@ -46,11 +59,15 @@ class HostPathDevice : public Device {
 
  private:
   void PopulateEntry(HostPathEntry* parent_entry);
+  // Canonical paths on the recursion stack, so a directory symlink cycle ends.
+  void PopulateEntry(HostPathEntry* parent_entry,
+                     std::vector<std::filesystem::path>& ancestors);
 
   std::string name_;
   std::filesystem::path host_path_;
   std::unique_ptr<Entry> root_entry_;
   bool read_only_;
+  bool collapse_content_packages_;
 };
 
 }  // namespace vfs

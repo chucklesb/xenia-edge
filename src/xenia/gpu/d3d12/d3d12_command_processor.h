@@ -11,28 +11,33 @@
 #define XENIA_GPU_D3D12_D3D12_COMMAND_PROCESSOR_H_
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdint>
+#include <cstring>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/memory.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
 #include "xenia/gpu/d3d12/d3d12_primitive_processor.h"
+#include "xenia/gpu/d3d12/d3d12_query_pool.h"
 #include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
 #include "xenia/gpu/d3d12/d3d12_shared_memory.h"
 #include "xenia/gpu/d3d12/d3d12_texture_cache.h"
-#include "xenia/gpu/d3d12/d3d12_zpd_query_pool.h"
 #include "xenia/gpu/d3d12/deferred_command_list.h"
 #include "xenia/gpu/d3d12/pipeline_cache.h"
 #include "xenia/gpu/draw_util.h"
-#include "xenia/gpu/dxbc_shader.h"
-#include "xenia/gpu/dxbc_shader_translator.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
@@ -176,6 +181,30 @@ class D3D12CommandProcessor final : public CommandProcessor {
     kNullRawSRV = kNullRawSRVAndSharedMemoryRawUAVStart,
     kSharedMemoryRawUAV,
 
+    // Device SRV + UAV pair, the device-buffer version of the host RW pair
+    // below, for memexport draws on the device path.
+    kSharedMemoryRawSRVAndRawUAVStart,
+    kSharedMemoryRawSRVForRW = kSharedMemoryRawSRVAndRawUAVStart,
+    kSharedMemoryRawUAVForRW,
+
+    // Host-imported (guest RAM) buffer pairs mirroring the device pairs above,
+    // bound instead for memexport-touching draws. Written only when the host
+    // buffer exists (two-buffer memexport routing). Unused otherwise.
+    kSharedMemoryHostRawSRVAndNullRawUAVStart,
+    kSharedMemoryHostRawSRV = kSharedMemoryHostRawSRVAndNullRawUAVStart,
+    kSharedMemoryHostNullRawUAV,
+
+    kNullRawSRVAndSharedMemoryHostRawUAVStart,
+    kSharedMemoryHostNullRawSRV = kNullRawSRVAndSharedMemoryHostRawUAVStart,
+    kSharedMemoryHostRawUAV,
+
+    // Host SRV + UAV as one adjacent pair for memexport draws that also read
+    // shared memory through the t0 SRV (guest vertex fetch). Mirrors Vulkan
+    // using one read + write buffer.
+    kSharedMemoryHostRawSRVAndHostRawUAVStart,
+    kSharedMemoryHostRawSRVForRW = kSharedMemoryHostRawSRVAndHostRawUAVStart,
+    kSharedMemoryHostRawUAVForRW,
+
     kEdramRawSRV,
     kEdramR32UintSRV,
     kEdramR32G32UintSRV,
@@ -184,7 +213,7 @@ class D3D12CommandProcessor final : public CommandProcessor {
     kEdramR32UintUAV,
     kEdramR32G32UintUAV,
     kEdramR32G32B32A32UintUAV,
-    kZpdROVCounterRawUAV,
+    kZpdCounterRawUAV,
 
     kGammaRampTableSRV,
     kGammaRampPWLSRV,
@@ -216,6 +245,16 @@ class D3D12CommandProcessor final : public CommandProcessor {
   void ReleaseScratchGPUBuffer(ID3D12Resource* buffer,
                                D3D12_RESOURCE_STATES new_state);
 
+  // If this shared memory range holds memexport output (which lives in the host
+  // buffer under two-buffer routing), copies the pages holding it into the
+  // device buffer so a following texture load reading the device buffer sees
+  // it, or all of the range with whole_range. No-op for normal ranges and when
+  // the host buffer is unavailable. Called by the texture cache before loading.
+  // Returns whether it copied, so an upload of the same range can be skipped.
+  bool EnsureMemexportRangeInDeviceBuffer(uint32_t base_bytes,
+                                          uint32_t size_bytes,
+                                          bool whole_range = false);
+
   // Returns a pipeline with deferred creation by its handle. May return nullptr
   // if failed to create the pipeline.
   ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
@@ -231,11 +270,18 @@ class D3D12CommandProcessor final : public CommandProcessor {
   void SetStencilReference(uint32_t stencil_ref);
   void SetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY primitive_topology);
 
-  std::string GetTitleStateSuffix() const override;
+  // Sets Xenos MSAA sample positions based on ForcedSampleCount for ROV, or
+  // target sample count, or the default pattern at 1x. Submits pending
+  // barriers under the old pattern first.
+  void UpdateSamplePositions(xenos::MsaaSamples msaa_samples);
+  bool xenos_sample_positions_used() const {
+    return xenos_sample_positions_used_;
+  }
 
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;
+  std::string MakeTitleStateSuffix() const override;
   XE_FORCEINLINE
   void WriteRegisterForceinline(uint32_t index, uint32_t value);
   void WriteRegister(uint32_t index, uint32_t value) override;
@@ -332,76 +378,84 @@ class D3D12CommandProcessor final : public CommandProcessor {
   bool IssueCopy() override;
   XE_NOINLINE
   bool IssueCopy_ReadbackResolvePath();
-  void IssueDraw_MemexportReadbackFullPath(uint32_t memexport_total_size);
-  void IssueDraw_MemexportReadbackFastPath(uint32_t memexport_total_size);
+
+  // For command_processor_resolve_readwatch.inc.
+  bool EndResolveSubmission() {
+    return !submission_open_ || EndSubmission(false);
+  }
+  uint64_t GetResolveSubmittedThrough() const {
+    return resolve_submitted_through_.load(std::memory_order_acquire);
+  }
+  // Copies resolve output into guest RAM from a fault, on its own command list
+  // and fence, as the faulting thread can't use the GPU thread's. With
+  // zero-copy, only waits for the resolve to have written it.
+  bool FaultCopyResolveToGuestRam(
+      const std::vector<std::pair<uint32_t, uint32_t>>& ranges);
+  void DestroyResolveFaultCopy();
+  bool EnsureResolveFaultReadback(uint32_t size);
+  void ReleaseResolveFaultReadback();
+  // The last submission handed to the GPU, for other threads.
+  std::atomic<uint64_t> resolve_submitted_through_{0};
+  Microsoft::WRL::ComPtr<ID3D12CommandAllocator>
+      resolve_fault_command_allocator_;
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> resolve_fault_command_list_;
+  Microsoft::WRL::ComPtr<ID3D12Fence> resolve_fault_fence_;
+  uint64_t resolve_fault_fence_value_ = 0;
+
+  // Staging storage for command_processor_readback_staging.inc, which owns the
+  // pool itself. Used only without the guest RAM host buffer.
+  struct ReadbackStagingBuffer {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    void* mapped = nullptr;
+  };
+  bool CreateReadbackStagingBuffer(ReadbackStagingBuffer& buffer,
+                                   uint32_t size);
+  void DestroyReadbackStagingBuffer(ReadbackStagingBuffer& buffer);
+  // Where a fault copy lands without the guest RAM host buffer. Idle between
+  // fault copies, each of which is awaited.
+  ReadbackStagingBuffer resolve_fault_readback_;
+  uint32_t resolve_fault_readback_size_ = 0;
+  void PrepareReadbackStagingEviction() {}
+  // The staging pool, shared with the Vulkan backend. Included here rather than
+  // with the other fragments because the declarations below name its
+  // ReadbackStagingSlot.
+#include "../command_processor_readback_staging.inc"
+  void StageMemexportReadback();
+  void FlushMemexportStagingReadback();
+  void AwaitMemexportSubmission(uint64_t submission) {
+    CheckSubmissionCompletion(submission);
+  }
+  // Without the host buffer or zero-copy, export output reaches guest RAM only
+  // through the staging copy, which a wait makes.
+  bool CanHoldSignalsForMemexport() const {
+    return shared_memory_->GetHostBuffer() != nullptr ||
+           shared_memory_->is_zero_copy();
+  }
+  void EndSubmissionForMemexport() { EndResolveSubmission(); }
+  // Export ranges staged but not yet copied out, in record order - a later
+  // copy of an overlapping range has to win.
+  struct MemexportStagedRange {
+    uint64_t key;
+    uint32_t address;
+    uint32_t length;
+    // Where address lies in the slot's buffer.
+    uint32_t offset;
+  };
+  std::vector<MemexportStagedRange> memexport_staged_;
 
   void InitializeTrace() override;
+  bool DumpEdramSnapshotToFile(const std::filesystem::path& path) override;
 
  private:
   static constexpr uint32_t kQueueFrames = 3;
 
-  enum RootParameter : UINT {
-    // Keep the size of the root signature at each stage 13 dwords or less
-    // (better 12 or less) so it fits in user data on AMD. Descriptor tables are
-    // 1 dword, root descriptors are 2 dwords (however, root descriptors require
-    // less setup on the CPU - balance needs to be maintained).
-
-    // CBVs are set in both bindful and bindless cases via root descriptors.
-
-    // - Bindful resources - multiple root signatures depending on extra
-    //   parameters.
-
-    // These are always present.
-
-    // Very frequently changed, especially for UI draws, and for models drawn in
-    // multiple parts - contains vertex and texture fetch constants.
-    kRootParameter_Bindful_FetchConstants = 0,  // +2 dwords = 2 in all.
-    // Quite frequently changed (for one object drawn multiple times, for
-    // instance - may contain projection matrices).
-    kRootParameter_Bindful_FloatConstantsVertex,  // +2 = 4 in VS.
-    // Less frequently changed (per-material).
-    kRootParameter_Bindful_FloatConstantsPixel,  // +2 = 4 in PS.
-    // May stay the same across many draws.
-    kRootParameter_Bindful_SystemConstants,  // +2 = 6 in all.
-    // Pretty rarely used and rarely changed - flow control constants.
-    kRootParameter_Bindful_BoolLoopConstants,  // +2 = 8 in all.
-    // Changed only when starting a new descriptor heap or when switching
-    // between shared memory as SRV and UAV - shared memory byte address buffer
-    // (as SRV and as UAV, either may be null if not used), and, if ROV is used
-    // for EDRAM, EDRAM R32_UINT UAV.
-    kRootParameter_Bindful_SharedMemoryAndEdram,  // +1 = 9 in all.
-
-    kRootParameter_Bindful_Count_Base,
-
-    // Extra parameter that may or may not exist:
-    // - Pixel textures (+1 = 10 in PS).
-    // - Pixel samplers (+1 = 11 in PS).
-    // - Vertex textures (+1 = 10 in VS).
-    // - Vertex samplers (+1 = 11 in VS).
-
-    kRootParameter_Bindful_Count_Max = kRootParameter_Bindful_Count_Base + 4,
-
-    // - Bindless resources - two global root signatures (for non-tessellated
-    //   and tessellated drawing), so these are always present.
-
-    kRootParameter_Bindless_FetchConstants = 0,    // +2 = 2 in all.
-    kRootParameter_Bindless_FloatConstantsVertex,  // +2 = 4 in VS.
-    kRootParameter_Bindless_FloatConstantsPixel,   // +2 = 4 in PS.
-    // Changed per-material, texture and sampler descriptor indices.
-    kRootParameter_Bindless_DescriptorIndicesPixel,   // +2 = 6 in PS.
-    kRootParameter_Bindless_DescriptorIndicesVertex,  // +2 = 6 in VS.
-    kRootParameter_Bindless_SystemConstants,          // +2 = 8 in all.
-    kRootParameter_Bindless_BoolLoopConstants,        // +2 = 10 in all.
-    // Changed only when switching between shared memory as SRV and UAV - shared
-    // memory byte address buffer (as SRV and as UAV, either may be null if not
-    // used).
-    kRootParameter_Bindless_SharedMemory,  // +1 = 11 in all.
-    // Unbounded sampler descriptor table - changed in case of overflow.
-    kRootParameter_Bindless_SamplerHeap,  // +1 = 12 in all.
-    // Unbounded SRV/UAV descriptor table - never changed.
-    kRootParameter_Bindless_ViewHeap,  // +1 = 13 in all.
-
-    kRootParameter_Bindless_Count,
+  // Shader registers of SpirvShaderTranslator's
+  // kDescriptorSetSharedMemoryAndEdram bindings, which Mesa maps one-to-one to
+  // registers of space 0.
+  enum : UINT {
+    kMesaRegister_SharedMemory = 0,
+    kMesaRegister_ZpdCounter = 1,
+    kMesaRegister_Edram = 2,
   };
 
   // Root parameters for the spirv_to_dxil guest path (texture-less milestone).
@@ -430,11 +484,11 @@ class D3D12CommandProcessor final : public CommandProcessor {
     kRootParameter_Mesa_PixelTextureRange,   // SRV t0+, space3.
     kRootParameter_Mesa_VertexSamplerRange,  // sampler s0+, space2.
     kRootParameter_Mesa_PixelSamplerRange,   // sampler s0+, space3.
-    // EDRAM (u1) and ZPD FSI counter (u2) raw UAVs in space0, present for the
-    // ROV (fragment shader interlock) path. Bound only when the render target
-    // cache is in its pixel shader interlock path. Unreferenced otherwise.
-    kRootParameter_Mesa_Edram,          // u1 UAV, space0.
-    kRootParameter_Mesa_ZpdRovCounter,  // u2 UAV, space0.
+    // ZPD counter (u1) and EDRAM (u2) raw UAVs in space0. EDRAM is referenced
+    // only on the ROV (fragment shader interlock) path; the counter is also
+    // used by RTV hybrid occlusion queries.
+    kRootParameter_Mesa_ZpdCounter,  // u1 UAV, space0.
+    kRootParameter_Mesa_Edram,       // u2 UAV, space0.
 
     kRootParameter_Mesa_Count,
   };
@@ -460,11 +514,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
-  // Checks if ending a submission right now would not cause potentially more
-  // delay than it would reduce by making the GPU start working earlier - such
-  // as when there are unfinished graphics pipeline creation requests that would
-  // need to be fulfilled before actually submitting the command list.
-  bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionCompletion(GetCurrentSubmission());
     return GetCompletedSubmission() + 1u >= GetCurrentSubmission();
@@ -486,10 +535,13 @@ class D3D12CommandProcessor final : public CommandProcessor {
       D3D12_CPU_DESCRIPTOR_HANDLE& cpu_handle_out,
       D3D12_GPU_DESCRIPTOR_HANDLE& gpu_handle_out);
 
-  void UpdateFixedFunctionState(const draw_util::ViewportInfo& viewport_info,
-                                const draw_util::Scissor& scissor,
-                                bool primitive_polygonal,
-                                reg::RB_DEPTHCONTROL normalized_depth_control);
+  void UpdateFixedFunctionState(
+      const draw_util::ViewportInfo& viewport_info,
+      const draw_util::Scissor& scissor, bool primitive_polygonal,
+      reg::RB_DEPTHCONTROL normalized_depth_control,
+      uint32_t normalized_color_mask,
+      uint32_t bound_depth_and_color_render_target_bits,
+      bool depth_bias_in_pixel_shader);
 
   // Parallel binding for the spirv_to_dxil guest path (Mesa root signature).
   // Fills a SpirvShaderTranslator::SystemConstants (mirroring the Vulkan
@@ -498,13 +550,13 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // shared memory descriptor table. Bindless only.
   bool UpdateBindingsMesa(
       const SpirvShader* vertex_shader, const SpirvShader* pixel_shader,
-      bool memexport_used, bool primitive_polygonal,
+      bool memexport_used, bool route_to_host, bool primitive_polygonal,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       const draw_util::ViewportInfo& viewport_info,
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask,
       const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset,
-      bool interpreter_placeholder);
+      bool interpreter_placeholder, int32_t window_offset_tiles);
   // Resolves a sampler to its index in the bindless sampler heap for the Mesa
   // path, allocating and writing the descriptor on first use. Returns
   // UINT32_MAX if the heap is full, so the caller switches to a fresh heap and
@@ -516,43 +568,56 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // could not be created.
   bool SwitchToNewBindlessSamplerHeap();
 
-  // Returns a buffer for reading GPU data back to the CPU. Assuming
-  // synchronizing immediately after use. Always in COPY_DEST state.
-  ID3D12Resource* RequestReadbackBuffer(uint32_t size);
-
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
+  void WriteZPDCounterRawUAVDescriptor(
+      D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
-  // ZPD occlusion queries backend.
+  // Query segments backend for both ZPD occlusion query reports and
+  // VIZ visibility surveys & conditional rendering.
+  //
   // BeginQuery/EndQuery must be in the same command list, segments split at
-  // EndSubmission, resume at BeginSubmission. Discarded queries still need
-  // EndQuery or the heap slot breaks on some drivers. RecordZPDResolveBatch
-  // emits coalesced ResolveQueryData and ROV counter copies at submit.
-  void EnsureZPDQueryResources() override;
-  void ShutdownZPDQueryResources() override {
-    zpd_resolves_in_flight_.clear();
-    zpd_active_query_index_ = UINT32_MAX;
-    zpd_active_query_generation_ = 0;
-    zpd_active_query_is_rov_ = false;
-    bindful_zpd_rov_counter_buffer_ = nullptr;
-    bindful_zpd_rov_counter_capacity_ = 0;
-    if (zpd_host_query_pool_) {
-      zpd_host_query_pool_->Shutdown();
+  // EndSubmission, resume at BeginSubmission. Coalesced ResolveQueryData and
+  // counter copies are emitted at submit.
+  void EnsureQueryResources() override;
+  void ShutdownQueryResources() override {
+    query_resolves_in_flight_.clear();
+    active_query_index_ = UINT32_MAX;
+    active_query_generation_ = 0;
+    active_query_is_rov_ = false;
+    zpd_rov_path_ = false;
+    bindful_zpd_counter_buffer_ = nullptr;
+    bindful_zpd_counter_capacity_ = 0;
+    if (!bindless_resources_used_) {
+      draw_view_bindful_heap_index_ =
+          ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
+    }
+    if (host_query_pool_) {
+      host_query_pool_->Shutdown();
     }
   }
 
-  bool IsZPDQueryPoolReady() const override;
-  bool CanOpenZPDQuery() const override;
+  bool IsQueryPoolReady() const override;
+  bool CanOpenQuery() const override;
 
-  QueryOpenResult OpenZPDQuery(ReportHandle report_handle,
-                               bool can_close_submission) override;
-  bool CloseZPDQuery(ReportHandle report_handle,
-                     uint64_t& out_submission) override;
-  bool DiscardZPDQuery() override;
+  QueryOpenResult OpenQuery(bool can_close_submission) override;
+  bool CloseQuery(ReportHandle report_handle, const VIZQueryHandle& viz,
+                  uint64_t& out_submission) override;
   void PumpQueryResolves() override;
   bool AwaitQueryResolve(ReportHandle report_handle,
                          uint64_t wait_for_submission) override;
 
-  void RecordZPDResolveBatch();
+  bool EnsureVIZPredicateBuffer();
+  // The tracked transition without recording it, so it can batch with other
+  // barriers. False when none is needed.
+  bool GetVIZPredicateBufferBarrier(D3D12_RESOURCE_STATES new_state,
+                                    D3D12_RESOURCE_BARRIER& barrier_out);
+  void AwaitVIZQueryResolve(uint64_t wait_for_submission) override;
+  void ShutdownVIZQueryResources() {
+    viz_predicate_buffer_.Reset();
+    viz_predicate_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
+    viz_predicate_buffer_state_submission_ = UINT64_MAX;
+    viz_predicate_buffer_failed_ = false;
+  }
 
   bool device_removed_ = false;
 
@@ -562,13 +627,20 @@ class D3D12CommandProcessor final : public CommandProcessor {
     uint64_t submission = 0;
     uint32_t query_index = UINT32_MAX;
     uint32_t query_generation = 0;
-    bool uses_rov_counter = false;
+    uint32_t scale_area = 1;
+    bool rov = false;
+    bool hybrid = false;
     ReportHandle report_handle = kInvalidReportHandle;
+    VIZQueryHandle viz;
   };
-  uint32_t zpd_active_query_index_ = UINT32_MAX;
-  uint32_t zpd_active_query_generation_ = 0;
-  bool zpd_active_query_is_rov_ = false;
-  std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
+  uint32_t active_query_index_ = UINT32_MAX;
+  uint32_t active_query_generation_ = 0;
+  bool active_query_is_rov_ = false;
+  bool zpd_rov_path_ = false;
+  bool zpd_hybrid_supported_ = false;
+  // Depth bias is set on the command list instead of baked into pipelines.
+  bool depth_bias_dynamic_ = false;
+  std::deque<PendingQueryResolve> query_resolves_in_flight_;
 
   std::unique_ptr<ui::d3d12::D3D12GPUCompletionTimeline> completion_timeline_;
   bool submission_open_ = false;
@@ -601,6 +673,7 @@ class D3D12CommandProcessor final : public CommandProcessor {
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   ID3D12GraphicsCommandList2* command_list_2_ = nullptr;
+  ID3D12GraphicsCommandList9* command_list_9_ = nullptr;
   DeferredCommandList deferred_command_list_;
 
   // Should bindless textures and samplers be used - many times faster
@@ -609,15 +682,27 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // of UpdateBindings time, and that's outside the emulator's control even).
   bool bindless_resources_used_ = false;
 
+  // SetSamplePositions and ResolveSubresourceRegion remove the device
+  // without tier 1 support.
+  bool xenos_sample_positions_used_ = false;
+
   std::unique_ptr<D3D12SharedMemory> shared_memory_;
 
   std::unique_ptr<D3D12RenderTargetCache> render_target_cache_;
 
-  std::unique_ptr<D3D12ZPDQueryPool> zpd_host_query_pool_;
-  // Tracks the ROV counter buffer captured by the current bindful page so we
-  // can invalidate the page when the counter resource changes.
-  ID3D12Resource* bindful_zpd_rov_counter_buffer_ = nullptr;
-  uint32_t bindful_zpd_rov_counter_capacity_ = 0;
+  std::unique_ptr<D3D12QueryPool> host_query_pool_;
+  // Tracks the counter buffer captured by the current bindful page so we can
+  // invalidate the page when the counter resource changes.
+  ID3D12Resource* bindful_zpd_counter_buffer_ = nullptr;
+  uint32_t bindful_zpd_counter_capacity_ = 0;
+
+  // The tracked state is only valid within the recorded submission. Buffers
+  // decay to COMMON when the previous submission's command list finishes.
+  Microsoft::WRL::ComPtr<ID3D12Resource> viz_predicate_buffer_;
+  D3D12_RESOURCE_STATES viz_predicate_buffer_state_ =
+      D3D12_RESOURCE_STATE_COMMON;
+  uint64_t viz_predicate_buffer_state_submission_ = UINT64_MAX;
+  bool viz_predicate_buffer_failed_ = false;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
 
@@ -678,8 +763,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   // Root signatures for different descriptor counts.
   std::unordered_map<uint32_t, ID3D12RootSignature*> root_signatures_bindful_;
-  ID3D12RootSignature* root_signature_bindless_vs_ = nullptr;
-  ID3D12RootSignature* root_signature_bindless_ds_ = nullptr;
   ID3D12RootSignature* root_signature_mesa_ = nullptr;
 
   std::unique_ptr<D3D12PrimitiveProcessor> primitive_processor_;
@@ -738,23 +821,10 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // Resolve downscale compute shader for scaled resolution readback.
   // Downscales scaled resolve buffer data back to 1x resolution on the GPU,
   // avoiding expensive CPU-side downscaling and reducing PCIe bandwidth.
-  struct ResolveDownscaleConstants {
-    uint32_t scale_x;          // 1 to kMaxDrawResolutionScaleAlongAxis
-    uint32_t scale_y;          // 1 to kMaxDrawResolutionScaleAlongAxis
-    uint32_t pixel_size_log2;  // 0=8bit, 1=16bit, 2=32bit, 3=64bit
-    uint32_t tile_count;       // Number of 32x32 tiles to process
-    // Byte offset into the source buffer. Always 0 on D3D12 (the offset is
-    // baked into the source SRV). Kept for a shared shader with Vulkan.
-    uint32_t source_offset_bytes;
-    // When non-zero, apply half-pixel offset correction by sampling from
-    // (scale/2, scale/2) within each scaled block instead of (0, 0).
-    uint32_t half_pixel_offset;
-  };
   enum class ResolveDownscaleRootParameter : UINT {
     kConstants,
     kSource,
     kDestination,
-
     kCount,
   };
   Microsoft::WRL::ComPtr<ID3D12RootSignature> resolve_downscale_root_signature_;
@@ -791,39 +861,42 @@ class D3D12CommandProcessor final : public CommandProcessor {
   D3D12_RESOURCE_STATES scratch_buffer_state_;
   bool scratch_buffer_used_ = false;
 
-  // Per-resolve double-buffered readback for delayed sync
-  struct ReadbackBuffer {
-    ID3D12Resource* buffers[2] = {nullptr, nullptr};
-    uint32_t sizes[2] = {0, 0};
-    void* mapped_data[2] = {nullptr, nullptr};  // Persistent mappings
-    uint32_t current_index = 0;
-    uint64_t last_used_frame = 0;
-  };
+  // Two-buffer memexport page tracking (data + methods), shared with the Vulkan
+  // backend as a class-body fragment so each backend gets its own non-virtual,
+  // inlinable copy. Requires <array> and SharedMemory, both included above.
+#include "../command_processor_memexport.inc"
 
-  // Helper to evict old readback buffers from a cache map
-  void EvictOldReadbackBuffers(
-      std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
-
-  // Map: (written_address << 32 | written_length) -> ReadbackBuffer
-  std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
-
-  // Simple single buffer for memexport (full mode - always syncs, no
-  // double-buffering)
-  ID3D12Resource* memexport_readback_buffer_ = nullptr;
-  uint32_t memexport_readback_buffer_size_ = 0;
-
-  // Per-memexport double-buffered readback for fast mode (delayed sync)
-  std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+  // Backend-agnostic resolve read-watch consumption tracking, shared with the
+  // Vulkan backend (same class-body fragment).
+#include "../command_processor_resolve_readwatch.inc"
+  // Per-backend trampoline from the memory read callback into the shared
+  // MarkResolvePagesRead, PrepareResolvePagesForWrite or DiscardResolvePages.
+  static void ResolveReadCallbackThunk(void* context, uint32_t physical_address,
+                                       uint32_t length,
+                                       Memory::PhysicalAccess access);
+  // Downscaling a scaled resolve's output into resolve_downscale_buffer_ for a
+  // copy out of it, and writing it into the shared memory buffer where a native
+  // resolve would have, for a fault to copy it from there. Declared after the
+  // .inc for ScaledResolveReadbackInfo.
+  bool DownscaleScaledResolve(uint32_t written_address,
+                              const ScaledResolveReadbackInfo& scaled_info);
+  bool MirrorScaledResolveToSharedMemory(uint32_t written_address,
+                                         uint32_t written_length,
+                                         reg::RB_COPY_DEST_INFO copy_dest_info,
+                                         uint32_t& mirrored_length_out);
 
   // The current fixed-function drawing state.
   D3D12_VIEWPORT ff_viewport_;
   D3D12_RECT ff_scissor_;
   float ff_blend_factor_[4];
   uint32_t ff_stencil_ref_;
+  float ff_depth_bias_;
+  float ff_depth_bias_slope_scaled_;
   bool ff_viewport_update_needed_;
   bool ff_scissor_update_needed_;
   bool ff_blend_factor_update_needed_;
   bool ff_stencil_ref_update_needed_;
+  bool ff_depth_bias_update_needed_;
 
   // Currently bound pipeline, either a graphics pipeline from the pipeline
   // cache (with potentially deferred creation - current_external_pipeline_ is
@@ -909,6 +982,9 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   // Current primitive topology.
   D3D_PRIMITIVE_TOPOLOGY primitive_topology_;
+
+  // MSAA mode the command list's sample positions are programmed for.
+  xenos::MsaaSamples current_sample_positions_;
 
   draw_util::GetViewportInfoArgs previous_viewport_info_args_;
   draw_util::ViewportInfo previous_viewport_info_;

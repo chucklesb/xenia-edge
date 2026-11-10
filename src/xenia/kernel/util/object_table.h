@@ -34,7 +34,10 @@ class ObjectTable {
 
   void Reset();
 
-  X_STATUS AddHandle(XObject* object, X_HANDLE* out_handle);
+  // force_guest_handle puts a host object's new handle in the guest table, for
+  // the paths that hand one to the guest.
+  X_STATUS AddHandle(XObject* object, X_HANDLE* out_handle,
+                     bool force_guest_handle = false);
   X_STATUS DuplicateHandle(X_HANDLE orig, X_HANDLE* out_handle);
   X_STATUS RetainHandle(X_HANDLE handle);
   X_STATUS ReleaseHandle(X_HANDLE handle);
@@ -61,6 +64,7 @@ class ObjectTable {
   }
 
   X_STATUS AddNameMapping(const std::string_view name, X_HANDLE handle);
+  bool IsNameMappedTo(const std::string_view name, X_HANDLE handle);
   void RemoveNameMapping(const std::string_view name);
   X_STATUS GetObjectByName(const std::string_view name, X_HANDLE* out_handle);
   template <typename T>
@@ -82,6 +86,13 @@ class ObjectTable {
 
   std::vector<object_ref<XObject>> GetAllObjects();
   void PurgeAllObjects();  // Purges the object table of all guest objects
+
+  // The objects of the bodies CreateNative made, since a body that isn't a
+  // dispatcher has no room for the handle stashed in a dispatch header.
+  void AddAllocatedBody(uint32_t body, XObject* object);
+  void RemoveAllocatedBody(uint32_t body, const XObject* object);
+  // Null when |body| has no object or its last reference is gone.
+  object_ref<XObject> LookupAllocatedBody(uint32_t body);
 
  private:
   struct ObjectTableEntry {
@@ -110,6 +121,7 @@ class ObjectTable {
   uint32_t last_free_entry_ = 0;
   uint32_t last_free_host_entry_ = 0;
   std::unordered_map<string_key_case, X_HANDLE> name_table_;
+  std::unordered_map<uint32_t, XObject*> allocated_bodies_;
 };
 
 // Generic lookup

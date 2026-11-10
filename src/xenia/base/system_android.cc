@@ -296,5 +296,6 @@ void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {
 
 bool SetProcessPriorityClass(const uint32_t priority_class) { return true; }
 
-bool IsUseNexusForGameBarEnabled() { return false; }
+// Android keeps its ids behind Java APIs.
+std::string GetMachineId() { return {}; }
 }  // namespace xe

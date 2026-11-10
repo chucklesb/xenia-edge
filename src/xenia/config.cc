@@ -10,7 +10,9 @@
 #include "config.h"
 
 #include <algorithm>
+#include <optional>
 #include <sstream>
+#include <string_view>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
@@ -21,9 +23,11 @@
 #include "xenia/base/string_buffer.h"
 #include "xenia/base/system.h"
 #include "xenia/emulator.h"
+#include "xenia/kernel/xam/indie_game.h"
 #include "xenia/ui/config_helpers.h"
 #include "xenia/vfs/iso_metadata.h"
 #include "xenia/vfs/stfs_metadata.h"
+#include "xenia/vfs/xbe_metadata.h"
 #include "xenia/vfs/xex_metadata.h"
 #include "xenia/vfs/zar_metadata.h"
 
@@ -46,8 +50,14 @@ std::filesystem::path config_path;
 std::string game_config_suffix = ".config.toml";
 std::function<void()> config_saved_callback;
 
-std::filesystem::path GetGameConfigPath(const std::string& title_id) {
-  return config_folder / "config" / (title_id + game_config_suffix);
+// Empty for none, and for XeFu's, which every original Xbox game would
+// otherwise share.
+std::filesystem::path GetGameConfigPath(uint32_t title_id) {
+  if (!title_id || title_id == xe::kXeFuTitleId) {
+    return {};
+  }
+  return config_folder / "config" /
+         (fmt::format("{:08X}", title_id) + game_config_suffix);
 }
 
 std::filesystem::path GetBundledDataPath(const std::string& subdirectory) {
@@ -97,7 +107,7 @@ void PrintConfigToLog(const std::filesystem::path& file_path) {
     }
 
     // Check if remaining part of line is empty.
-    if (std::all_of(config_line.cbegin(), config_line.cend(), isspace)) {
+    if (std::ranges::all_of(std::as_const(config_line), isspace)) {
       continue;
     }
     // Check if line is a category mark. If it is add new line on start for
@@ -106,9 +116,34 @@ void PrintConfigToLog(const std::filesystem::path& file_path) {
     config_dump += (category_mark ? "\n" : "") + config_line + "\n";
   }
   config_dump += "----------- END OF CONFIG DUMP ----";
-  XELOGI("{}", config_dump);
+  XELOGI("{}", xe::strip_pii(config_dump));
 
   file.close();
+}
+
+// Loads an old value a same-name alias maps to one of the cvar's new type into
+// a game config. True if an alias applied.
+static bool LoadAliasedGameConfigValue(cvar::IConfigVar* config_var,
+                                       const toml::node& node) {
+  std::optional<std::string_view> value = node.value<std::string_view>();
+  if (!value) {
+    return false;
+  }
+  for (const auto& alias : xe::ui::GetCvarAliases()) {
+    if (alias.old_name != config_var->name() ||
+        alias.new_name != alias.old_name || alias.old_value != *value) {
+      continue;
+    }
+    if (dynamic_cast<cvar::ConfigVar<bool>*>(config_var)) {
+      toml::value new_value(alias.new_value == "true");
+      config_var->LoadGameConfigValue(&new_value);
+    } else {
+      toml::value new_value(alias.new_value);
+      config_var->LoadGameConfigValue(&new_value);
+    }
+    return true;
+  }
+  return false;
 }
 
 void MigrateLegacyCvars(const toml::table& config) {
@@ -173,8 +208,20 @@ void MigrateLegacyCvars(const toml::table& config) {
             // If new_value is "*", copy the original value as-is
             std::string final_value =
                 (alias.new_value == "*") ? var_value : alias.new_value;
-            toml::value new_value(final_value);
-            config_var->LoadConfigValue(&new_value);
+            // A bool doesn't load from a string node.
+            if (dynamic_cast<cvar::ConfigVar<bool>*>(config_var)) {
+              toml::value new_value(final_value == "true");
+              config_var->LoadConfigValue(&new_value);
+            } else {
+              toml::value new_value(final_value);
+              config_var->LoadConfigValue(&new_value);
+            }
+            // Loading the old value under the same name, now of another type,
+            // failed before this migrated it.
+            if (alias.old_name == alias.new_name &&
+                cvar::config_type_mismatch_warnings) {
+              std::erase(*cvar::config_type_mismatch_warnings, alias.new_name);
+            }
           }
           break;
         }
@@ -220,7 +267,8 @@ void ReadConfig(const std::filesystem::path& file_path,
         XELOGI("Command line overrides:");
         has_overrides = true;
       }
-      XELOGI("  {} = {}", config_var->name(), config_var->commandline_value());
+      XELOGI("  {} = {}", config_var->name(),
+             xe::strip_pii(config_var->commandline_value()));
     }
   }
 
@@ -250,7 +298,7 @@ void ReadConfig(const std::filesystem::path& file_path,
     cvar::config_type_mismatch_warnings->clear();
   }
 
-  XELOGI("Loaded config: {}", file_path);
+  XELOGI("Loaded config: {}", xe::strip_pii(xe::path_to_utf8(file_path)));
 }
 
 uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
@@ -258,14 +306,24 @@ uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
     return 0;
   }
 
-  std::string ext = game_path.extension().string();
+  std::string ext = xe::path_to_utf8(game_path.extension());
   std::transform(ext.begin(), ext.end(), ext.begin(),
                  [](unsigned char c) { return std::tolower(c); });
 
   uint32_t title_id = 0;
 
-  if (ext == ".iso") {
+  // An installed indie game is configured as itself.
+  if (auto game = xe::kernel::xam::ReadIndieGame(game_path)) {
+    title_id = game->title_id;
+  } else if (ext == ".iso") {
     if (auto metadata = xe::vfs::ExtractIsoMetadata(game_path)) {
+      title_id = metadata->title_id;
+    } else if (auto xbe = xe::vfs::ExtractXbeMetadata(game_path)) {
+      // An original Xbox disc.
+      title_id = xbe->title_id;
+    }
+  } else if (ext == ".xbe") {
+    if (auto metadata = xe::vfs::ExtractXbeMetadata(game_path)) {
       title_id = metadata->title_id;
     }
   } else if (ext == ".zar") {
@@ -280,25 +338,23 @@ uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
     // Unknown extension - try all formats.
     if (auto metadata = xe::vfs::ExtractStfsMetadata(game_path)) {
       title_id = metadata->title_id;
+      // An Xbox Original package is configured as the game its executable
+      // names, as the library lists it, or not at all.
+      if (metadata->content_type == uint32_t(xe::XContentType::kXboxTitle)) {
+        const auto xbe = xe::vfs::ExtractXbeMetadata(game_path);
+        title_id = xbe ? xbe->title_id : 0;
+      }
     } else if (auto metadata = xe::vfs::ExtractXexMetadata(game_path)) {
       title_id = metadata->title_id;
     } else if (auto metadata = xe::vfs::ExtractZarMetadata(game_path)) {
       title_id = metadata->title_id;
     } else if (auto metadata = xe::vfs::ExtractIsoMetadata(game_path)) {
       title_id = metadata->title_id;
+    } else if (auto metadata = xe::vfs::ExtractXbeMetadata(game_path)) {
+      // An original Xbox disc, which launches whatever its extension.
+      title_id = metadata->title_id;
     }
   }
-
-  if (title_id == 0) {
-    XELOGI("Could not extract title_id from: {}", game_path.string());
-    return 0;
-  }
-
-  XELOGI("Extracted title_id {:08X} from: {}", title_id, game_path.string());
-
-  // Load the game config directly into cvars.
-  auto title_id_str = fmt::format("{:08X}", title_id);
-  const auto game_config_path = GetGameConfigPath(title_id_str);
 
   if (!cvar::ConfigVars) {
     return title_id;
@@ -310,13 +366,25 @@ uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
     static_cast<cvar::IConfigVar*>(it.second)->ClearGameConfigValue();
   }
 
-  if (!std::filesystem::exists(game_config_path)) {
+  if (title_id == 0) {
+    XELOGI("Could not extract title_id from: {}",
+           xe::strip_pii(xe::path_to_utf8(game_path)));
+    return 0;
+  }
+
+  XELOGI("Extracted title_id {:08X} from: {}", title_id,
+         xe::strip_pii(xe::path_to_utf8(game_path)));
+
+  // Load the game config directly into cvars.
+  const auto game_config_path = GetGameConfigPath(title_id);
+  if (game_config_path.empty() || !std::filesystem::exists(game_config_path)) {
     return title_id;
   }
 
   try {
     const auto config = ParseConfig(game_config_path);
-    XELOGI("Loading game config: {}", xe::path_to_utf8(game_config_path));
+    XELOGI("Loading game config: {}",
+           xe::strip_pii(xe::path_to_utf8(game_config_path)));
 
     size_t override_count = 0;
     for (auto& it : *cvar::ConfigVars) {
@@ -326,7 +394,9 @@ uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
 
       const auto config_key_node = config.at_path(config_key);
       if (config_key_node) {
-        config_var->LoadGameConfigValue(config_key_node.node());
+        if (!LoadAliasedGameConfigValue(config_var, *config_key_node.node())) {
+          config_var->LoadGameConfigValue(config_key_node.node());
+        }
         override_count++;
 
         std::stringstream ss;
@@ -338,15 +408,19 @@ uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
     XELOGI("Applied {} game config override(s)", override_count);
   } catch (const std::exception& e) {
     XELOGE("Failed to parse game config {}: {}",
-           xe::path_to_utf8(game_config_path), e.what());
+           xe::strip_pii(xe::path_to_utf8(game_config_path)),
+           xe::strip_pii(e.what()));
   }
 
   return title_id;
 }
 
 void SaveGameConfig(uint32_t title_id, const toml::table& config_table) {
-  const auto game_config_path =
-      GetGameConfigPath(fmt::format("{:08X}", title_id));
+  const auto game_config_path = GetGameConfigPath(title_id);
+  if (game_config_path.empty()) {
+    XELOGW("Not saving a game config for title {:08X}", title_id);
+    return;
+  }
 
   try {
     xe::filesystem::CreateParentFolder(game_config_path);
@@ -363,25 +437,46 @@ void SaveGameConfig(uint32_t title_id, const toml::table& config_table) {
     XELOGI("Saved game config for title {:08X}", title_id);
   } catch (const std::exception& e) {
     XELOGE("Failed to save game config {}: {}",
-           xe::path_to_utf8(game_config_path), e.what());
+           xe::strip_pii(xe::path_to_utf8(game_config_path)),
+           xe::strip_pii(e.what()));
     throw;
+  }
+}
+
+// Resolves a possibly dotted category ("GPU.Debug") to a nested table, creating
+// intermediates. toml::path splits on '.', so a table stored under the literal
+// key "GPU.Debug" would never be found on load.
+toml::table* ResolveSectionTable(toml::table& root, std::string_view section) {
+  toml::table* table = &root;
+  size_t start = 0;
+  while (true) {
+    size_t dot = section.find('.', start);
+    std::string key(section.substr(
+        start, dot == std::string_view::npos ? dot : dot - start));
+    if (key.empty()) {
+      return nullptr;
+    }
+    if (!table->contains(key)) {
+      table->insert(key, toml::table{});
+    }
+    table = (*table)[key].as_table();
+    if (!table || dot == std::string_view::npos) {
+      return table;
+    }
+    start = dot + 1;
   }
 }
 
 void SaveGameConfigSetting(xe::Emulator* emulator, const char* section,
                            const char* cvar_name, const std::string& value) {
-  if (!emulator || !emulator->is_title_open()) {
+  const uint32_t title_id = emulator ? emulator->game_config_title_id() : 0;
+  if (!title_id) {
     return;
   }
 
-  uint32_t title_id = emulator->title_id();
   toml::table config_table = LoadGameConfig(title_id);
 
-  if (!config_table.contains(section)) {
-    config_table.insert(section, toml::table{});
-  }
-
-  auto* section_table = config_table[section].as_table();
+  auto* section_table = ResolveSectionTable(config_table, section);
   if (section_table) {
     section_table->insert_or_assign(cvar_name, value);
   }
@@ -391,18 +486,14 @@ void SaveGameConfigSetting(xe::Emulator* emulator, const char* section,
 
 void SaveGameConfigSetting(xe::Emulator* emulator, const char* section,
                            const char* cvar_name, bool value) {
-  if (!emulator || !emulator->is_title_open()) {
+  const uint32_t title_id = emulator ? emulator->game_config_title_id() : 0;
+  if (!title_id) {
     return;
   }
 
-  uint32_t title_id = emulator->title_id();
   toml::table config_table = LoadGameConfig(title_id);
 
-  if (!config_table.contains(section)) {
-    config_table.insert(section, toml::table{});
-  }
-
-  auto* section_table = config_table[section].as_table();
+  auto* section_table = ResolveSectionTable(config_table, section);
   if (section_table) {
     section_table->insert_or_assign(cvar_name, value);
   }
@@ -412,18 +503,14 @@ void SaveGameConfigSetting(xe::Emulator* emulator, const char* section,
 
 void SaveGameConfigSetting(xe::Emulator* emulator, const char* section,
                            const char* cvar_name, int32_t value) {
-  if (!emulator || !emulator->is_title_open()) {
+  const uint32_t title_id = emulator ? emulator->game_config_title_id() : 0;
+  if (!title_id) {
     return;
   }
 
-  uint32_t title_id = emulator->title_id();
   toml::table config_table = LoadGameConfig(title_id);
 
-  if (!config_table.contains(section)) {
-    config_table.insert(section, toml::table{});
-  }
-
-  auto* section_table = config_table[section].as_table();
+  auto* section_table = ResolveSectionTable(config_table, section);
   if (section_table) {
     section_table->insert_or_assign(cvar_name, value);
   }
@@ -433,18 +520,14 @@ void SaveGameConfigSetting(xe::Emulator* emulator, const char* section,
 
 void SaveGameConfigSetting(xe::Emulator* emulator, const char* section,
                            const char* cvar_name, uint32_t value) {
-  if (!emulator || !emulator->is_title_open()) {
+  const uint32_t title_id = emulator ? emulator->game_config_title_id() : 0;
+  if (!title_id) {
     return;
   }
 
-  uint32_t title_id = emulator->title_id();
   toml::table config_table = LoadGameConfig(title_id);
 
-  if (!config_table.contains(section)) {
-    config_table.insert(section, toml::table{});
-  }
-
-  auto* section_table = config_table[section].as_table();
+  auto* section_table = ResolveSectionTable(config_table, section);
   if (section_table) {
     section_table->insert_or_assign(cvar_name, value);
   }
@@ -454,18 +537,14 @@ void SaveGameConfigSetting(xe::Emulator* emulator, const char* section,
 
 void SaveGameConfigSetting(xe::Emulator* emulator, const char* section,
                            const char* cvar_name, double value) {
-  if (!emulator || !emulator->is_title_open()) {
+  const uint32_t title_id = emulator ? emulator->game_config_title_id() : 0;
+  if (!title_id) {
     return;
   }
 
-  uint32_t title_id = emulator->title_id();
   toml::table config_table = LoadGameConfig(title_id);
 
-  if (!config_table.contains(section)) {
-    config_table.insert(section, toml::table{});
-  }
-
-  auto* section_table = config_table[section].as_table();
+  auto* section_table = ResolveSectionTable(config_table, section);
   if (section_table) {
     section_table->insert_or_assign(cvar_name, value);
   }
@@ -474,16 +553,16 @@ void SaveGameConfigSetting(xe::Emulator* emulator, const char* section,
 }
 
 toml::table LoadGameConfig(uint32_t title_id) {
-  const auto game_config_path =
-      GetGameConfigPath(fmt::format("{:08X}", title_id));
+  const auto game_config_path = GetGameConfigPath(title_id);
 
   toml::table config_table;
-  if (std::filesystem::exists(game_config_path)) {
+  if (!game_config_path.empty() && std::filesystem::exists(game_config_path)) {
     try {
-      config_table = toml::parse_file(game_config_path.string());
+      config_table = toml::parse_file(xe::path_to_utf8(game_config_path));
     } catch (const std::exception& e) {
       XELOGE("Failed to parse game config {}: {}",
-             xe::path_to_utf8(game_config_path), e.what());
+             xe::strip_pii(xe::path_to_utf8(game_config_path)),
+             xe::strip_pii(e.what()));
     }
   }
   return config_table;
@@ -496,7 +575,8 @@ void ReloadConfig() {
 
   if (std::filesystem::exists(config_path)) {
     ReadConfig(config_path, false);
-    XELOGI("Reloaded config from: {}", xe::path_to_utf8(config_path));
+    XELOGI("Reloaded config from: {}",
+           xe::strip_pii(xe::path_to_utf8(config_path)));
   }
 }
 
@@ -518,7 +598,7 @@ void SaveConfig() {
       vars.push_back(s.second);
     }
   }
-  std::sort(vars.begin(), vars.end(), [](auto a, auto b) {
+  std::ranges::sort(vars, [](auto a, auto b) {
     if (a->category() < b->category()) {
       return true;
     }
@@ -603,7 +683,8 @@ void SaveConfig() {
 
   auto handle = xe::filesystem::OpenFile(config_path, "wb");
   if (!handle) {
-    XELOGE("Failed to open '{}' for writing.", config_path);
+    XELOGE("Failed to open '{}' for writing.",
+           xe::strip_pii(xe::path_to_utf8(config_path)));
   } else {
     fwrite(sb.buffer(), 1, sb.length(), handle);
     fclose(handle);

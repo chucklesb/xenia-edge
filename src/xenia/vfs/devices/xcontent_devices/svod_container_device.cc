@@ -10,9 +10,18 @@
 #include "xenia/vfs/devices/xcontent_devices/svod_container_device.h"
 #include "xenia/base/logging.h"
 #include "xenia/vfs/devices/xcontent_devices/svod_container_entry.h"
+#include "xenia/vfs/gdfx_util.h"
 
 namespace xe {
 namespace vfs {
+
+// Reads exactly |length| bytes at |offset|. False on a short or failed read.
+static bool ReadAt(xe::filesystem::FileHandle* file, size_t offset,
+                   void* buffer, size_t length) {
+  size_t bytes_read = 0;
+  return file->Read(offset, buffer, length, &bytes_read) &&
+         bytes_read == length;
+}
 
 SvodContainerDevice::SvodContainerDevice(const std::string_view mount_path,
                                          const std::filesystem::path& host_path)
@@ -22,29 +31,18 @@ SvodContainerDevice::SvodContainerDevice(const std::string_view mount_path,
   SetName("FATX");
 }
 
-SvodContainerDevice::~SvodContainerDevice() {
-  for (auto& file : files_) {
-    fclose(file.second);
-  }
-  files_.clear();
-  files_total_size_ = 0;
-}
+SvodContainerDevice::~SvodContainerDevice() {}
 
 SvodContainerDevice::Result SvodContainerDevice::LoadHostFiles() {
   std::filesystem::path data_fragment_path = host_path_;
   data_fragment_path += ".data";
   if (!std::filesystem::exists(data_fragment_path)) {
     XELOGE("STFS container is multi-file, but path {} does not exist.",
-           data_fragment_path);
+           xe::strip_pii(xe::path_to_utf8(data_fragment_path)));
     return Result::kFileMismatch;
   }
 
-  // Ensure data fragment files are sorted
   auto fragment_files = filesystem::ListFiles(data_fragment_path);
-  std::sort(fragment_files.begin(), fragment_files.end(),
-            [](filesystem::FileInfo& left, filesystem::FileInfo& right) {
-              return left.name < right.name;
-            });
 
   if (fragment_files.size() != header_->content_metadata.data_file_count) {
     XELOGE("SVOD expecting {} data fragments, but {} are present.",
@@ -55,18 +53,30 @@ SvodContainerDevice::Result SvodContainerDevice::LoadHostFiles() {
 
   for (size_t i = 0; i < fragment_files.size(); i++) {
     auto& fragment = fragment_files.at(i);
+    // A handle opens on a directory too, so reject one here rather than let
+    // every read routed to its fragment index fail.
+    if (fragment.type != xe::filesystem::FileInfo::Type::kFile) {
+      XELOGE("SVOD data fragment {} is not a file.",
+             xe::strip_pii(xe::path_to_utf8(fragment.name)));
+      return Result::kFileMismatch;
+    }
     auto path = fragment.path / fragment.name;
-    auto file = xe::filesystem::OpenFile(path, "rb");
-    if (!file) {
-      XELOGI("Failed to map SVOD file {}.", path);
-      // CloseFiles();
-      return Result::kReadError;
+
+    // The listing reports 0 for a symlinked fragment on Windows where the
+    // target size is what counts, so size the path then.
+    uintmax_t fragment_size = fragment.total_size;
+    if (!fragment_size) {
+      std::error_code ec;
+      fragment_size = std::filesystem::file_size(path, ec);
+      if (ec) {
+        XELOGI("Failed to size SVOD file {}.",
+               xe::strip_pii(xe::path_to_utf8(path)));
+        return Result::kReadError;
+      }
     }
 
-    xe::filesystem::Seek(file, 0L, SEEK_END);
-    files_total_size_ += xe::filesystem::Tell(file);
-    // no need to seek back, any reads from this file will seek first anyway
-    files_.emplace(std::make_pair(i, file));
+    files_total_size_ += fragment_size;
+    files_.Add(std::move(path));
   }
   XELOGI("SVOD successfully mapped {} files.", fragment_files.size());
   return Result::kSuccess;
@@ -76,14 +86,18 @@ XContentContainerDevice::Result SvodContainerDevice::Read() {
   // SVOD Systems can have different layouts. The root block is
   // denoted by the magic "MICROSOFT*XBOX*MEDIA" and is always in
   // the first "actual" data fragment of the system.
-  auto& svod_header = files_.at(0);
+  auto* svod_header = files_.Get(0);
+  if (!svod_header) {
+    return Result::kReadError;
+  }
 
-  size_t magic_offset;
-  SetLayout(svod_header, magic_offset);
+  size_t magic_offset = 0;
+  if (const Result result = SetLayout(svod_header, magic_offset);
+      result != Result::kSuccess) {
+    return result;
+  }
 
   // Parse the root directory
-  xe::filesystem::Seek(svod_header, magic_offset + 0x14, SEEK_SET);
-
   struct {
     uint32_t block;
     uint32_t size;
@@ -92,7 +106,8 @@ XContentContainerDevice::Result SvodContainerDevice::Read() {
   } root_data;
   static_assert_size(root_data, 0x10);
 
-  if (fread(&root_data, sizeof(root_data), 1, svod_header) != 1) {
+  if (!ReadAt(svod_header, magic_offset + 0x14, &root_data,
+              sizeof(root_data))) {
     XELOGE("ReadSVOD failed to read root block data at 0x{:016X}",
            magic_offset + 0x14);
     return Result::kReadError;
@@ -109,29 +124,40 @@ XContentContainerDevice::Result SvodContainerDevice::Read() {
   root_entry_ = std::unique_ptr<Entry>(root_entry);
 
   // Traverse all child entries
-  return ReadEntry(root_data.block, 0, root_entry);
+  const Result result = ReadEntry(root_data.block, 0, root_entry);
+  directory_blocks_.clear();
+  return result;
+}
+
+const uint8_t* SvodContainerDevice::ReadDirectoryBlock(size_t block) {
+  auto [it, inserted] = directory_blocks_.try_emplace(block);
+  if (!inserted) {
+    return it->second.data();
+  }
+
+  size_t address, file_index;
+  BlockToOffset(block, &address, &file_index);
+  auto* file = files_.Get(file_index);
+  if (!file || !ReadAt(file, address, it->second.data(), it->second.size())) {
+    XELOGE("ReadEntrySVOD failed to read directory block at {:016X}", address);
+    directory_blocks_.erase(it);
+    return nullptr;
+  }
+  return it->second.data();
 }
 
 SvodContainerDevice::Result SvodContainerDevice::ReadEntry(
     uint32_t block, uint32_t ordinal, SvodContainerEntry* parent) {
   // For games with a large amount of files, the ordinal offset can overrun
   // the current block and potentially hit a hash block.
-  size_t ordinal_offset = ordinal * 0x4;
-  size_t block_offset = ordinal_offset / 0x800;
-  size_t true_ordinal_offset = ordinal_offset % 0x800;
-
-  // Calculate the file & address of the block
-  size_t entry_address, entry_file;
-  BlockToOffset(block + block_offset, &entry_address, &entry_file);
-  entry_address += true_ordinal_offset;
-
-  // Read directory entry
-  auto& file = files_.at(entry_file);
-  if (!xe::filesystem::Seek(file, entry_address, SEEK_SET)) {
-    XELOGE("{} Failed: Cannot seek file {} with offset: {} ordinal: {}",
-           __func__, entry_file, entry_address, ordinal);
+  const size_t ordinal_offset = size_t(ordinal) * 4;
+  const uint8_t* directory_block =
+      ReadDirectoryBlock(block + ordinal_offset / kGdfxSectorSize);
+  if (!directory_block) {
     return Result::kReadError;
   }
+  const size_t entry_offset = ordinal_offset % kGdfxSectorSize;
+  const uint8_t* entry_data = directory_block + entry_offset;
 
 #pragma pack(push, 1)
   struct {
@@ -145,29 +171,31 @@ SvodContainerDevice::Result SvodContainerDevice::ReadEntry(
   static_assert_size(dir_entry, 0xE);
 #pragma pack(pop)
 
-  if (fread(&dir_entry, sizeof(dir_entry), 1, file) != 1) {
-    XELOGE("ReadEntrySVOD failed to read directory entry at {:016X}",
-           entry_address);
-    return Result::kReadError;
+  // An entry never spans blocks, so the end of one may only hold padding.
+  if (xe::load<uint16_t>(entry_data) == kGdfxPaddingOffset) {
+    const uint32_t padded_ordinal = GdfxPaddedEntryOrdinal(ordinal);
+    return padded_ordinal ? ReadEntry(block, padded_ordinal, parent)
+                          : Result::kSuccess;
   }
 
-  auto name_buffer = std::make_unique<char[]>(dir_entry.name_length);
-  if (fread(name_buffer.get(), 1, dir_entry.name_length, file) !=
-      dir_entry.name_length) {
-    XELOGE("ReadEntrySVOD failed to read directory entry name at {:016X}",
-           entry_address);
+  if (entry_offset + sizeof(dir_entry) > kGdfxSectorSize) {
+    XELOGE("ReadEntrySVOD directory entry {} of block {:08X} spans blocks",
+           ordinal, block);
+    return Result::kReadError;
+  }
+  std::memcpy(&dir_entry, entry_data, sizeof(dir_entry));
+  if (entry_offset + sizeof(dir_entry) + dir_entry.name_length >
+      kGdfxSectorSize) {
+    XELOGE("ReadEntrySVOD directory entry {} of block {:08X} spans blocks",
+           ordinal, block);
     return Result::kReadError;
   }
 
   // Filename is stored as Windows-1252, convert it to UTF-8.
-  auto ansi_name = std::string(name_buffer.get(), dir_entry.name_length);
+  auto ansi_name =
+      std::string(reinterpret_cast<const char*>(entry_data + sizeof(dir_entry)),
+                  dir_entry.name_length);
   auto name = xe::win1252_to_utf8(ansi_name);
-
-  // Fallback to normal name if for whatever reason conversion from 1252 code
-  // page failed.
-  if (name.empty()) {
-    name = ansi_name;
-  }
 
   // Read the left node
   if (dir_entry.node_l) {
@@ -259,7 +287,7 @@ SvodContainerDevice::Result SvodContainerDevice::ReadEntry(
 }
 
 XContentContainerDevice::Result SvodContainerDevice::SetLayout(
-    FILE* header, size_t& magic_offset) {
+    xe::filesystem::FileHandle* header, size_t& magic_offset) {
   if (IsEDGFLayout()) {
     return SetEDGFLayout(header, magic_offset);
   }
@@ -272,10 +300,9 @@ XContentContainerDevice::Result SvodContainerDevice::SetLayout(
 }
 
 XContentContainerDevice::Result SvodContainerDevice::SetEDGFLayout(
-    FILE* header, size_t& magic_offset) {
+    xe::filesystem::FileHandle* header, size_t& magic_offset) {
   uint8_t magic_buf[20];
-  xe::filesystem::Seek(header, 0x2000, SEEK_SET);
-  if (fread(magic_buf, 1, countof(magic_buf), header) != countof(magic_buf)) {
+  if (!ReadAt(header, 0x2000, magic_buf, countof(magic_buf))) {
     XELOGE("ReadSVOD failed to read SVOD magic at 0x2000");
     return Result::kReadError;
   }
@@ -292,11 +319,10 @@ XContentContainerDevice::Result SvodContainerDevice::SetEDGFLayout(
   return Result::kSuccess;
 }
 
-const bool SvodContainerDevice::IsXSFLayout(FILE* header) const {
+const bool SvodContainerDevice::IsXSFLayout(
+    xe::filesystem::FileHandle* header) const {
   uint8_t magic_buf[20];
-  xe::filesystem::Seek(header, 0x12000, SEEK_SET);
-
-  if (fread(magic_buf, 1, countof(magic_buf), header) != countof(magic_buf)) {
+  if (!ReadAt(header, 0x12000, magic_buf, countof(magic_buf))) {
     XELOGE("ReadSVOD failed to read SVOD magic at 0x12000");
     return false;
   }
@@ -305,12 +331,11 @@ const bool SvodContainerDevice::IsXSFLayout(FILE* header) const {
 }
 
 XContentContainerDevice::Result SvodContainerDevice::SetXSFLayout(
-    FILE* header, size_t& magic_offset) {
+    xe::filesystem::FileHandle* header, size_t& magic_offset) {
   uint8_t magic_buf[20];
   const char* XSF_MAGIC = "XSF";
 
-  xe::filesystem::Seek(header, 0x2000, SEEK_SET);
-  if (fread(magic_buf, 1, 3, header) != 3) {
+  if (!ReadAt(header, 0x2000, magic_buf, 3)) {
     XELOGE("ReadSVOD failed to read SVOD XSF magic at 0x2000");
     return Result::kReadError;
   }
@@ -332,37 +357,36 @@ XContentContainerDevice::Result SvodContainerDevice::SetXSFLayout(
 }
 
 XContentContainerDevice::Result SvodContainerDevice::SetNormalLayout(
-    FILE* header, size_t& magic_offset) {
+    xe::filesystem::FileHandle* header, size_t& magic_offset) {
   uint8_t magic_buf[20];
 
-  const uint32_t magic_pos =
-      header_->content_metadata.data_file_count == 1 ? 0xD000 : 0x2000;
-  xe::filesystem::Seek(header, magic_pos, SEEK_SET);
-  if (fread(magic_buf, 1, countof(magic_buf), header) != countof(magic_buf)) {
-    XELOGE("ReadSVOD failed to read SVOD magic at 0x{:04X}", magic_pos);
-    return Result::kReadError;
-  }
-
-  if (std::memcmp(magic_buf, MEDIA_MAGIC, 20) != 0) {
-    XELOGE("Could not locate SVOD magic block.");
-    return Result::kReadError;
-  }
-
-  // If the SVOD's magic block is at 0xD000, it most likely means that it
-  // is a single-file system. The STFS Header is 0xB000 bytes and the
-  // remaining 0x2000 is from hash tables. In most cases, these will be
-  // STFS, not SVOD.
-  if (header_->content_metadata.data_file_count == 1) {
+  // A single-file system usually has its magic block at 0xD000: the STFS
+  // header is 0xB000 bytes and the remaining 0x2000 is from hash tables. In
+  // most cases, these will be STFS, not SVOD. Some single-file packages are
+  // laid out like multiple-file ones instead, with it at 0x2000.
+  if (header_->content_metadata.data_file_count == 1 &&
+      ReadAt(header, 0xD000, magic_buf, countof(magic_buf)) &&
+      std::memcmp(magic_buf, MEDIA_MAGIC, countof(magic_buf)) == 0) {
     svod_base_offset_ = 0xB000;
     svod_layout_ = SvodLayoutType::kSingleFile;
     XELOGI("SVOD is a single file. Magic block present at 0xD000.");
     magic_offset = 0xD000;
-  } else {
-    svod_base_offset_ = 0x0000;
-    svod_layout_ = SvodLayoutType::kMultipleFiles;
-    XELOGI("SVOD is a multiple files. Magic block present at 0x2000.");
-    magic_offset = 0x2000;
+    return Result::kSuccess;
   }
+
+  if (!ReadAt(header, 0x2000, magic_buf, countof(magic_buf))) {
+    XELOGE("ReadSVOD failed to read SVOD magic at 0x2000");
+    return Result::kReadError;
+  }
+  if (std::memcmp(magic_buf, MEDIA_MAGIC, countof(magic_buf)) != 0) {
+    XELOGE("Could not locate SVOD magic block.");
+    return Result::kReadError;
+  }
+
+  svod_base_offset_ = 0x0000;
+  svod_layout_ = SvodLayoutType::kMultipleFiles;
+  XELOGI("SVOD uses a multiple-file layout. Magic block present at 0x2000.");
+  magic_offset = 0x2000;
   return Result::kSuccess;
 }
 

@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "third_party/tomlplusplus/toml.hpp"
 
@@ -27,17 +28,28 @@ enum class XexFormat {
 };
 
 struct XexVersion {
-  uint8_t major;
-  uint8_t minor;
-  uint16_t build;
-  uint8_t qfe;
+  uint8_t major = 0;
+  uint8_t minor = 0;
+  uint16_t build = 0;
+  uint8_t qfe = 0;
 
+  // "major.minor.build.qfe".
   std::string ToString() const;
+  // Packed as it appears in the XEX execution info.
+  uint32_t value() const;
+  static XexVersion FromValue(uint32_t value);
+  // Parses what ToString() produces. Empty unless the text is exactly that,
+  // so a version can never be spelled two ways.
+  static std::optional<XexVersion> FromString(std::string_view text);
+
+  bool operator==(const XexVersion& other) const = default;
 };
 
 struct XexMetadata {
   XexFormat format = XexFormat::kUnknown;
   std::string module_name;
+  // The only path the executable may load from.
+  std::string bounding_path;
 
   // From XEX_HEADER_EXECUTION_INFO
   uint32_t title_id = 0;
@@ -47,6 +59,9 @@ struct XexMetadata {
   XexVersion base_version = {};
   uint8_t disc_number = 0;
   uint8_t disc_count = 0;
+
+  // From the security info
+  uint32_t allowed_media_types = 0;
 
   // From XEX_HEADER_GAME_RATINGS
   struct {
@@ -58,6 +73,9 @@ struct XexMetadata {
     uint8_t oflc_au = 0xFF;
     uint8_t oflc_nz = 0xFF;
   } ratings;
+
+  // True for an executable no disc can hold, so one an STFS package held.
+  bool RunsFromPackageOnly() const;
 
   toml::table ToToml() const;
 };

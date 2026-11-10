@@ -10,10 +10,15 @@
 #ifndef XENIA_CPU_BACKEND_A64_A64_BACKEND_H_
 #define XENIA_CPU_BACKEND_A64_A64_BACKEND_H_
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "xenia/base/bit_map.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/mutex.h"
 #include "xenia/cpu/backend/backend.h"
 
 namespace xe {
@@ -30,6 +35,11 @@ class A64CodeCache;
 typedef void* (*HostToGuestThunk)(void* target, void* arg0, void* arg1);
 typedef void* (*GuestToHostThunk)(void* target, void* arg0, void* arg1);
 typedef void (*ResolveFunctionThunk)();
+// Host entry to a stwcx. helper, returns 1 if the store landed. The value is
+// guest endian.
+typedef uint32_t (*ReservedStoreThunk)(uint32_t guest_address,
+                                       ppc::PPCContext* context, uint64_t value,
+                                       void* host_address);
 
 // Place guest trampolines in an address range that the HV normally occupies.
 static constexpr uint32_t GUEST_TRAMPOLINE_BASE = 0x80000000;
@@ -38,21 +48,57 @@ static constexpr uint32_t GUEST_TRAMPOLINE_MIN_LEN = 8;
 static constexpr uint32_t MAX_GUEST_TRAMPOLINES =
     (GUEST_TRAMPOLINE_END - GUEST_TRAMPOLINE_BASE) / GUEST_TRAMPOLINE_MIN_LEN;
 
-#define A64_RESERVE_BLOCK_SHIFT 16
-#define A64_RESERVE_NUM_ENTRIES \
-  ((1024ULL * 1024ULL * 1024ULL * 4ULL) >> A64_RESERVE_BLOCK_SHIFT)
+// Xenon reservation granule is one 128 byte cache line.
+static constexpr uint32_t A64_RESERVE_GRANULE_SHIFT = 7;
+// A generation counter per granule, hashed. stwcx. bumps its granule to kill
+// other threads' reservations. Colliding granules only cost a spurious failure.
+static constexpr uint32_t A64_RESERVE_ENTRY_BITS = 20;
+static constexpr uint32_t A64_RESERVE_ENTRY_MASK =
+    (1u << A64_RESERVE_ENTRY_BITS) - 1;
+static constexpr uint32_t A64_RESERVE_NUM_ENTRIES = A64_RESERVE_ENTRY_MASK + 1;
 
 struct ReserveHelper {
-  uint64_t blocks[A64_RESERVE_NUM_ENTRIES / 64];
+  std::atomic<uint32_t> generations[A64_RESERVE_NUM_ENTRIES];
 
-  ReserveHelper() { memset(blocks, 0, sizeof(blocks)); }
+  ReserveHelper() {
+    for (auto& generation : generations) {
+      generation.store(0, std::memory_order_relaxed);
+    }
+  }
 };
 
 struct A64BackendStackpoint {
   uint64_t host_stack_;
   unsigned guest_stack_;
+  // Guest lr at the prolog, which a dynamic code return matches against.
   unsigned guest_return_address_;
 };
+
+// The guest return address host code enters guest code with.
+constexpr uint32_t kHostReturnAddress = 0xBCBCBCBC;
+
+// Which lookups take a dynamic call cache entry.
+enum A64DynamicCallCacheKind : uint32_t {
+  kA64DynamicCallAny = 0,
+  // Cached by a direct call, which skips the return site checks a branch to
+  // the same address needs.
+  kA64DynamicCallDirectOnly = 1,
+  // The function entered at a return site. A branch takes it only when no
+  // live frame returns there and MayResolveLongjmp rules out a longjmp.
+  kA64DynamicCallReturnSite = 2,
+};
+// A resolved guest address that has no indirection slot.
+struct A64DynamicCallCacheEntry {
+  uint32_t guest_address;
+  uint32_t kind;
+  uint64_t host_address;
+};
+constexpr uint32_t kA64DynamicCallCacheSize = 16384;
+// EmitDynamicCallLookup indexes and loads these itself.
+static_assert(sizeof(A64DynamicCallCacheEntry) == 16);
+static_assert(offsetof(A64DynamicCallCacheEntry, kind) == 4);
+static_assert(offsetof(A64DynamicCallCacheEntry, host_address) == 8);
+static_assert((kA64DynamicCallCacheSize & (kA64DynamicCallCacheSize - 1)) == 0);
 
 uint32_t FindStackpointSyncDepth(const A64BackendStackpoint* stackpoints,
                                  uint32_t current_depth, uint32_t guest_sp);
@@ -65,7 +111,28 @@ enum : uint32_t {
 };
 
 // Located prior to the context register (x20) in memory.
+// vexptefp/vlogefp estimate constants, splatted across all four lanes. a64 has
+// no memory operands and only v0-v3 are scratch, so these live in the backend
+// context and load with a single ldr q rather than being materialized.
+enum A64EstConst {
+  kEstExp2Poly = 0,                 // 6 entries, 2^f minimax on [0,1)
+  kEstLog2Poly = kEstExp2Poly + 6,  // 7 entries, log2(1+u) minimax on [0,1]
+  kEstScale = kEstLog2Poly + 7,     // 2048.0f
+  kEstUnscale,                      // 1.0f / 2048.0f
+  kEstExp2Max,                      // 128.0f
+  kEstExp2Min,                      // -126.0f
+  kEstOne,                          // 0x3F800000
+  kEstInt127,                       // 127
+  kEstPosInf,                       // 0x7F800000
+  kEstNegInf,                       // 0xFF800000
+  kEstQNaN,                         // 0x7FC00000
+  kEstMantissaMask,                 // 0x007FFFFF
+  kEstQuietBit,                     // 0x00400000
+  kEstConstCount,
+};
+
 struct A64BackendContext {
+  alignas(16) uint32_t est_consts[kEstConstCount][4];
   // Scratch vectors for helper routines.
   // Using uint8_t[16] instead of NEON intrinsic types to avoid including
   // arm_neon.h in the header.
@@ -77,9 +144,32 @@ struct A64BackendContext {
   ReserveHelper* reserve_helper_;
   uint64_t cached_reserve_value_;
   uint64_t* guest_tick_count;
+  // Fixed for the life of the process, so generated code loads them with one
+  // ldr instead of building each as an immediate.
+  uint64_t indirection_table_bias;
+  uint64_t code_execute_base;
+  uint64_t external_indirection_table;
+  uint64_t guest_to_host_thunk_address;
+  // Same thunk without the q4-q31 save/restore, for CallExtern.
+  uint64_t guest_to_host_thunk_no_vec_address;
+  // Helpers Initialize emits into the code cache. The stack-repair entry is
+  // null unless --a64_enable_host_guest_stack_synchronization, which also
+  // gates every site that reads it.
+  uint64_t synchronize_guest_and_host_stack_helper_address;
+  uint64_t vrsqrtefp_scalar_helper_address;
+  uint64_t vrsqrtefp_vector_helper_address;
+  uint64_t frsqrte_helper_address;
+  uint64_t reserved_store_32_helper_address;
+  uint64_t reserved_store_64_helper_address;
+  // The address of the yield handler pointer, not the handler: the scheduler
+  // installs the handler after guest threads exist and drops it on shutdown.
+  uint64_t preempt_yield_handler_address;
   A64BackendStackpoint* stackpoints;
-  uint64_t cached_reserve_offset;
-  uint32_t cached_reserve_bit;
+  // allocated by the first dynamic call resolve on this thread
+  A64DynamicCallCacheEntry* dynamic_call_cache;
+  // address of the live reservation, and its granule generation when taken
+  uint32_t reserve_address;
+  uint32_t reserve_generation;
   unsigned int current_stackpoint_depth;
   unsigned int pending_stackpoint_sync_depth;
   unsigned int fpcr_fpu;
@@ -88,12 +178,45 @@ struct A64BackendContext {
   // bit 1 = got reserve
   unsigned int flags;
   unsigned int Ox1000;  // constant 0x1000
+  // DEFAULT_VMX_FPCR regardless of NJM, for the ops that always flush
+  unsigned int fpcr_vmx_daz;
+  // Set by a dynamic call resolve that continues inside a function rather than
+  // at its entry. Emitted code clears it before a lookup and reads it after.
+  unsigned int dynamic_target_in_body;
+  // The stackpoint depth, host stack pointer and return address of the frame
+  // host code entered, which the return to host helper restores.
+  unsigned int host_return_stackpoint_depth;
+  uint64_t host_return_stack;
+  uint64_t host_return_address;
 };
 
 // Default FPCR for FPU mode (round to nearest, no flush to zero).
 constexpr unsigned int DEFAULT_FPU_FPCR = 0;
 // Default FPCR for VMX mode (flush to zero, preserve NaN payloads).
 constexpr unsigned int DEFAULT_VMX_FPCR = (1 << 24);  // FZ
+// PPC rounding control (RN in bits 0-1, NI in bit 2) to FPCR. RMode is bits
+// 23:22, and NI maps to FZ (bit 24).
+inline constexpr uint32_t kGuestFpcrTable[8] = {
+    (0b00 << 22),              // PPC 0: nearest, IEEE
+    (0b11 << 22),              // PPC 1: toward zero, IEEE
+    (0b01 << 22),              // PPC 2: toward +inf, IEEE
+    (0b10 << 22),              // PPC 3: toward -inf, IEEE
+    (0b00 << 22) | (1 << 24),  // PPC 4: nearest, flush-to-zero
+    (0b11 << 22) | (1 << 24),  // PPC 5: toward zero, flush-to-zero
+    (0b01 << 22) | (1 << 24),  // PPC 6: toward +inf, flush-to-zero
+    (0b10 << 22) | (1 << 24),  // PPC 7: toward -inf, flush-to-zero
+};
+// The NaN fixups rely on FPCR.DN (bit 25) and FPCR.AH (bit 1) being clear in
+// every FPCR the guest runs with. SET_NJM only toggles FZ.
+static_assert([] {
+  constexpr uint32_t kNaNControl = (1u << 25) | (1u << 1);
+  for (uint32_t fpcr : kGuestFpcrTable) {
+    if (fpcr & kNaNControl) {
+      return false;
+    }
+  }
+  return !(DEFAULT_FPU_FPCR & kNaNControl) && !(DEFAULT_VMX_FPCR & kNaNControl);
+}());
 
 class A64Backend : public Backend {
  public:
@@ -103,17 +226,14 @@ class A64Backend : public Backend {
   ~A64Backend() override;
 
   A64CodeCache* code_cache() const { return code_cache_.get(); }
+  void* return_to_host_helper() const { return return_to_host_helper_; }
   uintptr_t emitter_data() const { return emitter_data_; }
 
   std::string name() const override { return "a64"; }
 
   HostToGuestThunk host_to_guest_thunk() const { return host_to_guest_thunk_; }
-  GuestToHostThunk guest_to_host_thunk() const { return guest_to_host_thunk_; }
   ResolveFunctionThunk resolve_function_thunk() const {
     return resolve_function_thunk_;
-  }
-  void* synchronize_guest_and_host_stack_helper() const {
-    return synchronize_guest_and_host_stack_helper_;
   }
 
   bool Initialize(Processor* processor) override;
@@ -134,17 +254,31 @@ class A64Backend : public Backend {
   void InitializeBackendContext(void* ctx) override;
   void DeinitializeBackendContext(void* ctx) override;
   void PrepareForReentry(void* ctx) override;
+  void InvalidateDynamicCalls(uint32_t start, uint32_t end) override;
+  static A64BackendStackpoint* AllocStackpoints();
+  void* CreateStackpointState() override;
+  void DestroyStackpointState(void* state) override;
+  void SwapStackpointState(void* ctx, void* state) override;
 
   A64BackendContext* BackendContextForGuestContext(void* ctx) {
     return reinterpret_cast<A64BackendContext*>(
         reinterpret_cast<intptr_t>(ctx) - sizeof(A64BackendContext));
   }
+  // lwarx found the granule claimed, refreshes the generation it took.
+  static uint64_t AwaitReservation(void* raw_context, uint64_t guest_address);
 
   uint32_t CreateGuestTrampoline(GuestTrampolineProc proc, void* userdata1,
                                  void* userdata2, bool long_term) override;
   void FreeGuestTrampoline(uint32_t trampoline_addr) override;
   void SetGuestRoundingMode(void* ctx, unsigned int mode) override;
   bool PopulatePseudoStacktrace(GuestPseudoStackTrace* st) override;
+
+  uint32_t ReservedLoad32(ppc::PPCContext* context, uint32_t address) override;
+  uint64_t ReservedLoad64(ppc::PPCContext* context, uint32_t address) override;
+  bool ReservedStore32(ppc::PPCContext* context, uint32_t address,
+                       uint32_t value) override;
+  bool ReservedStore64(ppc::PPCContext* context, uint32_t address,
+                       uint64_t value) override;
 
   bool trace_instr_available() const override;
   bool trace_data_available() const override;
@@ -155,12 +289,14 @@ class A64Backend : public Backend {
   void set_trace_data_enabled(bool value) override;
   bool trace_func_enabled() const override;
   void set_trace_func_enabled(bool value) override;
+  std::string FormatSequenceKey(uint64_t key) const override;
 
   void RecordMMIOExceptionForGuestInstruction(void* host_address);
 
  private:
   static bool ExceptionCallbackThunk(Exception* ex, void* data);
   bool ExceptionCallback(Exception* ex);
+  static uint64_t ReleaseFaultingReservedStore(void* data, Exception* ex);
 
   uintptr_t capstone_handle_ = 0;
 
@@ -169,16 +305,23 @@ class A64Backend : public Backend {
 
   HostToGuestThunk host_to_guest_thunk_ = nullptr;
   GuestToHostThunk guest_to_host_thunk_ = nullptr;
+  GuestToHostThunk guest_to_host_thunk_no_vec_ = nullptr;
   ResolveFunctionThunk resolve_function_thunk_ = nullptr;
   void* synchronize_guest_and_host_stack_helper_ = nullptr;
+  void* return_to_host_helper_ = nullptr;
+  void* vrsqrtefp_scalar_helper_ = nullptr;
+  void* vrsqrtefp_vector_helper_ = nullptr;
+  void* frsqrte_helper_ = nullptr;
+  void* reserved_store_32_helper_ = nullptr;
+  void* reserved_store_64_helper_ = nullptr;
+  ReservedStoreThunk reserved_store_32_thunk_ = nullptr;
+  ReservedStoreThunk reserved_store_64_thunk_ = nullptr;
+  ReservedStoreFaultSite reserved_store_fault_sites_[2] = {};
 
- public:
-  void* try_acquire_reservation_helper_ = nullptr;
-  void* reserved_store_32_helper = nullptr;
-  void* reserved_store_64_helper = nullptr;
-
- private:
   alignas(64) ReserveHelper reserve_helper_;
+  // The registered backend contexts, whose dynamic call caches a sweep clears.
+  xe::global_critical_region global_critical_region_;
+  std::vector<void*> backend_contexts_;
   BitMap guest_trampoline_address_bitmap_;
   uint8_t* guest_trampoline_memory_ = nullptr;
   bool guest_trampolines_sub4gb_ = false;

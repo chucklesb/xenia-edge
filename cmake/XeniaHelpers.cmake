@@ -111,15 +111,35 @@ function(xe_target_defaults target)
   endif()
 endfunction()
 
+# xe_windowed_app_main(target)
+#
+# Adds the per-platform wx entry point a WindowedApp executable needs.
+# src/xenia/ui/CMakeLists.txt keeps these out of the xenia-ui library, so every
+# windowed executable has to name one itself.
+function(xe_windowed_app_main target)
+  if(WIN32)
+    set(_main windowed_app_main_win.cc)
+  elseif(APPLE)
+    set(_main windowed_app_main_mac.cc)
+  else()
+    set(_main windowed_app_main_linux.cc)
+  endif()
+  target_sources(${target} PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/xenia/ui/${_main})
+endfunction()
+
 # xe_embed_binary_assets(target source_dir output_namespace)
 #
 # Embeds every file in source_dir as a static byte array in a generated
 # embedded_<namespace>.{h,cc} pair. Symbol names mirror the filename with
 # '-' and '.' replaced by '_'. Generated files land in the build dir and
-# are added to target's sources / include path. Re-run cmake configure
-# after adding/changing assets.
+# are added to target's sources / include path. Changing an asset re-runs
+# configure on the next build; adding or removing one needs a reconfigure, like
+# sources (no CONFIGURE_DEPENDS, which re-checks the glob on every build).
 function(xe_embed_binary_assets target source_dir output_namespace)
   file(GLOB asset_files "${source_dir}/*")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      ${asset_files})
   set(header_path "${CMAKE_CURRENT_BINARY_DIR}/embedded_${output_namespace}.h")
   set(source_path "${CMAKE_CURRENT_BINARY_DIR}/embedded_${output_namespace}.cc")
   set(ns "xe::ui::embedded_${output_namespace}")
@@ -487,9 +507,4 @@ function(xe_test_suite name base_path)
     target_link_libraries(${name} PRIVATE ${ARG_LINKS})
   endif()
   xe_target_defaults(${name})
-
-  if(MSVC)
-    # Edit-and-Continue rewrites __LINE__ and breaks Catch2 test discovery.
-    target_compile_options(${name} PRIVATE /Zi)
-  endif()
 endfunction()

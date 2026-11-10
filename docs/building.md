@@ -29,14 +29,13 @@ drivers.
   it caches the download.
 * The D3D12 backend builds Mesa's `spirv_to_dxil` (the SPIR-V to DXIL guest
   shader compiler) from the `third_party/mesa` submodule using Meson. You need
-  Meson and the Python `mako` and `pyyaml` modules on PATH; Ninja is already
+  Meson and the Python `mako` and `pyyaml` modules on PATH, Ninja is already
   provided by the "C++ CMake tools for Windows" component. Install with:
     ```
     python -m pip install meson mako pyyaml
     ```
   Initialize the submodule along with the others (`git submodule update --init
-  third_party/mesa`). This is Windows-only, as the D3D12 backend is not built on
-  Linux or macOS.
+  third_party/mesa`). This is Windows/macOS only.
 
 ```
 git clone https://github.com/has207/xenia-edge.git
@@ -55,6 +54,9 @@ xb devenv
 
 # Format code to the style guide:
 xb format
+
+# Build and run the unit tests:
+xb test
 ```
 
 > **Note:** The shaders Xenia generates need a Direct3D 12 runtime with shader
@@ -62,7 +64,7 @@ xb format
 > loads the [DirectX 12 Agility SDK](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12)
 > runtime (`D3D12Core.dll`) from a `D3D12\` subfolder next to it to guarantee
 > this. Release builds bundle that DLL automatically (see
-> `.github/workflows/build.yml`); a local build does not, so it falls back to
+> `.github/workflows/build.yml`), a local build does not, so it falls back to
 > your system's in-box runtime. If that runtime predates shader model 6.6, copy
 > `D3D12Core.dll` from the Agility SDK into a `D3D12\` subfolder next to the
 > built `xenia_edge.exe` (its version must match the `D3D12SDKVersion` exported
@@ -71,7 +73,7 @@ xb format
 #### Cross-compiling (Windows ARM64 ↔ x64)
 
 The build supports cross-compiling between Windows x64 and ARM64 on the same
-machine; `xb` configures into `build-<target>/` so it never clobbers the
+machine, `xb` configures into `build-<target>/` so it never clobbers the
 native-build tree.
 
 * Install Visual Studio components for the target architecture:
@@ -134,7 +136,7 @@ You will also need some development libraries. To get them on an Ubuntu system:
 
 ```sh
 sudo apt-get install build-essential mesa-vulkan-drivers libc++-dev libc++abi-dev liblz4-dev libvulkan-dev libx11-xcb-dev clang-21 llvm-21 ninja-build libfontconfig1-dev \
-  libasound2-dev libpulse-dev libudev-dev libdbus-1-dev \
+  libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libcurl4-openssl-dev \
   libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxss-dev libxkbcommon-dev libxfixes-dev
 ```
 
@@ -162,6 +164,33 @@ In addition, you will need up to date Vulkan libraries and drivers for your hard
   point at an existing install instead, set the `SLANGC_PATH` environment
   variable. See `.github/workflows/build.yml` for the version CI pins and how
   it caches the download.
+* Mesa's `spirv_to_dxil` is built from the `third_party/mesa` submodule using
+  Meson. Its codegen requires Python 3.10+ and Apple ships 3.9, so install a
+  newer one and put Meson and the modules Mesa imports in it:
+    ```sh
+    curl -O https://www.python.org/ftp/python/3.14.6/python-3.14.6-macos11.pkg
+    sudo installer -pkg python-3.14.6-macos11.pkg -target /
+    "/Applications/Python 3.14/Install Certificates.command"
+    python3.14 -m pip install meson mako pyyaml packaging
+    ```
+  The installer puts `python3.14` in `/usr/local/bin`, where Meson finds it. It
+  also becomes the default `python3`, and it ships no CA bundle until that
+  certificates step runs, which `xb`'s downloads need.
+  Initialize the submodule along with the others (`git submodule update --init
+  third_party/mesa`).
+* Apple's Metal Shader Converter turns that DXIL into the AIR the Metal backend
+  runs. Its headers are vendored in `third_party/metal-shader-converter`, the
+  dylib is downloaded, as the cmake configure step fails without it:
+    ```sh
+    ./xenia-build.py msc
+    ```
+  Apple's own download needs a developer login, so the dylib is mirrored as a
+  release asset and verified against Apple's code signature after download. To
+  move to a newer release, install the [Metal Developer
+  Tools](https://developer.apple.com/metal/), compare its version against
+  `MSC_VERSION` in `xenia-build.py`, then re-mirror
+  `/usr/local/lib/libmetalirconverter.dylib` and refresh the headers with
+  `rsync -a /usr/local/include/metal_irconverter* third_party/metal-shader-converter/include/`.
 
 ```sh
 git clone https://github.com/has207/xenia-edge.git

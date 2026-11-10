@@ -13,6 +13,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "xenia/base/mutex.h"
 #if !XE_PLATFORM_WIN32
@@ -33,6 +34,9 @@
 #include "xenia/xbox.h"
 
 namespace xe {
+namespace cpu {
+class Function;
+}  // namespace cpu
 namespace kernel {
 
 constexpr fourcc_t kThreadSaveSignature = make_fourcc("THRD");
@@ -87,6 +91,8 @@ struct XAPC {
   static constexpr uint32_t kSize = 40;
   static constexpr uint32_t kDummyKernelRoutine = 0xF00DFF00;
   static constexpr uint32_t kDummyRundownRoutine = 0xF00DFF01;
+  // Kernel routine of an APC its owner frees, skipped on delivery.
+  static constexpr uint32_t kOwnedKernelRoutine = 0xF00DFF02;
 
   // KAPC is 0x28(40) bytes? (what's passed to ExAllocatePoolWithTag)
   // This is 4b shorter than NT - looks like the reserved dword at +4 is gone.
@@ -430,10 +436,10 @@ class XThread : public XObject, public cpu::Thread {
   bool main_thread() const { return main_thread_; }
   bool is_running() const { return running_; }
 
-  // True for threads that run a host C++ routine (XHostThread) rather than
-  // guest PPC code. These always use a real host thread, never a cooperative
-  // fiber, since they run host loops/blocking and other code dereferences their
-  // thread().
+  // True for threads that run a host C++ routine (XHostThread) on a real host
+  // thread rather than a cooperative fiber, since they run host loops/blocking
+  // and other code dereferences their thread(). An XHostThread created on a
+  // fiber is not one.
   virtual bool is_host_thread() const { return false; }
 
   uint32_t thread_id() const { return thread_id_; }
@@ -452,32 +458,36 @@ class XThread : public XObject, public cpu::Thread {
   void EnterCriticalRegion();
   void LeaveCriticalRegion();
 
+  // |apc_mode| 1 queues a user APC, 0 a kernel APC.
   void EnqueueApc(uint32_t normal_routine, uint32_t normal_context,
-                  uint32_t arg1, uint32_t arg2);
+                  uint32_t arg1, uint32_t arg2, uint32_t apc_mode = 1);
+  // Queues an owned APC initialized for this thread, unless already queued.
+  bool InsertOwnedApc(uint32_t apc_ptr, uint32_t arg1, uint32_t arg2);
+  void RemoveOwnedApc(uint32_t apc_ptr);
 
   // True if this thread has a user-mode APC queued (or pending). Used by the
   // cooperative scheduler's alertable waits to return USER_APC, the same way a
   // host alertable wait wakes on a queued APC.
   bool HasPendingUserApc();
+  // True if a kernel APC is queued that this thread can run now, below
+  // APC_LEVEL, outside a critical region and outside another kernel APC.
+  bool HasDeliverableKernelApc();
 
   int32_t priority() const { return priority_; }
   int32_t QueryPriority();
+  // KeQueryBasePriorityThread: the base priority as a signed increment relative
+  // to the priority-class base, NOT the absolute priority.
+  int32_t QueryBasePriority();
   void SetPriority(int32_t increment);
+  // KeSetBasePriorityThread: |increment| is a signed offset from the priority-
+  // class base, not an absolute priority. Returns the previous increment.
+  int32_t SetBasePriority(int32_t increment);
 
-  // Called periodically (~20ms) by KernelState's timestamp timer to simulate
-  // the Xenon scheduler's quantum-based priority decay for non-real-time
-  // threads (base_priority < 18).  Threads that run for longer than one
-  // quantum (~20ms) have their effective priority decayed toward the base,
-  // which causes them to drop into lower host priority buckets and prevents
-  // starvation.  On the first decay step the accumulated priority boost is
-  // also drained.
-  void CheckQuantumAndDecay();
-  // Called when a thread wakes from a kernel wait.  Applies a priority
-  // boost of |increment| above base_priority (matching the Xenon kernel's
-  // unwait-boost behavior) and restarts the quantum timer.  The boost is
-  // drained on the next quantum expiry via CheckQuantumAndDecay().
-  // If increment is 0 or the thread has boost disabled, the priority is
-  // simply restored to base_priority.
+  // Called at a guest quantum end. Decays a non-real-time thread by boost + 1
+  // levels floored at base, then clears the boost.
+  void OnQuantumEnd();
+  // Called when a thread wakes from a kernel wait. Applies the Xenon unwait
+  // boost of |increment| above base, upward only and clamped to max dynamic.
   void BoostOnWake(int32_t increment);
 
   // Xbox thread IDs:
@@ -517,14 +527,238 @@ class XThread : public XObject, public cpu::Thread {
   // Create().
   xe::threading::Fiber* fiber() const { return fiber_.get(); }
 
+  // The fiber to dispatch, the user mode fiber while one is running.
+  xe::threading::Fiber* dispatch_fiber() const {
+    return active_fiber_ ? active_fiber_ : fiber_.get();
+  }
+  void set_active_fiber(xe::threading::Fiber* fiber) { active_fiber_ = fiber; }
+
+  // Guest user mode state, created by the first KeEnterUserMode.
+  struct UserMode {
+    // A host stack that user code runs on. The kernel services a trap by
+    // leaving user mode and entering again at the instruction after it, so a
+    // fiber parked in a trap keeps its host call frames for that resume.
+    struct UserFiber {
+      std::unique_ptr<xe::threading::Fiber> fiber;
+      // Backend stackpoint record for this stack.
+      void* stackpoint_state = nullptr;
+      // Where a fresh entry starts.
+      uint32_t entry_address = 0;
+      // Where the parked trap resumes, and the guest stack pointer it had.
+      uint32_t resume_address = 0;
+      uint32_t stack_pointer = 0;
+      // Set when the handler returned instead of leaving user mode.
+      bool handler_returned = false;
+    };
+    std::vector<std::unique_ptr<UserFiber>> fibers;
+    // Fibers parked in a trap, most recent last.
+    std::vector<UserFiber*> parked;
+    // The fiber user code last ran on.
+    UserFiber* running = nullptr;
+    // The fiber whose trap the handler is running for.
+    UserFiber* trapped = nullptr;
+    // Runs the trap handler, so leaving user mode from it leaves the trapped
+    // fiber's frames intact.
+    std::unique_ptr<xe::threading::Fiber> handler_fiber;
+    void* handler_stackpoint_state = nullptr;
+    // Stackpoint states exchanged into the context since the kernel entered
+    // user mode, exchanged back in reverse on leave.
+    std::vector<void*> swapped_stackpoint_states;
+    // Suspended in KeEnterUserMode while user code runs.
+    xe::threading::Fiber* kernel_fiber = nullptr;
+    // Owns kernel_fiber when the thread is not scheduler-managed.
+    std::unique_ptr<xe::threading::Fiber> adopted_fiber;
+    // Integer and control registers from KeEnterUserMode, restored on leave.
+    struct {
+      uint64_t r[32];
+      uint64_t ctr;
+      uint64_t lr;
+      uint32_t cr;
+      uint32_t xer;
+    } kernel_registers;
+    uint32_t handler = 0;
+    // Resolved once per handler rather than on every trap.
+    cpu::Function* handler_function = nullptr;
+    // Guest buffer the handler receives as the trapped register frame.
+    uint32_t kframes = 0;
+    // Guest buffer for the exception record a fault hands the handler.
+    uint32_t exception_record = 0;
+    uint32_t leave_value = 0;
+    // The trap frame its KTHREAD names, where the console saves interrupted
+    // user code. Code running while it is interrupted sets and clears CR bits
+    // in the frame, which it resumes with.
+    uint32_t interrupt_frame = 0;
+    // Laid out as the trap frame the user mode trap handler receives. XeFu
+    // changes the CR in it.
+    static constexpr uint32_t kInterruptFrameSize = 0x1C0;
+    static constexpr uint32_t kInterruptFrameCr = 0x1B0;
+    // The CR saved in the frame, to tell what was changed there.
+    uint32_t interrupted_cr = 0;
+    // Where KeEnterUserMode restarts the fiber after a dispatched fault.
+    bool restart_pending = false;
+    uint32_t restart_address = 0;
+    bool in_user_code = false;
+  };
+  UserMode* user_mode() const { return user_mode_.get(); }
+  // Saves the CR of the user code being interrupted in its trap frame.
+  void SaveInterruptedUserCr();
+  // Applies the CR bits changed in the trap frame since SaveInterruptedUserCr
+  // to the context, as returning to user code reloads CR from the frame.
+  void RestoreInterruptedUserCr();
+  void set_user_mode(std::unique_ptr<UserMode> user_mode) {
+    user_mode_ = std::move(user_mode);
+  }
+
+  // A guest exception dispatch whose handler is running. One whose handler
+  // continued the thread elsewhere instead of returning stays here until the
+  // next dispatch on the thread finds it gone.
+  struct ExceptionDispatch {
+    // Where the handlers run and return to, on the back chain of whatever a
+    // handler runs.
+    uint32_t handler_sp;
+    uint32_t handler_return;
+    // A load or store at handler_return - 4 made with this lr, else a call
+    // that returns to handler_return.
+    bool data_fault;
+    uint32_t fault_lr;
+    // Its CONTEXT, EXCEPTION_RECORD and DISPATCHER_CONTEXT in the system heap.
+    uint32_t records;
+  };
+  std::vector<ExceptionDispatch>& exception_dispatches() {
+    return exception_dispatches_;
+  }
+
+  // Drops the self reference from Create and any surviving handle. The delete
+  // point for a fiber thread, so the caller must ensure it is not executing.
+  void ReclaimExited();
+
+  // The object this thread is registered on as a cooperative waiter, owned by
+  // XObject::Enter/LeaveCooperativeWait. Atomic because the waiting fiber
+  // clears it just as a terminating thread may be reading it, and either order
+  // is fine since a redundant release is a no-op.
+  // Why a fiber is parked, for the scheduler's no-progress report.
+  enum class CooperativeWaitKind : uint8_t {
+    kNone = 0,
+    kSingle,
+    kMultiAny,
+    kMultiAll,
+    kDelay,
+    kFence,
+  };
+  // Records the wait shape for diagnostics. Extra handles beyond the array are
+  // dropped; the count reported is the real one so truncation stays visible.
+  void set_cooperative_wait_shape(CooperativeWaitKind kind,
+                                  const uint32_t* handles, uint32_t count,
+                                  XObject* const* objects = nullptr) {
+    auto& links = scheduler_links_;
+    links.wait_kind = static_cast<uint8_t>(kind);
+    links.wait_handle_count = static_cast<uint8_t>(count > 255 ? 255 : count);
+    uint32_t n = count < 8 ? count : 8;
+    for (uint32_t i = 0; i < n; ++i) {
+      links.wait_handles[i] = handles ? handles[i] : 0;
+    }
+    // Gating needs every object, so a set that does not fit is not gated at
+    // all rather than gated on a subset, which could park past a signal.
+    links.wait_gate_count = 0;
+    if (objects && count <= 8) {
+      for (uint32_t i = 0; i < count; ++i) {
+        links.wait_gate_objects[i] = objects[i];
+      }
+      links.wait_gate_count = static_cast<uint8_t>(count);
+    }
+  }
+  void clear_cooperative_wait_shape() {
+    scheduler_links_.wait_kind =
+        static_cast<uint8_t>(CooperativeWaitKind::kNone);
+    scheduler_links_.wait_handle_count = 0;
+    scheduler_links_.wait_gate_count = 0;
+  }
+  // Summed signal epoch of a tracked multi-wait set; 0 when untracked. Any
+  // signal or pulse to any member moves the sum, since both bump the epoch.
+  uint32_t cooperative_wait_set_epoch() const {
+    uint32_t sum = 0;
+    for (uint8_t i = 0; i < scheduler_links_.wait_gate_count; ++i) {
+      sum += scheduler_links_.wait_gate_objects[i]->cooperative_signal_epoch();
+    }
+    return sum;
+  }
+  uint8_t cooperative_wait_set_count() const {
+    return scheduler_links_.wait_gate_count;
+  }
+
+  XObject* cooperative_wait_object() const {
+    return cooperative_wait_object_.load(std::memory_order_acquire);
+  }
+  void set_cooperative_wait_object(XObject* object) {
+    cooperative_wait_object_.store(object, std::memory_order_release);
+  }
+
   // Intrusive scheduler links, owned exclusively by GuestScheduler and only
   // touched under its lock. Embedding them here keeps the queue operations
   // allocation-free. A thread is in at most one of the ready or blocked lists.
   struct SchedulerLinks {
     XThread* ready_next = nullptr;  // link for the ready OR blocked list
-    bool queued = false;            // in the ready list
-    bool blocked = false;           // parked in the blocked (waiting) list
-    bool has_run = false;           // diagnostic: dispatched at least once
+    int cpu = -1;                   // CPU owning the list we are on
+    int queued_prio = 0;     // priority level of the ready list we are on
+    bool queued = false;     // in the ready list
+    bool blocked = false;    // parked in the blocked (waiting) list
+    bool suspended = false;  // parked with a nonzero suspend count
+    bool running = false;    // executing on a dispatch thread
+    // Slice cut short by a ready higher-priority thread that took the CPU,
+    // matching X_KTHREAD::was_preempted. Not set speculatively - see
+    // repoll_preempt.
+    bool preempted = false;
+    // Bumped to a safepoint so its CPU can re-poll for a blocked waiter that
+    // outranks it. That waiter may not wake, so nothing has displaced this
+    // thread and no quantum is charged.
+    bool repoll_preempt = false;
+    bool has_run = false;  // diagnostic: dispatched at least once
+    // Raw host ticks when this thread was linked into a ready list, so a
+    // dispatch can measure how long it waited behind higher priorities.
+    uint64_t ready_since_tick = 0;
+    // Consecutive involuntary preemptions with no wait or voluntary yield in
+    // between. A spinning fiber has no other exit, so this separates one from
+    // a thread that is merely running long.
+    uint32_t unyielded_quanta = 0;
+    bool starved_out_logged = false;  // one starvation warning per thread
+    // Set by an external Terminate, exits the fiber at its next
+    // ExitIfTerminated check.
+    std::atomic<bool> terminate_pending{false};
+    // Absolute raw-tick end of the granted timeslice, 0 = grant fresh at
+    // dispatch. Preemption preserves it so the quantum end still arrives.
+    uint64_t quantum_deadline_tick = 0;
+    // xe::Profiler::ThreadLogHandle for this thread's fiber, installed by
+    // SwitchTo for as long as it runs. Void to keep profiling.h, and the UI
+    // headers behind it, out of the kernel headers.
+    void* profiler_log = nullptr;
+    // Re-poll gating, written by BlockCurrentThread, read by RereadyBlocked.
+    bool wait_gated = false;        // skip re-polls until something below fires
+    bool wait_alertable = false;    // also re-poll on a pending user APC
+    uint32_t wait_epoch = 0;        // object epoch sampled before the last poll
+    uint64_t wait_deadline_ms = 0;  // absolute host uptime, 0 = none
+    // Also re-poll on a deliverable kernel APC.
+    bool wait_interruptible = true;
+    // What this fiber parked in and the guest handles it named. Handles, not
+    // XObject pointers: safe to print if the object is released mid-dump, and
+    // they key the signal ring. Without it a multi-object wait dumps obj=0x0.
+    uint8_t wait_kind = 0;  // CooperativeWaitKind
+    uint8_t wait_handle_count = 0;
+    uint32_t wait_handles[8] = {};
+    // Objects of a multi-wait, for re-poll gating. Only read while the fiber is
+    // parked, where the waiting frame keeps them alive - the same lifetime the
+    // single-object cooperative_wait_object() already relies on. Zero when the
+    // set was too large to track, which just means no gating.
+    XObject* wait_gate_objects[8] = {};
+    uint8_t wait_gate_count = 0;
+
+    // Safepoints since the last preemption that declined to preempt because the
+    // guest was at IRQL >= 2, as the console defers the dispatch. Diagnostic
+    // only.
+    uint32_t preempt_defers_irql = 0;
+    // Consecutive safepoints that declined to preempt while holding the global
+    // critical region. Diagnostic only - yielding there would let a co-resident
+    // fiber re-enter the recursive lock.
+    uint32_t preempt_defers_lock = 0;
   };
   SchedulerLinks& scheduler_links() { return scheduler_links_; }
 
@@ -553,6 +787,11 @@ class XThread : public XObject, public cpu::Thread {
 
   void DeliverAPCs();
   void RundownAPCs();
+  cpu::ppc::PPCContext* ApcQueueContext();
+
+  // Publishes a new effective priority to the guest KTHREAD field, the host
+  // thread and the scheduler's ready queue. Every change goes through here.
+  void PublishPriority(int32_t priority);
 
   xe::threading::WaitHandle* GetWaitHandle() override {
     // Under the cooperative scheduler there is no host thread, so a
@@ -584,7 +823,6 @@ class XThread : public XObject, public cpu::Thread {
   int32_t priority_ = 0;       // current effective priority (may be decayed)
   int32_t base_priority_ = 0;  // priority floor — decay never goes below this
   int32_t boost_amount_ = 0;   // accumulated priority boost above base
-  uint64_t quantum_start_ms_ = 0;  // host uptime (ms) when quantum last reset
 
 #if !XE_PLATFORM_WIN32
   // Condition variable for thread self-suspension.
@@ -604,7 +842,14 @@ class XThread : public XObject, public cpu::Thread {
   // When the cooperative scheduler is active, the guest thread runs on this
   // fiber instead of its own host thread (cpu::Thread::thread_).
   std::unique_ptr<xe::threading::Fiber> fiber_;
+  xe::threading::Fiber* active_fiber_ = nullptr;
+  std::unique_ptr<UserMode> user_mode_;
+  std::vector<ExceptionDispatch> exception_dispatches_;
   SchedulerLinks scheduler_links_;
+  // Set by the first ReclaimExited so both terminal paths reclaim once.
+  std::atomic<bool> self_reference_dropped_{false};
+  // Owned by XObject::Enter/LeaveCooperativeWait.
+  std::atomic<XObject*> cooperative_wait_object_{nullptr};
   // Signaled when a fiber-backed thread exits, so waits on the thread object
   // resolve (the host thread handle that normally serves this role is absent).
   std::unique_ptr<xe::threading::Event> fiber_exit_event_;
@@ -614,16 +859,19 @@ class XThread : public XObject, public cpu::Thread {
 
 class XHostThread : public XThread {
  public:
+  // |on_fiber| runs |host_fn| on a scheduler fiber instead, for a routine that
+  // only blocks in guest waits.
   XHostThread(KernelState* kernel_state, uint32_t stack_size,
               uint32_t creation_flags, std::function<int()> host_fn,
-              uint32_t guest_process = 0);
+              uint32_t guest_process = 0, bool on_fiber = false);
 
-  bool is_host_thread() const override { return true; }
+  bool is_host_thread() const override { return !on_fiber_; }
 
   void Execute() override;
 
  private:
   std::function<int()> host_fn_;
+  bool on_fiber_;
 };
 
 }  // namespace kernel

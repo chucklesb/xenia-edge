@@ -37,7 +37,7 @@ uint32_t lower_ascii(const uint32_t c) {
 }
 
 uint32_t upper_ascii(const uint32_t c) {
-  return c >= 'A' && c <= 'Z' ? c + 32 : c;
+  return c >= 'a' && c <= 'z' ? c - 32 : c;
 }
 
 bool equal_ascii_case(const uint32_t l, const uint32_t r) {
@@ -456,7 +456,7 @@ bool ends_with_case(const std::string_view haystack,
   auto end = it;
   --it;
 
-  for (size_t i = 0; i < needle_count; ++i) {
+  for (size_t i = 1; i < needle_count; ++i) {
     if (it == haystack_begin) {
       // not enough room in target for search
       return false;
