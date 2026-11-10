@@ -1,0 +1,91 @@
+name: Sync upstream
+
+# Fork-only workflow (see FORK.md). Merges has207/xenia-edge `edge` into this
+# fork's `edge` and pushes, which triggers linux-aarch64.yml to cut a release.
+#
+# Requires secret SYNC_TOKEN: a fine-grained PAT on this repo with
+# Contents: read/write and Workflows: read/write. GITHUB_TOKEN can't be used —
+# it may not push commits touching .github/workflows/*, and its pushes don't
+# trigger other workflows.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Merge upstream edge
+    runs-on: ubuntu-latest
+    if: github.repository == 'chucklesb/xenia-edge'
+    steps:
+      - name: Check for SYNC_TOKEN
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Secret SYNC_TOKEN is not set. See FORK.md."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          ref: edge
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Merge upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/has207/xenia-edge.git
+          git fetch --no-tags upstream edge
+
+          if git merge-base --is-ancestor upstream/edge HEAD; then
+            echo "Already up to date with upstream ($(git rev-parse --short upstream/edge))." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          before=$(git rev-parse HEAD)
+          count=$(git rev-list --count HEAD..upstream/edge)
+          if ! git merge --no-edit upstream/edge; then
+            {
+              echo "## Merge conflict"
+              echo ""
+              echo "Upstream conflicts with fork changes in:"
+              echo ""
+              git diff --name-only --diff-filter=U | sed 's/^/- /'
+              echo ""
+              echo "Resolve locally (see FORK.md) and push."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Merge conflict with upstream; see job summary."
+            exit 1
+          fi
+
+          # Drift alarm: linux-aarch64.yml copies upstream's build-linux job.
+          extract() {
+            git show "$1:.github/workflows/build.yml" 2>/dev/null |
+              awk '/^  build-linux:/{p=1; print; next} p && /^  [^ #]/{exit} p'
+          }
+          if ! diff <(extract "$before") <(extract HEAD) > linux_job.diff; then
+            echo "::warning::Upstream changed the build-linux job; port the changes to linux-aarch64.yml."
+            {
+              echo "## Upstream changed build-linux"
+              echo ""
+              echo "Port these changes to \`.github/workflows/linux-aarch64.yml\`:"
+              echo ""
+              echo '```diff'
+              cat linux_job.diff
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          git push origin HEAD:edge
+          echo "Merged $count upstream commit(s) up to $(git rev-parse --short upstream/edge)." | tee -a "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,250 @@
+name: Linux aarch64
+
+# Fork-only workflow (see FORK.md). Builds the linux-aarch64 AppImage on
+# GitHub's native arm64 runner and publishes it as a release. It lives in its
+# own file so upstream merges into CI.yml / build.yml never conflict; upstream's
+# CI workflow is disabled on this fork via repo settings.
+#
+# The `build` job is a copy of upstream's `build-linux` job in build.yml. Keep
+# it in sync: sync-upstream.yml warns whenever upstream changes that job.
+# Fork-specific deltas are marked "fork:".
+
+on:
+  push:
+    branches: [edge]
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+      - 'LICENSE'
+  workflow_dispatch:
+
+concurrency:
+  group: linux-aarch64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Linux aarch64
+    # fork: native arm64 runner. Oldest supported LTS keeps the AppImage's
+    # glibc floor low enough for Ubuntu 22.04 / Debian 12 users.
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Cache linuxdeploy tools
+        id: cache-linuxdeploy
+        uses: actions/cache@v5
+        with:
+          path: ~/linuxdeploy
+          # fork: arch in key
+          key: ${{ runner.os }}-${{ runner.arch }}-linuxdeploy-tools
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-linuxdeploy-
+
+      - name: Cache Slang
+        id: cache-slang
+        uses: actions/cache@v5
+        with:
+          path: .slang
+          # Keep in sync with SLANG_VERSION in xenia-build.py.
+          key: ${{ runner.os }}-${{ runner.arch }}-slang-2026.8
+
+      - name: Download Slang
+        if: steps.cache-slang.outputs.cache-hit != 'true'
+        run: ./xenia-build.py slang
+
+      - name: Cache apt packages
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/apt-archives
+            ~/apt-lists
+          # Saved together, so the indices and the .debs they name always agree.
+          # Stable key: fetched once, reused after. Bump the version to refresh.
+          # fork: arch in key
+          key: ${{ runner.os }}-${{ runner.arch }}-apt-jammy-clang21-gcc14-v2
+
+      - name: Setup
+        run: |
+          UBUNTU_BASE=$(lsb_release -cs)
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          # --no-update on both, then one update below; each add-apt-repository
+          # otherwise refetches every index.
+          sudo apt-add-repository --no-update "deb http://apt.llvm.org/${UBUNTU_BASE}/ llvm-toolchain-${UBUNTU_BASE}-21 main"
+          # jammy's default libstdc++ is GCC 12, whose <ranges> Clang can't
+          # compile; GCC 13's <chrono> then trips a consteval bug. g++-14 is
+          # the first libstdc++ Clang compiles cleanly (and what 24.04 ships).
+          sudo add-apt-repository -y --no-update ppa:ubuntu-toolchain-r/test
+
+          # restricted is 15 MB of the index and holds nothing we install.
+          sudo sed -i 's/ restricted//g' /etc/apt/sources.list
+
+          # A dead mirror otherwise costs 120s per index file before failover.
+          printf '%s\n' \
+            'APT::Keep-Downloaded-Packages "true";' \
+            'Acquire::Languages "none";' \
+            'Acquire::Retries "2";' \
+            'Acquire::http::Timeout "15";' \
+            'Acquire::https::Timeout "15";' \
+            'Acquire::Check-Valid-Until "false";' \
+            | sudo tee /etc/apt/apt.conf.d/99ci > /dev/null
+
+          # Restore both halves before updating; update keeps the restored
+          # indices for any source it cannot reach.
+          sudo cp -a ~/apt-lists/. /var/lib/apt/lists/ 2>/dev/null || true
+          sudo chown -R root:root /var/lib/apt/lists
+          sudo cp -n ~/apt-archives/*.deb /var/cache/apt/archives/ 2>/dev/null || true
+
+          sudo apt-get -y update
+          sudo apt-get -y install --no-install-recommends \
+            clang-21 lld-21 libclang-rt-21-dev llvm-21
+          sudo apt-get -y install g++-14 libgtk-3-dev libx11-xcb-dev ninja-build cmake libfontconfig1-dev libxtst-dev \
+            libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libcurl4-openssl-dev \
+            libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxss-dev libxkbcommon-dev libxfixes-dev
+
+          rm -rf ~/apt-lists
+          mkdir -p ~/apt-archives ~/apt-lists
+          sudo cp -n /var/cache/apt/archives/*.deb ~/apt-archives/ 2>/dev/null || true
+          sudo find /var/lib/apt/lists -maxdepth 1 -type f ! -name lock \
+            -exec cp -a {} ~/apt-lists/ \;
+          sudo chown -R "$(id -u):$(id -g)" ~/apt-archives ~/apt-lists
+          ls ~/apt-archives/*.deb > /dev/null 2>&1 || echo "::warning::no .debs staged, apt cache will save empty"
+
+          # Download linuxdeploy if not cached.
+          # fork: aarch64 builds of linuxdeploy and its appimage plugin
+          if [ '${{ steps.cache-linuxdeploy.outputs.cache-hit }}' != 'true' ]; then
+            mkdir -p ~/linuxdeploy
+            wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-aarch64.AppImage -O ~/linuxdeploy/linuxdeploy
+            wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-aarch64.AppImage -O ~/linuxdeploy/linuxdeploy-plugin-appimage
+            chmod +x ~/linuxdeploy/linuxdeploy ~/linuxdeploy/linuxdeploy-plugin-appimage
+          fi
+          echo "$HOME/linuxdeploy" >> $GITHUB_PATH
+
+          # Update submodules
+          git submodule update --init --depth=1 -j$(getconf _NPROCESSORS_ONLN) $(grep -oP '(?<=path = )(?!third_party\/DirectXShaderCompiler).+' .gitmodules)
+
+          # Fetch data repos (game-patches)
+          ./xenia-build.py fetchdata
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Build
+        env:
+          CC: clang-21
+          CXX: clang++-21
+          SCCACHE_GHA_ENABLED: "true"
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
+        run: ./xenia-build.py build --config=Release
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+      - name: Prepare artifacts
+        id: prepare_artifacts
+        run: |
+          binary=build/bin/Linux/Release/xenia_edge
+          if [ $(stat -c%s $binary) -le 100000 ]; then
+            echo "::error::Binary is too small."
+            exit 1
+          fi
+          # fork: make sure we really built an aarch64 binary
+          if ! file "$binary" | grep -q "aarch64"; then
+            echo "::error::$binary is not aarch64:"
+            file "$binary"
+            exit 1
+          fi
+          chmod +x $binary
+          mkdir -p artifacts/xenia_edge
+
+          # Install icons with proper naming for linuxdeploy
+          for size in 16 32 48 64 128 256 512 1024; do
+            mkdir -p artifacts/xenia_edge/usr/share/icons/hicolor/${size}x${size}/apps
+            cp assets/icon/${size}.png artifacts/xenia_edge/usr/share/icons/hicolor/${size}x${size}/apps/xenia_edge.png
+          done
+
+          mkdir -p artifacts/xenia_edge/usr/bin
+
+          ~/linuxdeploy/linuxdeploy --appdir artifacts/xenia_edge \
+            --executable $binary \
+            --desktop-file assets/xenia_edge.desktop \
+            --icon-file assets/icon/256.png \
+            --output appimage
+
+          # linuxdeploy creates the AppImage in the current directory
+          appimage_file=$(ls -1 *.AppImage | head -n1)
+          if [ -z "$appimage_file" ]; then
+            echo "::error::AppImage file not found after linuxdeploy"
+            exit 1
+          fi
+
+          mkdir -p artifacts/release
+          mv "$appimage_file" artifacts/release/xenia_edge.AppImage
+          chmod +x artifacts/release/xenia_edge.AppImage
+          cp LICENSE artifacts/release/
+      - name: Upload artifacts
+        if: steps.prepare_artifacts.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: xenia_edge_linux_aarch64
+          path: artifacts/release
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: |
+      github.repository == 'chucklesb/xenia-edge' &&
+      github.ref == 'refs/heads/edge'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: xenia_edge_linux_aarch64
+          path: linux_aarch64_artifacts
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag=${GITHUB_SHA::7}
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "Release $tag already exists; nothing to do."
+            exit 0
+          fi
+
+          asset=xenia_edge_linux-aarch64.AppImage
+          mv linux_aarch64_artifacts/xenia_edge.AppImage "$asset"
+
+          # Release body: commit list since last release + compare URL.
+          prev_tag=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || echo "")
+          prev_sha=""
+          if [ -n "$prev_tag" ]; then
+            prev_sha=$(git rev-parse "${prev_tag}^{}" 2>/dev/null || git rev-parse "$prev_tag" 2>/dev/null || echo "")
+          fi
+          {
+            echo "### Changes"
+            echo ""
+            if [ -n "$prev_sha" ]; then
+              git log --no-merges --format="- %s (\`%h\`)" --abbrev=7 "${prev_sha}..${GITHUB_SHA}" -- | head -n 300
+              echo ""
+              echo "**Full changelog**: https://github.com/${GH_REPO}/compare/${prev_tag}...${tag}"
+            else
+              git log --format="- %s (\`%h\`)" --abbrev=7 -1 "${GITHUB_SHA}" --
+            fi
+          } > release_notes.md
+
+          gh release create "$tag" "$asset" \
+            --target "$GITHUB_SHA" -t "xenia_edge linux-aarch64" --notes-file release_notes.md
