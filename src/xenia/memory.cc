@@ -2605,14 +2605,26 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size,
   if (allocation_type == kMemoryAllocationReserve) {
     // Reserve is not needed, as we are mapped already.
   } else {
-    if (!ShouldSkipHostCommit(*this)) {
-      if (!CommitHostPages(start_page_number, page_count, protect)) {
-        XELOGE("BaseHeap::AllocFixed failed to alloc range from host");
-        return false;
+    if (!ShouldSkipHostCommit(*this) &&
+        !CommitHostPages(start_page_number, page_count, protect)) {
+      XELOGE("BaseHeap::AllocFixed failed to alloc range from host");
+      return false;
+    }
+    if (cvars::scribble_heap && IsWritableProtect(protect)) {
+      // Pages already committed hold the guest's data.
+      for (uint32_t page_number = start_page_number;
+           page_number <= end_page_number;) {
+        uint32_t run_end = page_number;
+        while (run_end <= end_page_number &&
+               !(page_table_[run_end].state & kMemoryAllocationCommit)) {
+          ++run_end;
+        }
+        if (run_end > page_number) {
+          RandomizeMemory(TranslateRelative(page_number * page_size_),
+                          (run_end - page_number) * page_size_);
+        }
+        page_number = run_end + 1;
       }
-    } else if (cvars::scribble_heap && IsWritableProtect(protect)) {
-      RandomizeMemory(TranslateRelative(start_page_number * page_size_),
-                      page_count * page_size_);
     }
   }
 
@@ -2784,14 +2796,14 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
   if (allocation_type == kMemoryAllocationReserve) {
     // Reserve is not needed, as we are mapped already.
   } else {
-    if (!ShouldSkipHostCommit(*this)) {
-      if (!CommitHostPages(start_page_number, page_count, protect)) {
-        XELOGE("BaseHeap::Alloc failed to alloc range from host");
-        // Restore the free block since we failed.
-        InsertFreeBlock(start_page_number, page_count);
-        return false;
-      }
-    } else if (cvars::scribble_heap && IsWritableProtect(protect)) {
+    if (!ShouldSkipHostCommit(*this) &&
+        !CommitHostPages(start_page_number, page_count, protect)) {
+      XELOGE("BaseHeap::Alloc failed to alloc range from host");
+      // Restore the free block since we failed.
+      InsertFreeBlock(start_page_number, page_count);
+      return false;
+    }
+    if (cvars::scribble_heap && IsWritableProtect(protect)) {
       RandomizeMemory(TranslateRelative(start_page_number << page_size_shift_),
                       page_count << page_size_shift_);
     }
@@ -2868,7 +2880,8 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   // Given address must be a region base address.
   uint32_t base_page_number = (base_address - heap_base_) / page_size_;
   auto base_page_entry = page_table_[base_page_number];
-  if (base_page_entry.base_address != base_page_number) {
+  if (!base_page_entry.state ||
+      base_page_entry.base_address != base_page_number) {
     XELOGE("BaseHeap::Release failed because address is not a region start");
     return false;
   }
@@ -2882,46 +2895,110 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
     *out_region_size = (base_page_entry.region_page_count * page_size_);
   }
 
+  ReleasePages(base_page_number, base_page_entry.region_page_count);
+  return true;
+}
+
+bool BaseHeap::ReleaseRange(uint32_t address, uint32_t size) {
+  auto global_lock = global_critical_region_.Acquire();
+
+  uint32_t start_page_number = (address - heap_base_) >> page_size_shift_;
+  uint32_t page_count = get_page_count(size, page_size_);
+  if (address < heap_base_ || start_page_number >= page_table_.size() ||
+      !page_count || page_count > page_table_.size() - start_page_number) {
+    return false;
+  }
+  auto start_page_entry = page_table_[start_page_number];
+  uint32_t region_start = start_page_entry.base_address;
+  uint32_t region_end = region_start + start_page_entry.region_page_count;
+  uint32_t end_page_number = start_page_number + page_count;
+  if (!start_page_entry.state || end_page_number > region_end) {
+    return false;
+  }
+
+  // The pages either side become regions of their own.
+  for (uint32_t page_number = region_start; page_number < start_page_number;
+       ++page_number) {
+    page_table_[page_number].region_page_count =
+        start_page_number - region_start;
+  }
+  for (uint32_t page_number = end_page_number; page_number < region_end;
+       ++page_number) {
+    page_table_[page_number].base_address = end_page_number;
+    page_table_[page_number].region_page_count = region_end - end_page_number;
+  }
+
+  ReleasePages(start_page_number, page_count);
+  return true;
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> BaseHeap::TakeUninitializedRuns(
+    uint32_t address, uint32_t size) {
+  std::vector<std::pair<uint32_t, uint32_t>> runs;
+  if (address < heap_base_ || address - heap_base_ >= heap_size_) {
+    return runs;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t page_number = (address - heap_base_) >> page_size_shift_;
+  const uint32_t end_page_number =
+      std::min(uint32_t(page_table_.size()),
+               page_number + get_page_count(size, page_size_));
+  for (; page_number < end_page_number; ++page_number) {
+    auto& page_entry = page_table_[page_number];
+    if (page_entry.initialized) {
+      continue;
+    }
+    page_entry.initialized = 1;
+    const uint32_t page_address =
+        heap_base_ + (page_number << page_size_shift_);
+    if (!runs.empty() &&
+        runs.back().first + runs.back().second == page_address) {
+      runs.back().second += page_size_;
+    } else {
+      runs.emplace_back(page_address, page_size_);
+    }
+  }
+  return runs;
+}
+
+void BaseHeap::ReleasePages(uint32_t start_page_number, uint32_t page_count) {
   // Release from host not needed as mapping reserves the range for us.
   // TODO(benvanik): protect with NOACCESS?
   /*BOOL result = VirtualFree(
-      TranslateRelative(base_page_number * page_size_), 0, MEM_RELEASE);
+      TranslateRelative(start_page_number * page_size_), 0, MEM_RELEASE);
   if (!result) {
     PLOGE("BaseHeap::Release failed due to host VirtualFree failure");
     return false;
   }*/
   // Instead, we just protect it, if we can.
   if (page_size_ == xe::memory::page_size() ||
-      ((base_page_entry.region_page_count * page_size_) %
-               xe::memory::page_size() ==
-           0 &&
-       ((base_page_number * page_size_) % xe::memory::page_size() == 0))) {
+      ((page_count * page_size_) % xe::memory::page_size() == 0 &&
+       ((start_page_number * page_size_) % xe::memory::page_size() == 0))) {
     // TODO(benvanik): figure out why games are using memory after releasing
     // it. It's possible this is some virtual/physical stuff where the GPU
     // still can access it.
     if (cvars::protect_on_release && !skip_host_protect_) {
-      if (!xe::memory::Protect(TranslateRelative(base_page_number * page_size_),
-                               base_page_entry.region_page_count * page_size_,
-                               xe::memory::PageAccess::kNoAccess, nullptr)) {
+      if (!xe::memory::Protect(
+              TranslateRelative(start_page_number * page_size_),
+              page_count * page_size_, xe::memory::PageAccess::kNoAccess,
+              nullptr)) {
         XELOGW("BaseHeap::Release failed due to host VirtualProtect failure");
       }
     }
   }
 
   // Perform table change.
-  uint32_t end_page_number =
-      base_page_number + base_page_entry.region_page_count - 1;
-  for (uint32_t page_number = base_page_number; page_number <= end_page_number;
-       ++page_number) {
+  for (uint32_t page_number = start_page_number;
+       page_number < start_page_number + page_count; ++page_number) {
     auto& page_entry = page_table_[page_number];
+    const uint32_t initialized = page_entry.initialized;
     page_entry.qword = 0;
+    page_entry.initialized = initialized;
     unreserved_page_count_++;
   }
 
   // Insert freed block into tracker with coalescing.
-  InsertFreeBlock(base_page_number, base_page_entry.region_page_count);
-
-  return true;
+  InsertFreeBlock(start_page_number, page_count);
 }
 
 bool BaseHeap::ApplyHostProtect(uint32_t start_page_number,
@@ -3043,24 +3120,11 @@ bool BaseHeap::CommitHostPages(uint32_t start_page_number, uint32_t page_count,
         TranslateRelative(start_page_number * page_size_),
         page_count * page_size_, xe::memory::AllocationType::kCommit,
         ToPageAccess(protect));
-    if (!result) {
-      return false;
-    }
-    if (cvars::scribble_heap && IsWritableProtect(protect)) {
-      RandomizeMemory(result, page_count * page_size_);
-    }
-    return true;
+    return result != nullptr;
   }
 
-  if (!ApplyHostProtect(start_page_number, start_page_number + page_count - 1,
-                        protect, nullptr)) {
-    return false;
-  }
-  if (cvars::scribble_heap && IsWritableProtect(protect)) {
-    RandomizeMemory(TranslateRelative(start_page_number * page_size_),
-                    page_count * page_size_);
-  }
-  return true;
+  return ApplyHostProtect(start_page_number, start_page_number + page_count - 1,
+                          protect, nullptr);
 }
 
 bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,

@@ -42,7 +42,8 @@ void XNotifyListener::Initialize(uint64_t mask, uint32_t is_system,
   kernel_state_->RegisterNotifyListener(this);
 }
 
-void XNotifyListener::EnqueueNotification(XNotificationID id, uint32_t data) {
+void XNotifyListener::EnqueueNotification(XNotificationID id, uint32_t data,
+                                          bool signal) {
   auto key = XNotificationKey(id);
   // Ignore if the notification doesn't match our mask.
   if ((mask_ & uint64_t(1ULL << key.mask_index)) == 0) {
@@ -52,10 +53,16 @@ void XNotifyListener::EnqueueNotification(XNotificationID id, uint32_t data) {
   if (key.version > max_version_) {
     return;
   }
+  // xam 816A8328.
+  if (key.system_only && !is_system_) {
+    return;
+  }
   auto global_lock = global_critical_region_.Acquire();
   // A repeat replaces the pending one's data, and still signals.
   notifications_[QueueKey(id)] = {id, data};
-  wait_handle_->Set();
+  if (signal) {
+    wait_handle_->Set();
+  }
 }
 
 // The console keeps a queue per area and clears the signal when a read empties
