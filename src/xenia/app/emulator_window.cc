@@ -139,6 +139,7 @@
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/content_manager.h"
+#include "xenia/kernel/xam/dash_mouse.h"
 #include "xenia/kernel/xam/indie_game.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
@@ -310,7 +311,8 @@ DEFINE_bool(
 #endif
 DEFINE_bool(disable_game_window_mouse, false,
             "Disables mouse interactions in the game window, including "
-            "double-click to fullscreen and right-click context menu.",
+            "double-click to fullscreen, the right-click context menu and "
+            "mouse input to the dashboard.",
             "General");
 
 namespace xe {
@@ -518,6 +520,15 @@ class AboutDialog : public wxGenericAboutDialog {
     AddText("\n");
     AddLinkedLine(_("UI font: %s (SIL Open Font License 1.1)"),
                   _("Inter by Rasmus Andersson"), "https://rsms.me/inter/");
+    AddLinkedLine(_("UI font: %s (SIL Open Font License 1.1)"),
+                  _("M PLUS 1p by Coji Morishita"),
+                  "https://mplusfonts.github.io/");
+    AddLinkedLine(_("System font: %s (SIL Open Font License 1.1)"),
+                  _("Pretendard by Kil Hyung-jin"),
+                  "https://github.com/orioncactus/pretendard");
+    AddLinkedLine(_("System font: %s (SIL Open Font License 1.1)"),
+                  _("Noto Sans TC by Adobe"),
+                  "https://fonts.google.com/noto/specimen/Noto+Sans+TC");
     AddLinkedLine(_("Icons by %s"), _("Icons8"), "https://icons8.com");
   }
 
@@ -1110,6 +1121,21 @@ void EmulatorWindow::EmulatorWindowListener::OnMouseUp(ui::MouseEvent& e) {
 void EmulatorWindow::EmulatorWindowListener::OnMouseDoubleClick(
     ui::MouseEvent& e) {
   emulator_window_.OnMouseDoubleClick(e);
+}
+
+void EmulatorWindow::EmulatorWindowListener::OnMouseMove(ui::MouseEvent& e) {
+  emulator_window_.OnMouseMove(e);
+}
+
+void EmulatorWindow::EmulatorWindowListener::OnMouseWheel(ui::MouseEvent& e) {
+  emulator_window_.OnMouseWheel(e);
+}
+
+void EmulatorWindow::EmulatorWindowListener::OnLostFocus(ui::UISetupEvent& e) {
+  // A release made while unfocused isn't seen.
+  if (kernel::xam::DashMouse* dash_mouse = emulator_window_.GetDashMouse()) {
+    dash_mouse->Cancel();
+  }
 }
 
 void EmulatorWindow::EmulatorWindowListener::OnUsbDeviceChanged(
@@ -1749,8 +1775,7 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
       // In game Esc toggles the context menu, which offers leaving fullscreen.
       // Other open dialogs keep Esc to cancel.
       if (emulator_->is_title_open()) {
-        if (!context_menu_ && imgui_drawer() &&
-            imgui_drawer()->HasOpenDialogs()) {
+        if (!context_menu_ && HasOpenDialogs()) {
           return;
         }
         ToggleContextMenu(false);
@@ -1778,13 +1803,99 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
   e.set_handled(true);
 }
 
+kernel::xam::DashMouse* EmulatorWindow::GetDashMouse() const {
+  // A relaunch frees the kernel state on another thread.
+  if (cvars::disable_game_window_mouse || !emulator_ ||
+      !emulator_->is_title_open() || emulator_->is_relaunching() ||
+      !emulator_->kernel_state()) {
+    return nullptr;
+  }
+  auto dash_mouse = emulator_->kernel_state()->xam_state()->dash_mouse();
+  return dash_mouse->active() ? dash_mouse : nullptr;
+}
+
+bool EmulatorWindow::HasOpenDialogs() const {
+  return imgui_drawer_ && imgui_drawer_->HasOpenDialogs();
+}
+
+bool EmulatorWindow::GetGuestOutputMousePosition(const ui::MouseEvent& e,
+                                                 float& x_out, float& y_out,
+                                                 bool& inside_out) const {
+  ui::Presenter* presenter = GetGraphicsSystemPresenter();
+  const uint32_t window_width = window_->GetActualPhysicalWidth();
+  const uint32_t window_height = window_->GetActualPhysicalHeight();
+  float left, top, width, height;
+  if (!presenter || !window_width || !window_height ||
+      !presenter->GetGuestOutputPaintArea(left, top, width, height) ||
+      width <= 0.0f || height <= 0.0f) {
+    return false;
+  }
+  const float x = ((float(e.x()) + 0.5f) / float(window_width) - left) / width;
+  const float y = ((float(e.y()) + 0.5f) / float(window_height) - top) / height;
+  inside_out = x >= 0.0f && x < 1.0f && y >= 0.0f && y < 1.0f;
+  x_out = std::clamp(x, 0.0f, 1.0f);
+  y_out = std::clamp(y, 0.0f, 1.0f);
+  return true;
+}
+
+void EmulatorWindow::OnMouseMove(const ui::MouseEvent& e) {
+  kernel::xam::DashMouse* dash_mouse = GetDashMouse();
+  if (!dash_mouse) {
+    return;
+  }
+  float x, y;
+  bool inside;
+  if (HasOpenDialogs()) {
+    dash_mouse->Cancel();
+  } else if (GetGuestOutputMousePosition(e, x, y, inside)) {
+    dash_mouse->Move(x, y);
+  }
+}
+
+void EmulatorWindow::OnMouseWheel(const ui::MouseEvent& e) {
+  kernel::xam::DashMouse* dash_mouse = GetDashMouse();
+  if (!dash_mouse || !e.scroll_y() || HasOpenDialogs()) {
+    return;
+  }
+  // Touchpads and smooth wheels turn by parts of a detent.
+  if ((dash_mouse_wheel_ < 0) != (e.scroll_y() < 0)) {
+    dash_mouse_wheel_ = 0;
+  }
+  dash_mouse_wheel_ += e.scroll_y();
+  constexpr int32_t kDetent = int32_t(ui::MouseEvent::kScrollPerDetent);
+  while (std::abs(dash_mouse_wheel_) >= kDetent) {
+    dash_mouse->Wheel(dash_mouse_wheel_ > 0);
+    dash_mouse_wheel_ -= dash_mouse_wheel_ > 0 ? kDetent : -kDetent;
+  }
+}
+
 void EmulatorWindow::OnMouseDown(const ui::MouseEvent& e) {
+  // The dashboard takes the mouse unless a dialog is over it, with right and
+  // the back button going back in place of the context menu.
+  kernel::xam::DashMouse* dash_mouse = GetDashMouse();
+  if (dash_mouse && !HasOpenDialogs()) {
+    float x, y;
+    bool inside;
+    switch (e.button()) {
+      case ui::MouseEvent::Button::kLeft:
+        if (GetGuestOutputMousePosition(e, x, y, inside) && inside) {
+          dash_mouse->Press(x, y);
+        }
+        return;
+      case ui::MouseEvent::Button::kRight:
+      case ui::MouseEvent::Button::kX1:
+        dash_mouse->Back();
+        return;
+      default:
+        break;
+    }
+  }
   if (e.button() == ui::MouseEvent::Button::kRight) {
     if (cvars::disable_game_window_mouse) {
       return;
     }
     // Don't show context menu if a dialog (other than context menu) is open
-    if (!context_menu_ && imgui_drawer() && imgui_drawer()->HasOpenDialogs()) {
+    if (!context_menu_ && HasOpenDialogs()) {
       return;
     }
     ToggleContextMenu();
@@ -1885,6 +1996,20 @@ void EmulatorWindow::ToggleContextMenu(bool use_cursor_position) {
 }
 
 void EmulatorWindow::OnMouseUp(const ui::MouseEvent& e) {
+  kernel::xam::DashMouse* dash_mouse = GetDashMouse();
+  if (dash_mouse && e.button() == ui::MouseEvent::Button::kLeft) {
+    float x, y;
+    bool inside;
+    if (!HasOpenDialogs() && GetGuestOutputMousePosition(e, x, y, inside)) {
+      const int double_click_time =
+          wxSystemSettings::GetMetric(wxSYS_DCLICK_MSEC);
+      dash_mouse->Release(x, y,
+                          std::chrono::milliseconds(
+                              double_click_time > 0 ? double_click_time : 500));
+    } else {
+      dash_mouse->Cancel();
+    }
+  }
   last_mouse_up = steady_clock::now();
 }
 
@@ -1967,19 +2092,18 @@ void EmulatorWindow::SaveImage(const std::filesystem::path& filepath,
   }
 }
 
-void EmulatorWindow::OnMouseDoubleClick(const ui::MouseEvent& e) {
-  if (cvars::disable_game_window_mouse) {
+void EmulatorWindow::OnMouseDoubleClick(ui::MouseEvent& e) {
+  // A handled double click keeps the window from toggling fullscreen.
+  if (e.button() != ui::MouseEvent::Button::kLeft) {
     return;
   }
-  // Don't toggle fullscreen if any ImGui dialogs are open
-  // This allows users to double-click to select text in dialog input fields
-  if (imgui_drawer_ && imgui_drawer_->HasOpenDialogs()) {
+  if (cvars::disable_game_window_mouse || HasOpenDialogs()) {
+    e.set_handled(true);
     return;
   }
-
-  // Only toggle fullscreen on left button double-click
-  if (e.button() == ui::MouseEvent::Button::kLeft) {
-    ToggleFullscreen();
+  if (kernel::xam::DashMouse* dash_mouse = GetDashMouse()) {
+    dash_mouse->DoubleClick();
+    e.set_handled(true);
   }
 }
 

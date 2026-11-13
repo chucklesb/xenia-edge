@@ -823,6 +823,31 @@ X_HRESULT_result_t XdfLaunchNewImageFromCache_entry(lpstring_t name_ptr,
 }
 DECLARE_XAM_EXPORT1(XdfLaunchNewImageFromCache, kNone, kImplemented);
 
+// The package manager's error for a name no installed package has.
+constexpr X_HRESULT kPackageFileNotFound = 0x8B050009;
+
+// Gives the path of a system extended partition file, which is how the
+// dashboard finds its language packs.
+X_HRESULT_result_t XamPackageManagerGetFilePathW_entry(lpu16string_t name_ptr,
+                                                       lpvoid_t path_ptr,
+                                                       dword_t path_count) {
+  if (!name_ptr) {
+    return X_E_INVALIDARG;
+  }
+  const std::u16string path =
+      xe::to_utf16(FindSystemExtFile(xe::to_utf8(name_ptr.value())));
+  if (path.empty()) {
+    return kPackageFileNotFound;
+  }
+  if (!path_ptr || path.size() >= path_count) {
+    return X_E_INVALIDARG;
+  }
+  xe::string_util::copy_and_swap_truncating(path_ptr.as<char16_t*>(), path,
+                                            path_count);
+  return X_E_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamPackageManagerGetFilePathW, kNone, kImplemented);
+
 void XamLoaderTerminateTitle_entry() { kernel_state()->ExitToDashboard(); }
 DECLARE_XAM_EXPORT1(XamLoaderTerminateTitle, kNone, kSketchy);
 
@@ -1571,7 +1596,8 @@ dword_result_t XamSetDvrStorage_entry(
 }
 DECLARE_XAM_EXPORT1(XamSetDvrStorage, kNone, kStub);
 
-dword_result_t XamLookupCommonStringByIndex_entry(dword_t string_index) {
+// The guest address of a string in xam's common string table, or 0.
+static uint32_t LookupCommonString(uint32_t string_index) {
   static std::mutex lock;
   std::lock_guard<std::mutex> guard(lock);
   auto& table = kernel_state()->xam_state()->common_string_table_;
@@ -1585,13 +1611,71 @@ dword_result_t XamLookupCommonStringByIndex_entry(dword_t string_index) {
     }
     if (!skin ||
         XFAILED(LoadXuiStringTable(*skin, "xam", "xamstrings.xus", &loaded))) {
-      XELOGW("XamLookupCommonStringByIndex: no xam string table to read");
+      XELOGW("LookupCommonString: no xam string table to read");
     }
     table = loaded;
   }
   return *table ? LookupXuiStringTable(*table, string_index) : 0;
 }
+
+dword_result_t XamLookupCommonStringByIndex_entry(dword_t string_index) {
+  return LookupCommonString(string_index);
+}
 DECLARE_XAM_EXPORT1(XamLookupCommonStringByIndex, kNone, kImplemented);
+
+// The console name's length in characters with its terminator, and the
+// common string naming an unnamed console.
+constexpr size_t kConsoleNameLength = 0x18;
+constexpr uint32_t kDefaultConsoleNameString = 0x18;
+
+// Empty until named, it lasts until edge exits since edge doesn't store the
+// network settings it belongs with.
+static std::mutex console_name_lock;
+static std::u16string console_name;
+
+void XamGetConsoleFriendlyName_entry(pointer_t<char16_t> name_ptr) {
+  if (!name_ptr) {
+    return;
+  }
+  std::u16string name;
+  {
+    std::lock_guard<std::mutex> guard(console_name_lock);
+    name = console_name;
+  }
+  // An unnamed console takes the default name, which then stays its name.
+  // The lookup may load a module so it runs outside the lock.
+  if (name.empty()) {
+    if (const uint32_t common = LookupCommonString(kDefaultConsoleNameString)) {
+      name = xe::load_and_swap<std::u16string>(
+          kernel_memory()->TranslateVirtual(common));
+      name.resize(std::min(name.size(), kConsoleNameLength - 1));
+      std::lock_guard<std::mutex> guard(console_name_lock);
+      if (console_name.empty()) {
+        console_name = name;
+      } else {
+        name = console_name;
+      }
+    }
+  }
+  xe::string_util::copy_and_swap_truncating(
+      name_ptr, name.empty() ? std::u16string_view(u"Xbox 360") : name,
+      kConsoleNameLength);
+}
+DECLARE_XAM_EXPORT1(XamGetConsoleFriendlyName, kNone, kImplemented);
+
+dword_result_t XamSetConsoleFriendlyName_entry(pointer_t<char16_t> name_ptr) {
+  // A name ends within its length.
+  if (!name_ptr ||
+      xe::load_and_swap<uint16_t>(static_cast<char16_t*>(name_ptr) +
+                                  kConsoleNameLength - 1)) {
+    return X_E_INVALIDARG;
+  }
+  std::lock_guard<std::mutex> guard(console_name_lock);
+  console_name =
+      xe::load_and_swap<std::u16string>(static_cast<char16_t*>(name_ptr));
+  return X_E_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamSetConsoleFriendlyName, kNone, kSketchy);
 
 dword_result_t XamLogLocalizationEtx_entry(dword_t error_code, dword_t unk) {
   if (error_code == 0x80300034) {
