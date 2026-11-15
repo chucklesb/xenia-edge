@@ -160,14 +160,6 @@ DEFINE_string(gpu, "vulkan", "Graphics system. Use: " GPU_OPTIONS, "GPU");
 
 DECLARE_bool(allow_plugins);
 
-DEFINE_bool(mount_scratch, false, "Enable scratch mount", "Storage");
-
-DEFINE_bool(mount_cache, true, "Enable cache mount", "Storage");
-UPDATE_from_bool(mount_cache, 2024, 8, 31, 20, false);
-
-DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount",
-            "Storage");
-
 DEFINE_path(xefu_path, "",
             "Folder with XeFu, the Xbox 360's original Xbox emulator: xbox.xex "
             "and the xefu*.xex builds it picks from, as the console's system "
@@ -184,7 +176,7 @@ DEFINE_string(xefu_launcher, "xbox.xex",
               "game.",
               "General");
 
-DECLARE_bool(force_mount_devkit);
+DEFINE_bool(force_mount_devkit, false, "Force devkit mount", "Storage");
 
 DEFINE_int32(priority_class, 0,
              "Forces Xenia to use different process priority than default one. "
@@ -1937,89 +1929,42 @@ void Emulator::ResetTitle() {
 }
 
 void Emulator::MountStandardDrives() {
-  auto fs = file_system_.get();
-
-  if (cvars::mount_scratch) {
-    auto scratch_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\SCRATCH", storage_root_ / "scratch", false);
-    if (!scratch_device->Initialize()) {
-      XELOGE("Unable to scan scratch path");
-    } else {
-      if (!fs->RegisterDevice(std::move(scratch_device))) {
-        XELOGE("Unable to register scratch path");
-      } else {
-        fs->RegisterSymbolicLink("scratch:", "\\SCRATCH");
-      }
-    }
-  }
-
-  if (cvars::mount_cache) {
-    auto cache0_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\CACHE0", storage_root_ / "cache0", false);
-    if (!cache0_device->Initialize()) {
-      XELOGE("Unable to scan cache0 path");
-    } else {
-      if (!fs->RegisterDevice(std::move(cache0_device))) {
-        XELOGE("Unable to register cache0 path");
-      } else {
-        fs->RegisterSymbolicLink("cache0:", "\\CACHE0");
-      }
-    }
-
-    auto cache1_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\CACHE1", storage_root_ / "cache1", false);
-    if (!cache1_device->Initialize()) {
-      XELOGE("Unable to scan cache1 path");
-    } else {
-      if (!fs->RegisterDevice(std::move(cache1_device))) {
-        XELOGE("Unable to register cache1 path");
-      } else {
-        fs->RegisterSymbolicLink("cache1:", "\\CACHE1");
-      }
-    }
-
-    // Some (older?) games try accessing cache:\ too
-    auto cache_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\CACHE", storage_root_ / "cache", false);
-    if (!cache_device->Initialize()) {
-      XELOGE("Unable to scan cache path");
-    } else {
-      if (!fs->RegisterDevice(std::move(cache_device))) {
-        XELOGE("Unable to register cache path");
-      } else {
-        fs->RegisterSymbolicLink("cache:", "\\CACHE");
-      }
-    }
-  }
-
-  if (cvars::mount_memory_unit) {
-    auto mu_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\MU", storage_root_ / "mu", false);
-    if (!mu_device->Initialize()) {
-      XELOGE("Unable to scan MU path");
-    } else {
-      if (!fs->RegisterDevice(std::move(mu_device))) {
-        XELOGE("Unable to register MU path");
-      } else {
-        fs->RegisterSymbolicLink("MU:", "\\MU");
-      }
-    }
-  }
-
   if (cvars::force_mount_devkit) {
-    auto devkit_device =
-        std::make_unique<xe::vfs::HostPathDevice>("\\DEVKIT", "devkit", false);
+    MountDevkitDrive();
+  }
+}
 
-    if (!devkit_device->Initialize()) {
-      XELOGE("Unable to scan devkit path");
+bool Emulator::MountDevkitDrive() {
+  if (file_system_->GetDevice("\\DEVKIT")) {
+    return true;
+  }
+  auto devkit_device = std::make_unique<vfs::HostPathDevice>(
+      "\\DEVKIT", storage_root_ / "devkit", false);
+  if (!devkit_device->Initialize()) {
+    XELOGE("Unable to scan devkit path");
+    return false;
+  }
+  file_system_->RegisterDevice(std::move(devkit_device));
+  file_system_->RegisterSymbolicLink("DEVKIT:", "\\DEVKIT");
+  file_system_->RegisterSymbolicLink("e:", "\\DEVKIT");
+  return true;
+}
+
+void Emulator::EmptyTitleCache() {
+  auto global_lock = global_critical_region::AcquireDirect();
+  vfs::Entry* root = file_system_->ResolvePath("\\CACHE");
+  if (!root) {
+    return;
+  }
+  std::vector<vfs::Entry*> children;
+  for (const auto& child : root->children()) {
+    children.push_back(child.get());
+  }
+  // Entries the title still has open stay.
+  for (vfs::Entry* child : children) {
+    if (!root->Delete(child)) {
+      XELOGW("Unable to delete cache:\\{} on format", child->name());
     }
-
-    if (!fs->RegisterDevice(std::move(devkit_device))) {
-      XELOGE("Unable to register devkit path");
-    }
-
-    fs->RegisterSymbolicLink("DEVKIT:", "\\DEVKIT");
-    fs->RegisterSymbolicLink("e:", "\\DEVKIT");
   }
 }
 
@@ -2776,7 +2721,9 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
                      std::string("\\Cache1")};
   auto null_device =
       std::make_unique<vfs::NullDevice>("\\Device\\Harddisk0", null_paths);
+  vfs::NullDevice* raw_partitions = nullptr;
   if (null_device->Initialize()) {
+    raw_partitions = null_device.get();
     file_system_->RegisterDevice(std::move(null_device));
   }
 
@@ -2850,6 +2797,29 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
     if (title_version.value != 0) {
       title_version_ = format_version(title_version);
     }
+  }
+
+  // XMountUtilityDrive creates \Device\cacheN on Harddisk0\CacheN and links
+  // cache: to it. Each game XeFu runs gets its own folder.
+  const uint32_t cache_title_id = game_config_title_id();
+  const auto cache_name =
+      fmt::format("{:08X}", cache_title_id ? cache_title_id : *title_id_);
+  const auto cache_root = storage_root_ / "cache";
+  auto cache_device = std::make_unique<vfs::HostPathDevice>(
+      "\\CACHE", cache_root / cache_name, false);
+  if (cache_device->Initialize()) {
+    file_system_->RegisterDevice(std::move(cache_device));
+    file_system_->RegisterSymbolicLink("\\Device\\cache0", "\\CACHE");
+    file_system_->RegisterSymbolicLink("\\Device\\cache1", "\\CACHE");
+  } else {
+    XELOGE("Unable to scan the title's cache path");
+  }
+  // The cache table and cluster sizes sit beside the folder, as content
+  // package headers do.
+  if (raw_partitions) {
+    raw_partitions->LoadCacheHeader(cache_root / "Headers" /
+                                    (cache_name + ".header"));
+    raw_partitions->set_cache_format_handler([this]() { EmptyTitleCache(); });
   }
 
   if (title_id_ == kXeFuTitleId) {

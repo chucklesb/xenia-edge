@@ -290,8 +290,12 @@ class Emulator {
   // Tears down all subsystems. Called by the destructor and by RelaunchTitle.
   void Shutdown();
 
-  // Mounts scratch, cache, and devkit drives based on cvars.
+  // Mounts the devkit drive when force_mount_devkit is set.
   void MountStandardDrives();
+
+  // Maps DEVKIT: and e: to the devkit folder under the storage root unless
+  // they're already mapped.
+  bool MountDevkitDrive();
 
   // Terminates the currently running title.
   X_STATUS TerminateTitle();
@@ -630,6 +634,9 @@ class Emulator {
 
   // Applies the media_type cvar override, if any.
   void SetDeploymentType(XDeploymentType detected_type);
+
+  // Empties the title's cache: volume when it formats a cache partition.
+  void EmptyTitleCache();
 
   X_STATUS CompleteLaunch(const std::filesystem::path& path,
                           const std::string_view module_path);
