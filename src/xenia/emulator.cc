@@ -1530,8 +1530,8 @@ X_STATUS Emulator::InstallContentPackage(
 
   vfs::VirtualFileSystem::ExtractContentHeader(device.get(), header_path);
 
-  // Lambda to handle cleanup - defined once, used in both cancellation paths
-  auto cleanup_and_fail = [&]() {
+  // Removes the partial install and reports the failure.
+  auto cleanup_and_fail = [&](X_STATUS result, std::string_view message) {
     std::error_code ec;
     bool cleanup_failed = false;
 
@@ -1551,16 +1551,16 @@ X_STATUS Emulator::InstallContentPackage(
 
     // Set state AFTER cleanup is done, so dialog doesn't pop up prematurely
     std::lock_guard<std::mutex> lock(*installation_info.mutex_);
-    installation_info.installation_result_ = X_ERROR_CANCELLED;
+    installation_info.installation_result_ = result;
     installation_info.installation_error_message_ =
-        cleanup_failed ? "Installation cancelled (cleanup failed)"
-                       : "Installation cancelled";
+        cleanup_failed ? fmt::format("{} (cleanup failed)", message)
+                       : std::string(message);
     installation_info.installation_state_ = InstallState::failed;
   };
 
   // Check for cancellation before extracting files
   if (installation_info.cancelled_.load()) {
-    cleanup_and_fail();
+    cleanup_and_fail(X_ERROR_CANCELLED, "Installation cancelled");
     return X_ERROR_CANCELLED;
   }
 
@@ -1571,13 +1571,15 @@ X_STATUS Emulator::InstallContentPackage(
 
   // Check for cancellation after extraction
   if (installation_info.cancelled_.load() || error_code == X_ERROR_CANCELLED) {
-    cleanup_and_fail();
+    cleanup_and_fail(X_ERROR_CANCELLED, "Installation cancelled");
     return X_ERROR_CANCELLED;
   }
 
+  // A partial install can't be used.
   if (error_code != X_ERROR_SUCCESS) {
-    std::lock_guard<std::mutex> lock(*installation_info.mutex_);
-    installation_info.installation_state_ = InstallState::failed;
+    cleanup_and_fail(error_code, error_code == X_STATUS_END_OF_FILE
+                                     ? "Package is damaged!"
+                                     : "Failed to extract package!");
     return error_code;
   }
 
@@ -2747,14 +2749,25 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
     return X_STATUS_NOT_SUPPORTED;
   }
 
-  X_RESULT result = kernel_state_->ApplyTitleUpdate(module);
-  if (XFAILED(result)) {
-    XELOGE("Failed to apply title update! Cannot run module {}",
+  // A patch that fails part way leaves the module unusable so it's loaded
+  // again and runs without the update.
+  if (XFAILED(kernel_state_->ApplyTitleUpdate(module))) {
+    XELOGE("Failed to apply title update, starting {} without it",
            xe::strip_pii(xe::path_to_utf8(path)));
-    return result;
+    kernel_state_->UnloadUserModule(module, false);
+    kernel_state_->content_manager()->CloseContent("UPDATE");
+    // Its image is freed with its last reference, which has to go before the
+    // reload maps the image at the same address.
+    module = nullptr;
+    module = kernel_state_->LoadUserModule(module_path);
+    if (!module) {
+      XELOGE("Failed to load user module {}",
+             xe::strip_pii(xe::path_to_utf8(path)));
+      return X_STATUS_NOT_FOUND;
+    }
   }
 
-  result = kernel_state_->FinishLoadingUserModule(module);
+  X_RESULT result = kernel_state_->FinishLoadingUserModule(module);
   if (XFAILED(result)) {
     XELOGE("Failed to initialize user module {}",
            xe::strip_pii(xe::path_to_utf8(path)));
