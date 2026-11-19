@@ -749,6 +749,110 @@ struct VECTOR_SHR_V128
 EMITTER_OPCODE_TABLE(OPCODE_VECTOR_SHR, VECTOR_SHR_V128);
 
 // ============================================================================
+// OPCODE_VECTOR_SHL_BITS, OPCODE_VECTOR_SHR_BITS
+// ============================================================================
+// The whole vector shifted by count bits, for counts that agree: each word's
+// own shift ORed with the bits of the word next to it, as the guest bytes of a
+// word run from most to least significant.
+static void EmitShiftBitsUniform(A64Emitter& e, int d, int s, bool left,
+                                 uint8_t count) {
+  if (!count) {
+    if (d != s) {
+      e.mov(VReg(d).b16, VReg(s).b16);
+    }
+    return;
+  }
+  if (s < 4) {
+    // A constant landed in the scratch bank the shifts below clobber.
+    e.mov(VReg(3).b16, VReg(s).b16);
+    s = 3;
+  }
+  // The neighbour's bits first, as d may be s
+  if (left) {
+    e.ushr(VReg(0).s4, VReg(s).s4, 32 - count);
+    e.shl(VReg(d).s4, VReg(s).s4, count);
+    e.movi(VReg(1).s4, 0);
+    e.ext(VReg(0).b16, VReg(0).b16, VReg(1).b16, 4);
+  } else {
+    e.shl(VReg(0).s4, VReg(s).s4, 32 - count);
+    e.ushr(VReg(d).s4, VReg(s).s4, count);
+    e.movi(VReg(1).s4, 0);
+    e.ext(VReg(0).b16, VReg(1).b16, VReg(0).b16, 12);
+  }
+  e.orr(VReg(d).b16, VReg(d).b16, VReg(0).b16);
+}
+
+// Each byte by its own count: the byte shifted by it, ORed with its neighbour
+// shifted the other way by 8 - count. ushl shifts right for a negative count
+// and gives 0 for a count of 8. tbl fetches the neighbours, and an index past
+// the end gives the 0 beyond the first or last byte.
+template <typename ARGS>
+static void EmitShiftBitsPerByte(A64Emitter& e, const ARGS& i, bool left) {
+  const int s = SrcVReg(e, i.src1, 0);
+  const int c = SrcVReg(e, i.src2, 1);
+  const int d = i.dest.reg().getIdx();
+  vec128_t neighbours;
+  for (int h = 0; h < 16; ++h) {
+    const int g = (h ^ 3) + (left ? 1 : -1);
+    neighbours.u8[h] = g >= 0 && g < 16 ? uint8_t(g ^ 3) : 0xFF;
+  }
+  e.movi(VReg(2).b16, 7);
+  e.and_(VReg(2).b16, VReg(c).b16, VReg(2).b16);
+  LoadV128Const(e, 3, neighbours);
+  e.tbl(VReg(3).b16, VReg(s).b16, 1, VReg(3).b16);
+  if (left) {
+    e.ushl(VReg(1).b16, VReg(s).b16, VReg(2).b16);
+    e.movi(VReg(0).b16, 8);
+    e.sub(VReg(2).b16, VReg(2).b16, VReg(0).b16);
+  } else {
+    e.neg(VReg(1).b16, VReg(2).b16);
+    e.ushl(VReg(1).b16, VReg(s).b16, VReg(1).b16);
+    e.movi(VReg(0).b16, 8);
+    e.sub(VReg(2).b16, VReg(0).b16, VReg(2).b16);
+  }
+  e.ushl(VReg(3).b16, VReg(3).b16, VReg(2).b16);
+  e.orr(VReg(d).b16, VReg(1).b16, VReg(3).b16);
+}
+
+// Counts known to agree take the whole-vector shift; the rest the per-byte
+// one, which is as fast for counts known only at run time.
+template <typename ARGS>
+static void EmitShiftBits(A64Emitter& e, const ARGS& i, bool left) {
+  if (i.src2.is_constant) {
+    const vec128_t counts = i.src2.constant();
+    const uint8_t count = counts.u8[0] & 7;
+    bool uniform = true;
+    for (int k = 1; k < 16; ++k) {
+      uniform &= (counts.u8[k] & 7) == count;
+    }
+    if (uniform) {
+      EmitShiftBitsUniform(e, i.dest.reg().getIdx(), SrcVReg(e, i.src1, 0),
+                           left, count);
+      return;
+    }
+  }
+  EmitShiftBitsPerByte(e, i, left);
+}
+
+struct VECTOR_SHL_BITS_V128
+    : Sequence<VECTOR_SHL_BITS_V128,
+               I<OPCODE_VECTOR_SHL_BITS, V128Op, V128Op, V128Op>> {
+  static void Emit(A64Emitter& e, const EmitArgType& i) {
+    EmitShiftBits(e, i, true);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_VECTOR_SHL_BITS, VECTOR_SHL_BITS_V128);
+
+struct VECTOR_SHR_BITS_V128
+    : Sequence<VECTOR_SHR_BITS_V128,
+               I<OPCODE_VECTOR_SHR_BITS, V128Op, V128Op, V128Op>> {
+  static void Emit(A64Emitter& e, const EmitArgType& i) {
+    EmitShiftBits(e, i, false);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_VECTOR_SHR_BITS, VECTOR_SHR_BITS_V128);
+
+// ============================================================================
 // OPCODE_VECTOR_SHA (arithmetic right shift)
 // ============================================================================
 struct VECTOR_SHA_V128
@@ -1313,14 +1417,13 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
   }
   // Inline Xenos float→half conversion for 4 float32 lanes in v0.
   // Xenos half saturates to 0x7FFF instead of producing IEEE inf/NaN.
-  // Denormals flush to zero (preserve_denormal=false).
-  // If round_to_even is true, applies round-to-nearest-even before truncation.
+  // Denormals flush to zero (preserve_denormal=false) and the mantissa is
+  // truncated.
   // Result: 4 halfwords in the low 16 bits of each 32-bit lane in v1.
   // Clobbers v0-v3, w0 and `tmp`, which holds the sign across the conversion
   // because v0-v3 are all in use. The caller's dest serves: it is written only
   // once the conversion is done.
-  static void EmitFloatToXenosHalf4(A64Emitter& e, bool round_to_even,
-                                    int tmp) {
+  static void EmitFloatToXenosHalf4(A64Emitter& e, int tmp) {
     // v0 = input float32 bits.  Extract sign, compute abs.
     e.ushr(VReg(tmp).s4, VReg(0).s4, 31);
     e.shl(VReg(tmp).s4, VReg(tmp).s4, 15);  // tmp = sign at bit 15
@@ -1333,16 +1436,6 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     // result = abs + 0xC8000000 (subtract 112 from float exponent, unsigned)
     LoadV128Const(e, 2, vec128i(0xC8000000u));
     e.add(VReg(2).s4, VReg(0).s4, VReg(2).s4);  // v2 = rebiased
-
-    if (round_to_even) {
-      // Round to nearest even: result += 0xFFF + ((result >> 13) & 1)
-      e.ushr(VReg(3).s4, VReg(2).s4, 13);
-      e.movi(VReg(1).s4, 1);
-      e.and_(VReg(3).b16, VReg(3).b16, VReg(1).b16);  // (result>>13)&1
-      LoadV128Const(e, 1, vec128i(0xFFFu));
-      e.add(VReg(3).s4, VReg(3).s4, VReg(1).s4);  // 0xFFF + bit
-      e.add(VReg(2).s4, VReg(2).s4, VReg(3).s4);  // rounded
-    }
 
     // Shift and mask to 15 bits.
     e.ushr(VReg(2).s4, VReg(2).s4, 13);
@@ -1377,7 +1470,7 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     int s = i.src1.reg().getIdx();
     int d = i.dest.reg().getIdx();
     e.mov(VReg(0).b16, VReg(s).b16);
-    EmitFloatToXenosHalf4(e, false, d);
+    EmitFloatToXenosHalf4(e, d);
     // v1 has halfs in s[0..3].  FLOAT16_2 uses only lanes 0,1.
     // Output: h[7]=half(f32[0]), h[6]=half(f32[1]), rest=0.
     // Narrow to halfwords, swap within word pairs, place at top of vector.
@@ -1392,7 +1485,7 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
       vec128_t result = {};
       for (int idx = 0; idx < 4; ++idx) {
         result.u16[7 - (idx ^ 2)] =
-            float_to_xenos_half(i.src1.constant().f32[idx], false, true);
+            float_to_xenos_half(i.src1.constant().f32[idx]);
       }
       LoadV128Const(e, i.dest.reg().getIdx(), result);
       return;
@@ -1400,7 +1493,7 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     int s = i.src1.reg().getIdx();
     int d = i.dest.reg().getIdx();
     e.mov(VReg(0).b16, VReg(s).b16);
-    EmitFloatToXenosHalf4(e, true, d);
+    EmitFloatToXenosHalf4(e, d);
     // v1 has halfs in s[0..3].  Output mapping:
     //   idx0→h[5], idx1→h[4], idx2→h[7], idx3→h[6]
     // = upper 64 bits with within-word swap, lower 64 bits zero.

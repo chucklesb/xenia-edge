@@ -579,11 +579,13 @@ void PPCHIRBuilder::UpdateFPSCR(std::initializer_list<Value*> operands,
   StoreFPSCRSummary(raised, true);
 }
 
-// A denormalized double operand makes the single-precision arithmetic answer
-// with the default QNaN and raise nothing at all. Divide and square root do not
-// do it, and a NaN or infinite operand takes precedence, so this asks for every
-// operand finite and at least one of them denormal.
-Value* PPCHIRBuilder::SingleDenormalOperand(
+// An operand outside the single range, nonzero and below 2^-149 (denormal
+// doubles among them) or from 2^128 up, makes the single-precision add,
+// multiply and multiply-add answer with the default QNaN and raise nothing at
+// all; divide and square root keep the unrounded double instead. A NaN or
+// infinite operand takes precedence, so this asks for every operand finite and
+// at least one of them out of range.
+Value* PPCHIRBuilder::SingleOutOfRangeOperand(
     std::initializer_list<Value*> operands) {
   Value* ops[3] = {nullptr, nullptr, nullptr};
   int count = 0;
@@ -594,22 +596,28 @@ Value* PPCHIRBuilder::SingleDenormalOperand(
   for (; count < 3; ++count) {
     ops[count] = ops[count - 1];
   }
-  return DenormalQuirk(ops[0], ops[1], ops[2]);
+  return SingleRangeQuirk(ops[0], ops[1], ops[2]);
 }
 
-Value* PPCHIRBuilder::ApplySingleDenormalOperand(Value* quirk, Value* result) {
+Value* PPCHIRBuilder::ApplySingleOutOfRangeOperand(Value* quirk,
+                                                   Value* result) {
   return Select(quirk,
                 Cast(LoadConstantUint64(0x7FF8000000000000ull), FLOAT64_TYPE),
                 result);
+}
+
+uint32_t PPCHIRBuilder::SingleRangeFlag(bool update_cr1) const {
+  return update_cr1 ? 0 : ARITHMETIC_SINGLE_RANGE;
 }
 
 Value* PPCHIRBuilder::SnapshotFpExceptions(bool update_cr1) {
   return update_cr1 ? LoadFpExceptions() : nullptr;
 }
 
-// The rounding to single never happened for a denormal operand, so what it
-// would have raised is not reported either. The host status is cumulative, so
-// the snapshot taken before it is the whole answer for that case.
+// The rounding to single never happened for an operand outside the single
+// range, so what it would have raised is not reported either. The host status
+// is cumulative, so the snapshot taken before it is the whole answer for that
+// case.
 void PPCHIRBuilder::UpdateFPSCRForUnroundedSingle(
     std::initializer_list<Value*> operands, bool update_cr1, Value* quirk,
     Value* before_rounding) {
@@ -695,7 +703,7 @@ void PPCHIRBuilder::UpdateFPSCRForConvertToInteger(Value* b,
   // Invalid is what the target range cannot hold, measured on the rounded
   // value: truncating 2^31 - 0.5 stays in range where rounding it up does
   // not. The limit is the power of two just past the maximum, which leaves
-  // the minimum itself in range. The NaNs never reach here.
+  // the minimum itself in range. A NaN's invalid comes from the conversion.
   Value* rounded = Round(b, round_mode);
   double limit = to_int64 ? 9223372036854775808.0 : 2147483648.0;
   Value* out_of_range = Or(CompareSGE(rounded, LoadConstantFloat64(limit)),
@@ -703,14 +711,6 @@ void PPCHIRBuilder::UpdateFPSCRForConvertToInteger(Value* b,
   Value* raised = Or(LoadFpExceptions(),
                      FpExceptionBit(*this, out_of_range, FP_EXCEPTION_INVALID));
   StoreFPSCRSummary(raised, true);
-}
-
-void PPCHIRBuilder::SetFPSCRInvalid(bool update_cr1) {
-  if (!update_cr1) {
-    ClearFPSCRExceptions(false);
-    return;
-  }
-  StoreFPSCRSummary(LoadConstantUint32(FP_EXCEPTION_INVALID), true);
 }
 
 void PPCHIRBuilder::CopyFPSCRToCR1() {
@@ -726,16 +726,16 @@ void PPCHIRBuilder::CopyFPSCRToCR1() {
                And(Truncate(Shr(fpscr, 28), INT8_TYPE), LoadConstantInt8(1)));
 }
 
-// SO is bit 31, OV bit 30, CA bit 29, with no byte count modelled.
+// SO is bit 31, OV bit 30, CA bit 29 and the byte count bits 0-6.
 Value* PPCHIRBuilder::LoadXER() {
   Value* v = Shl(ZeroExtend(LoadCA(), INT64_TYPE), 29);
   v = Or(v, Shl(ZeroExtend(LoadContext(offsetof(PPCContext, xer_ov), INT8_TYPE),
                            INT64_TYPE),
                 30));
-  return Or(v,
-            Shl(ZeroExtend(LoadContext(offsetof(PPCContext, xer_so), INT8_TYPE),
+  v = Or(v, Shl(ZeroExtend(LoadContext(offsetof(PPCContext, xer_so), INT8_TYPE),
                            INT64_TYPE),
                 31));
+  return Or(v, LoadXERCount());
 }
 
 void PPCHIRBuilder::StoreXER(Value* value) {
@@ -744,6 +744,13 @@ void PPCHIRBuilder::StoreXER(Value* value) {
                Truncate(And(Shr(value, 30), LoadConstantInt64(1)), INT8_TYPE));
   StoreContext(offsetof(PPCContext, xer_so),
                Truncate(And(Shr(value, 31), LoadConstantInt64(1)), INT8_TYPE));
+  StoreContext(offsetof(PPCContext, xer_count),
+               Truncate(And(value, LoadConstantInt64(0x7F)), INT8_TYPE));
+}
+
+Value* PPCHIRBuilder::LoadXERCount() {
+  return ZeroExtend(LoadContext(offsetof(PPCContext, xer_count), INT8_TYPE),
+                    INT64_TYPE);
 }
 
 void PPCHIRBuilder::StoreOV(Value* value) {

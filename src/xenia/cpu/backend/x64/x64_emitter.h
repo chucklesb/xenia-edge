@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_BACKEND_X64_X64_EMITTER_H_
 #define XENIA_CPU_BACKEND_X64_X64_EMITTER_H_
 
+#include <deque>
 #include <vector>
 
 #include "xenia/base/arena.h"
@@ -170,20 +171,46 @@ enum XmmConst {
   XMMXOPByteShiftMask,
   XMMXOPWordShiftMask,
   XMMXOPDwordShiftMask,
-  XMMVSRShlByteshuf,
-  XMMVSRMask,
-  // vexptefp/vlogefp. The guest ops are 11-bit estimates, so the results get
-  // snapped to a 2^-11 grid; these polynomials only have to beat that.
-  XMMExp2Poly,                    // 6 entries, 2^f minimax on [0,1)
-  XMMLog2Poly = XMMExp2Poly + 6,  // 7 entries, log2(1+u) minimax on [0,1]
-  XMMEstScale = XMMLog2Poly + 7,  // 2048.0f
-  XMMEstUnscale,                  // 1.0f / 2048.0f
-  XMMExp2Max,                     // 128.0f, at or above this 2^x is inf
-  XMMExp2Min,                     // -126.0f, below this 2^x is flushed to 0
-  XMMQuietBit,                    // 0x00400000
-  XMMFloatNegInf,                 // 0xFF800000
-  XMMMantissaMask,                // 0x007FFFFF
-  XMMVRsqrteTableStart,
+  // For vsl and vsr, see EmitShiftBitsPerByte
+  XMMShiftBitsPowers,
+  XMMShiftBitsInversePowers,
+  XMMShlBitsEvenWindows,
+  XMMShlBitsOddWindows,
+  XMMShrBitsEvenWindows,
+  XMMShiftBitsEvenCounts,
+  XMMShiftBitsOddCounts,
+  XMMShiftBitsHighBytes,
+  XMMQuietBit,  // 0x00400000
+  // Clears the bits of a double below single precision, so converting it to
+  // single rounds toward zero
+  XMMDoubleToSingleTruncateMask,
+  // For ARITHMETIC_SINGLE_RANGE, see EmitSingleRangeCheck
+  XMMSingleRangeBias,
+  XMMSingleRangeLimit,
+  // For vmsum3fp128 and vmsum4fp128, see EmitVectorMultiplySum
+  XMMVmsumInverseGridBase,
+  XMMVmsumGridSum,
+  XMMVmsum3Adjust,  // 4 entries, by the number of negative products
+  XMMVmsum4Adjust = XMMVmsum3Adjust + 4,  // 5 entries
+  // For the inline vrefp, see RECIP_V128
+  XMMVRefpStepMask = XMMVmsum4Adjust + 5,
+  XMMVRefpSlopeMask,
+  XMMVRefpMantissaMask,
+  XMMVRefpExponentBias,
+  XMMVRefpLargeLimit,
+  XMMVRefpSmallestNormal,
+  // For the inline vlogefp and vexptefp, see LOG2_V128 and POW2_V128
+  XMMEstimateIndexMask,
+  XMMEstimateExponentMask,
+  XMMVLogeExponentBias,
+  XMMVLogeScale,
+  XMMVLogeZeroResult,
+  XMMVExpteShiftBase,
+  XMMVExpteExponentBias,
+  XMMVExpteSmallestExponent,
+  XMMVExpteLargestInputExponent,
+  XMMVRefpTable,
+  XMMVRsqrteTableStart = XMMVRefpTable + (32 / 4),
   XMMVRsqrteTableBase =
       XMMVRsqrteTableStart +
       (32 /
@@ -325,6 +352,8 @@ class X64Emitter : public Xbyak::CodeGenerator {
     return (feature_flags_ & feature_flag) == feature_flag;
   }
 
+  // The label stays valid for the whole function, even as more tails are
+  // added, and a tail's callback may add tails of its own.
   Xbyak::Label& AddToTail(TailEmitCallback callback, uint32_t alignment = 0);
   Xbyak::Label& NewCachedLabel();
 
@@ -458,7 +487,8 @@ class X64Emitter : public Xbyak::CodeGenerator {
     which would have to represent 0 as 4 bytes
   */
   bool may_use_membase32_as_zero_reg_;
-  std::vector<TailEmitter> tail_code_;
+  // A deque, so adding a tail doesn't move the labels already handed out
+  std::deque<TailEmitter> tail_code_;
   std::vector<Xbyak::Label*>
       label_cache_;  // for creating labels that need to be referenced much
                      // later by tail emitters

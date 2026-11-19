@@ -77,13 +77,18 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   // As UpdateFPSCR, plus the 0 x inf the host is allowed to leave unsignalled.
   void UpdateFPSCRForMultiplyAdd(Value* a, Value* c, Value* b, bool update_cr1,
                                  Value* suppress = nullptr);
-  // The single-precision quirk: a denormalized operand answers with the
-  // default QNaN and raises nothing. Feed the condition to both of the above.
-  Value* SingleDenormalOperand(std::initializer_list<Value*> operands);
-  Value* ApplySingleDenormalOperand(Value* quirk, Value* result);
-  // Divide and square root take the other half of the quirk: a denormalized
-  // operand skips the rounding to single instead. Snapshot the status between
-  // the arithmetic and the rounding, then hand both to the update.
+  // The single-precision quirk: an operand outside the single range answers
+  // with the default QNaN and raises nothing. Feed the condition to both of the
+  // above.
+  Value* SingleOutOfRangeOperand(std::initializer_list<Value*> operands);
+  Value* ApplySingleOutOfRangeOperand(Value* quirk, Value* result);
+  // ARITHMETIC_SINGLE_RANGE, for the operation to apply the quirk itself,
+  // unless it's a recording form, which needs the condition as well.
+  uint32_t SingleRangeFlag(bool update_cr1) const;
+  // Divide and square root take the other half of the quirk: an operand
+  // outside the single range skips the rounding to single instead. Snapshot the
+  // status between the arithmetic and the rounding, then hand both to the
+  // update.
   Value* SnapshotFpExceptions(bool update_cr1);
   void UpdateFPSCRForUnroundedSingle(std::initializer_list<Value*> operands,
                                      bool update_cr1, Value* quirk,
@@ -94,11 +99,11 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   // not report: x64 clamps the operand before converting.
   void UpdateFPSCRForConvertToInteger(Value* b, hir::RoundMode round_mode,
                                       bool to_int64, bool update_cr1);
-  // For the paths whose answer is invalid and nothing else.
-  void SetFPSCRInvalid(bool update_cr1);
   void CopyFPSCRToCR1();
   Value* LoadXER();
   void StoreXER(Value* value);
+  // XER[25:31] as an INT64
+  Value* LoadXERCount();
   // Call before UpdateCR, which copies XER[SO] into the CR field.
   void StoreOV(Value* value);
   Value* LoadCA();

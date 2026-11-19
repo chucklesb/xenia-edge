@@ -55,14 +55,15 @@ Value* SignedDivDidOverflow(PPCHIRBuilder& f, Value* dividend, Value* divisor,
                     f.CompareEQ(divisor, f.Not(f.LoadZero(divisor->type)))));
 }
 
-// https://github.com/sebastianbiallas/pearpc/blob/0b3c823f61456faa677f6209545a7b906e797421/src/cpu/cpu_generic/ppc_tools.h#L26
 Value* AddWithCarryDidCarry(PPCHIRBuilder& f, Value* v1, Value* v2, Value* v3) {
-  v1 = f.Truncate(v1, INT32_TYPE);
-  v2 = f.Truncate(v2, INT32_TYPE);
   assert_true(v3->type == INT8_TYPE);
-  v3 = f.ZeroExtend(v3, INT32_TYPE);
-  Value* sum = f.Add(v1, v2);
-  return f.Or(f.CompareULT(f.Add(sum, v3), v3), f.CompareULT(sum, v1));
+  // The carry out of bit 31 is bit 32 of the low words' sum, zero extended:
+  // two adds and a shift, with no compares
+  Value* sum =
+      f.Add(f.Add(f.ZeroExtend(f.Truncate(v1, INT32_TYPE), INT64_TYPE),
+                  f.ZeroExtend(f.Truncate(v2, INT32_TYPE), INT64_TYPE)),
+            f.ZeroExtend(v3, INT64_TYPE));
+  return f.Truncate(f.Shr(sum, 32), INT8_TYPE);
 }
 
 int InstrEmit_addx(PPCHIRBuilder& f, const InstrData& i) {
@@ -286,10 +287,8 @@ int InstrEmit_divwux(PPCHIRBuilder& f, const InstrData& i) {
 
 int InstrEmit_mulhdx(PPCHIRBuilder& f, const InstrData& i) {
   // RT <- ((RA) × (RB) as 128)[0:63]
-  if (i.XO.OE) {
-    // With XER update.
-    XEINSTRNOTIMPLEMENTED();
-  }
+  // Bit 21 (OE) is reserved here: the OE forms act like the plain ones and
+  // leave XER alone.
   Value* v = f.MulHi(f.LoadGPR(i.XO.RA), f.LoadGPR(i.XO.RB));
   f.StoreGPR(i.XO.RT, v);
   if (i.XO.Rc) {
@@ -300,10 +299,8 @@ int InstrEmit_mulhdx(PPCHIRBuilder& f, const InstrData& i) {
 
 int InstrEmit_mulhdux(PPCHIRBuilder& f, const InstrData& i) {
   // RT <- ((RA) × (RB) as 128)[0:63]
-  if (i.XO.OE) {
-    // With XER update.
-    XEINSTRNOTIMPLEMENTED();
-  }
+  // Bit 21 (OE) is reserved here: the OE forms act like the plain ones and
+  // leave XER alone.
   Value* v =
       f.MulHi(f.LoadGPR(i.XO.RA), f.LoadGPR(i.XO.RB), ARITHMETIC_UNSIGNED);
   f.StoreGPR(i.XO.RT, v);
@@ -315,10 +312,8 @@ int InstrEmit_mulhdux(PPCHIRBuilder& f, const InstrData& i) {
 
 int InstrEmit_mulhwx(PPCHIRBuilder& f, const InstrData& i) {
   // RT[32:64] <- ((RA)[32:63] × (RB)[32:63])[0:31]
-  if (i.XO.OE) {
-    // With XER update.
-    XEINSTRNOTIMPLEMENTED();
-  }
+  // Bit 21 (OE) is reserved here: the OE forms act like the plain ones and
+  // leave XER alone.
   Value* ratrunc =
       f.SignExtend(f.Truncate(f.LoadGPR(i.XO.RA), INT32_TYPE), INT64_TYPE);
 
@@ -336,10 +331,8 @@ int InstrEmit_mulhwx(PPCHIRBuilder& f, const InstrData& i) {
 
 int InstrEmit_mulhwux(PPCHIRBuilder& f, const InstrData& i) {
   // RT[32:64] <- ((RA)[32:63] × (RB)[32:63])[0:31]
-  if (i.XO.OE) {
-    // With XER update.
-    XEINSTRNOTIMPLEMENTED();
-  }
+  // Bit 21 (OE) is reserved here: the OE forms act like the plain ones and
+  // leave XER alone.
 
   Value* ratrunc =
       f.ZeroExtend(f.Truncate(f.LoadGPR(i.XO.RA), INT32_TYPE), INT64_TYPE);

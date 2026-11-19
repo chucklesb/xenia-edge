@@ -333,7 +333,9 @@ bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
   PopStackpoint();
   ret();
   // todo: do some kind of sorting by alignment?
-  for (auto&& tail_item : tail_code_) {
+  // By index, so tails that a tail's callback adds are emitted too
+  for (size_t i = 0; i < tail_code_.size(); i++) {
+    TailEmitter& tail_item = tail_code_[i];
     if (tail_item.alignment) {
       align(tail_item.alignment);
     }
@@ -1668,8 +1670,8 @@ static constinit const vec128_t xmm_consts[] = {
         */
     vec128q(0x7fe000007fe000ULL),
 
-    /* XMMF16PackLCPI0 (bias + round-half-down) */
-    vec128i(0x8000FFF),
+    /* XMMF16PackLCPI0 (exponent bias) */
+    vec128i(0x8000000),
     /*XMMF16PackLCPI2*/
     vec128i(0x47ffe000),
     /*XMMF16PackLCPI3*/
@@ -1689,39 +1691,95 @@ static constinit const vec128_t xmm_consts[] = {
     vec128s(15),
     /*XMMXOPDwordShiftMask*/
     vec128i(31),
-    /*XMMVSRShlByteshuf*/
-    v128_setr_bytes(13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3, 0x80),
-    // XMMVSRMask
-    vec128b(1),
-    // XMMExp2Poly, 2^f on [0,1), max relative error 7.7e-08
-    vec128f(0.9999999266823865f),
-    vec128f(0.6931530239113992f),
-    vec128f(0.24015381838022493f),
-    vec128f(0.055826172900559086f),
-    vec128f(0.008989127362479102f),
-    vec128f(0.0018777841277241077f),
-    // XMMLog2Poly, log2(1+u) on [0,1], max absolute error 1.85e-06
-    vec128f(1.8456866772102942e-06f),
-    vec128f(1.4424953159391898f),
-    vec128f(-0.7177910762015521f),
-    vec128f(0.4565216600899004f),
-    vec128f(-0.2765407398023532f),
-    vec128f(0.12100223739860312f),
-    vec128f(-0.025691088797142478f),
-    // XMMEstScale
-    vec128f(2048.0f),
-    // XMMEstUnscale
-    vec128f(1.0f / 2048.0f),
-    // XMMExp2Max
-    vec128f(128.0f),
-    // XMMExp2Min
-    vec128f(-126.0f),
+    // XMMShiftBitsPowers: 2^count by count
+    v128_setr_bytes(1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0),
+    // XMMShiftBitsInversePowers: 2^(7 - count) by count
+    v128_setr_bytes(128, 64, 32, 16, 8, 4, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0),
+    // XMMShlBitsEvenWindows: guest byte 2k high, 2k + 1 low, in word k. Also
+    // vsr's odd windows.
+    v128_setr_bytes(2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13),
+    // XMMShlBitsOddWindows: guest byte 2k + 1 high, 2k + 2 low
+    v128_setr_bytes(1, 2, 7, 0, 5, 6, 11, 4, 9, 10, 15, 8, 13, 14, 0x80, 12),
+    // XMMShrBitsEvenWindows: guest byte 2k - 1 high, 2k low
+    v128_setr_bytes(3, 0x80, 1, 2, 7, 0, 5, 6, 11, 4, 9, 10, 15, 8, 13, 14),
+    // XMMShiftBitsEvenCounts: guest byte 2k in word k, zero-extended
+    v128_setr_bytes(3, 0x80, 1, 0x80, 7, 0x80, 5, 0x80, 11, 0x80, 9, 0x80, 15,
+                    0x80, 13, 0x80),
+    // XMMShiftBitsOddCounts: guest byte 2k + 1 in word k, zero-extended
+    v128_setr_bytes(2, 0x80, 0, 0x80, 6, 0x80, 4, 0x80, 10, 0x80, 8, 0x80, 14,
+                    0x80, 12, 0x80),
+    // XMMShiftBitsHighBytes
+    vec128s(0xFF00),
     // XMMQuietBit
     vec128i(0x00400000u),
-    // XMMFloatNegInf
-    vec128i(0xFF800000u),
-    // XMMMantissaMask
-    vec128i(0x007FFFFFu),
+    // XMMDoubleToSingleTruncateMask
+    vec128q(0xFFFFFFFFE0000000ull),
+    // XMMSingleRangeBias: takes a double's bits without the sign, shifted up
+    // by one, from 2^-149 up to the smallest signed value
+    vec128q(0x12C0000000000000ull),
+    // XMMSingleRangeLimit: the last of them below 2^128
+    vec128q(0xA29FFFFFFFFFFFFFull),
+    // XMMVmsumInverseGridBase: 1023 + 28 + 254, the biased exponent of the
+    // inverse grid plus the exponent sum
+    vec128i(1305),
+    // XMMVmsumGridSum: the grid's and the inverse grid's exponent fields add
+    // up to 2046
+    vec128q(2046ull << 52),
+    // XMMVmsum3Adjust and XMMVmsum4Adjust: -s * k and -s, for s the majority
+    // sign and k the number of products of the other sign, by the number of
+    // negative products
+    vec128q(0x8000000000000000ull, 0xBFF0000000000000ull),  // -0, -1
+    vec128q(0xBFF0000000000000ull, 0xBFF0000000000000ull),  // -1, -1
+    vec128q(0x3FF0000000000000ull, 0x3FF0000000000000ull),  // 1, 1
+    vec128q(0x8000000000000000ull, 0x3FF0000000000000ull),  // -0, 1
+    vec128q(0x8000000000000000ull, 0xBFF0000000000000ull),  // -0, -1
+    vec128q(0xBFF0000000000000ull, 0xBFF0000000000000ull),  // -1, -1
+    vec128q(0xC000000000000000ull, 0xBFF0000000000000ull),  // -2, -1
+    vec128q(0x3FF0000000000000ull, 0x3FF0000000000000ull),  // 1, 1
+    vec128q(0x8000000000000000ull, 0x3FF0000000000000ull),  // -0, 1
+    // XMMVRefpStepMask
+    vec128i(0x1FF),
+    // XMMVRefpSlopeMask
+    vec128i(0xFFFF),
+    // XMMVRefpMantissaMask
+    vec128i(0x7FFFFF),
+    // XMMVRefpExponentBias: 253 << 23
+    vec128i(0x7E800000),
+    // XMMVRefpLargeLimit: above it, the result is too small and flushes
+    vec128i(0x7E7FFFFF),
+    // XMMVRefpSmallestNormal
+    vec128i(0x00800000),
+    // XMMEstimateIndexMask: the 11 bits that index the vlogefp and vexptefp
+    // tables
+    vec128i(0x7FF),
+    // XMMEstimateExponentMask
+    vec128i(0xFF),
+    // XMMVLogeExponentBias
+    vec128i(127),
+    // XMMVLogeScale: the result is in 2048ths
+    vec128f(1.0f / 2048.0f),
+    // XMMVLogeZeroResult: -infinity
+    vec128i(0xFF800000),
+    // XMMVExpteShiftBase: the mantissa shifts right by this minus the
+    // exponent, for 15 fraction bits
+    vec128i(135),
+    // XMMVExpteExponentBias: 127, less the table's implicit bit
+    vec128i(126),
+    // XMMVExpteSmallestExponent: below it, the result flushes to zero
+    vec128i(static_cast<uint32_t>(-126)),
+    // XMMVExpteLargestInputExponent: above it (from 128 up), the result is
+    // infinity, or zero for a negative input
+    vec128i(133),
+    // XMMVRefpTable: base >> 9 in the upper half, slope in the lower, for the
+    // segments of ppc_estimates.cc's kReciprocalBase and kReciprocalSlope
+    v128_setr_words(0x7FFC03E1, 0x7C1C03A7, 0x78750371, 0x75040340),
+    v128_setr_words(0x71C40313, 0x6EB102EA, 0x6BC802C4, 0x690402A0),
+    v128_setr_words(0x6664027F, 0x63E50261, 0x61840245, 0x5F40022A),
+    v128_setr_words(0x5D160212, 0x5B0401FB, 0x590A01E5, 0x572501D1),
+    v128_setr_words(0x555401BE, 0x539601AC, 0x51EB019B, 0x504F018B),
+    v128_setr_words(0x4EC4017C, 0x4D48016E, 0x4BD7015B, 0x4A7C015B),
+    v128_setr_words(0x49220143, 0x47DF0143, 0x469C012D, 0x456F012D),
+    v128_setr_words(0x4442011A, 0x4328011A, 0x420E0108, 0x41060106),
     // XMMVRsqrteTableStart
     v128_setr_words(0x568B4FD, 0x4F3AF97, 0x48DAAA5, 0x435A618),
     v128_setr_words(0x3E7A1E4, 0x3A29DFE, 0x3659A5C, 0x32E96F8),
@@ -2040,8 +2098,6 @@ void X64Emitter::LoadConstantXmm(Xbyak::Xmm dest, const vec128_t& v) {
       return;
     }
 
-    // TODO(benvanik): see what other common values are.
-    // TODO(benvanik): build constant table - 99% are reused.
     MovMem64(rsp + kStashOffset, v.low);
     MovMem64(rsp + kStashOffset + 8, v.high);
     vmovdqa(dest, ptr[rsp + kStashOffset]);
@@ -2068,8 +2124,6 @@ void X64Emitter::LoadConstantXmm(Xbyak::Xmm dest, float v) {
         return;
       }
     }
-    // TODO(benvanik): see what other common values are.
-    // TODO(benvanik): build constant table - 99% are reused.
     mov(eax, x.i);
     vmovd(dest, eax);
   }
@@ -2095,8 +2149,6 @@ void X64Emitter::LoadConstantXmm(Xbyak::Xmm dest, double v) {
         return;
       }
     }
-    // TODO(benvanik): see what other common values are.
-    // TODO(benvanik): build constant table - 99% are reused.
     mov(rax, x.i);
     vmovq(dest, rax);
   }
