@@ -310,16 +310,15 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
   if (!base_path.empty()) {
     parent_entry = !root_entry ? ResolvePath(base_path)
                                : root_entry->ResolvePath(base_path);
-    if (!parent_entry) {
-      *out_action = FileAction::kDoesNotExist;
-      return X_STATUS_OBJECT_PATH_NOT_FOUND;
+    if (parent_entry) {
+      auto file_name = xe::utf8::find_name_from_guest_path(path);
+      entry = parent_entry->GetChild(file_name);
     }
-
-    auto file_name = xe::utf8::find_name_from_guest_path(path);
-    entry = parent_entry->GetChild(file_name);
-    // A device mounted on a folder of a host device is what the folder's path
-    // names. A raw partition's stand-in in a NullDevice stays what it is.
-    if (!root_entry && dynamic_cast<HostPathEntry*>(parent_entry)) {
+    // A device mounted on a folder of a host device, or on a path whose parent
+    // no device holds, is what the path names. A raw partition's stand-in in a
+    // NullDevice stays what it is.
+    if (!root_entry &&
+        (!parent_entry || dynamic_cast<HostPathEntry*>(parent_entry))) {
       if (Entry* mount_root = ResolveMountRoot(path)) {
         // Replacing it would delete the whole device.
         if (creation_disposition == FileDisposition::kSuperscede ||
@@ -330,6 +329,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
         }
         entry = mount_root;
       }
+    }
+    if (!parent_entry && !entry) {
+      *out_action = FileAction::kDoesNotExist;
+      return X_STATUS_OBJECT_PATH_NOT_FOUND;
     }
   } else if (path.empty() && root_entry) {
     // An empty relative path is the root entry itself. Replacing it would
@@ -442,9 +445,15 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
     }
   }
   if (!entry) {
-    // Create if needed (either new or as a replacement).
-    entry = CreatePath(
-        path, !is_directory ? kFileAttributeNormal : kFileAttributeDirectory);
+    // Create if needed (either new or as a replacement), under the parent
+    // resolved above. CreatePath resolves from the top, which a name relative
+    // to a root handle isn't.
+    const uint32_t attributes =
+        !is_directory ? kFileAttributeNormal : kFileAttributeDirectory;
+    entry = parent_entry
+                ? parent_entry->CreateEntry(
+                      xe::utf8::find_name_from_guest_path(path), attributes)
+                : CreatePath(path, attributes);
     if (!entry) {
       return X_STATUS_ACCESS_DENIED;
     }
