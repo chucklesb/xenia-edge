@@ -149,6 +149,9 @@ struct KernelGuestGlobals {
   // KeQueryBackgroundProcessors and written by KeSetBackgroundProcessors.
   // 0x3C (CPUs 2-5) is the console's boot value.
   xe::be<uint32_t> background_processors;
+
+  // Every loaded module's loader entry, by InLoadOrderLinks, in load order.
+  X_LIST_ENTRY loaded_modules;
 };
 struct DPCImpersonationScope {
   uint8_t previous_irql_;
@@ -255,8 +258,10 @@ class KernelState {
   object_ref<XThread> LaunchModule(object_ref<UserModule> module);
   object_ref<UserModule> GetExecutableModule();
   void SetExecutableModule(object_ref<UserModule> module);
+  // Stores why a module that can't be loaded failed in |out_status|.
   object_ref<UserModule> LoadUserModule(const std::string_view name,
-                                        bool call_entry = true);
+                                        bool call_entry = true,
+                                        X_STATUS* out_status = nullptr);
   object_ref<UserModule> LoadUserModuleFromMemory(const std::string_view name,
                                                   const void* addr,
                                                   const size_t length);
@@ -306,8 +311,6 @@ class KernelState {
   void RegisterNotifyListener(XNotifyListener* listener);
   void UnregisterNotifyListener(XNotifyListener* listener);
   void BroadcastNotification(XNotificationID id, uint32_t data);
-
-  util::NativeList* dpc_list() { return &dpc_list_; }
 
   void CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result);
   // The completion routine runs on thread_handle, the requester's thread.
@@ -459,8 +462,6 @@ class KernelState {
 
   std::atomic<bool> dispatch_thread_running_;
   object_ref<XHostThread> dispatch_thread_;
-  // Must be guarded by the global critical region.
-  util::NativeList dpc_list_;
   // Guards the dispatch queue, which a timer expiry pushes to while a timer
   // cancel holding the global lock can be waiting for it.
   std::mutex dispatch_mutex_;

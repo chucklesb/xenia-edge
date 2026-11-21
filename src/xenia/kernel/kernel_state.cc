@@ -64,7 +64,6 @@ KernelState::KernelState(Emulator* emulator)
     : emulator_(emulator),
       memory_(emulator->memory()),
       dispatch_thread_running_(false),
-      dpc_list_(emulator->memory()),
       kernel_trampoline_group_(emulator->processor()->backend()) {
   assert_null(shared_kernel_state_);
   shared_kernel_state_ = this;
@@ -418,9 +417,38 @@ void KernelState::RemoveTitleTerminateNotification(uint32_t routine) {
   }
 }
 
-void KernelState::RegisterModule(XModule* module) {}
+// Links the module's loader entry onto the end of the loaded module list once,
+// so a title walking InLoadOrderLinks finds every module.
+void KernelState::RegisterModule(XModule* module) {
+  if (!kernel_guest_globals_ || !module->hmodule_ptr()) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  auto ldr_data =
+      memory_->TranslateVirtual<X_LDR_DATA_TABLE_ENTRY*>(module->hmodule_ptr());
+  if (ldr_data->in_load_order_links.flink_ptr) {
+    return;
+  }
+  auto block =
+      memory_->TranslateVirtual<KernelGuestGlobals*>(kernel_guest_globals_);
+  util::XeInsertTailList(&block->loaded_modules, &ldr_data->in_load_order_links,
+                         memory_);
+}
 
-void KernelState::UnregisterModule(XModule* module) {}
+void KernelState::UnregisterModule(XModule* module) {
+  if (!module->hmodule_ptr()) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  auto ldr_data =
+      memory_->TranslateVirtual<X_LDR_DATA_TABLE_ENTRY*>(module->hmodule_ptr());
+  if (!ldr_data->in_load_order_links.flink_ptr) {
+    return;
+  }
+  util::XeRemoveEntryList(&ldr_data->in_load_order_links, memory_);
+  ldr_data->in_load_order_links.flink_ptr = 0;
+  ldr_data->in_load_order_links.blink_ptr = 0;
+}
 
 bool KernelState::RegisterUserModule(object_ref<UserModule> module) {
   auto lock = global_critical_region_.Acquire();
@@ -713,7 +741,7 @@ void KernelState::LoadKernelModule(object_ref<KernelModule> kernel_module) {
 }
 
 object_ref<UserModule> KernelState::LoadUserModule(
-    const std::string_view raw_name, bool call_entry) {
+    const std::string_view raw_name, bool call_entry, X_STATUS* out_status) {
   // Some games try to load relative to launch module, others specify full path.
   auto name = xe::utf8::find_name_from_guest_path(raw_name);
   std::string path(raw_name);
@@ -749,6 +777,9 @@ object_ref<UserModule> KernelState::LoadUserModule(
     X_STATUS status = module->LoadFromFile(path);
     if (XFAILED(status)) {
       object_table()->ReleaseHandle(module->handle());
+      if (out_status) {
+        *out_status = status;
+      }
       return nullptr;
     }
 
@@ -929,16 +960,15 @@ X_RESULT KernelState::ApplyTitleUpdate(
 
   if (fit == Fit::kNone) {
     XELOGW("No installed title update fits {}", title_module->name());
-    // First module that is loaded is always main executable. That way we can
-    // prevent random message spam in case of loading/unloading.
-    if (!GetExecutableModule()) {
-      emulator_->display_window()->app_context().CallInUIThread([&]() {
-        new xe::ui::HostNotificationWindow(
-            emulator_->imgui_drawer(), "Warning!",
-            "Title Update signature doesn't match. Skipping its application!",
-            0);
-      });
+    // The executable took the update, which this module would run without.
+    if (GetExecutableModule()) {
+      return X_STATUS_UNSUCCESSFUL;
     }
+    emulator_->display_window()->app_context().CallInUIThread([&]() {
+      new xe::ui::HostNotificationWindow(
+          emulator_->imgui_drawer(), "Warning!",
+          "Title Update signature doesn't match. Skipping its application!", 0);
+    });
     return X_STATUS_SUCCESS;
   }
   if (!patch_module) {
@@ -1919,6 +1949,7 @@ void KernelState::InitializeKernelGuestGlobals() {
   KernelGuestGlobals* block =
       memory_->TranslateVirtual<KernelGuestGlobals*>(kernel_guest_globals_);
   memset(block, 0, sizeof(KernelGuestGlobals));
+  util::XeInitializeListHead(&block->loaded_modules, memory_);
 
   auto idle_process = memory()->TranslateVirtual<X_KPROCESS*>(GetIdleProcess());
   InitializeProcess(idle_process, X_PROCTYPE_IDLE, 0, 0, 0);
@@ -2039,6 +2070,9 @@ void KernelState::InitializeKernelGuestGlobals() {
       {XObject::Type::Mutant,
        kernel_guest_globals_ +
            offsetof32(KernelGuestGlobals, ExMutantObjectType)},
+      {XObject::Type::Timer,
+       kernel_guest_globals_ +
+           offsetof32(KernelGuestGlobals, ExTimerObjectType)},
       {XObject::Type::Device,
        kernel_guest_globals_ +
            offsetof32(KernelGuestGlobals, IoDeviceObjectType)}};

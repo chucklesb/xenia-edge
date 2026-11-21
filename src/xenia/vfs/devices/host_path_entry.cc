@@ -77,7 +77,7 @@ bool HostPathEntry::Overwrite() {
   return true;
 }
 
-void HostPathEntry::SetOverwrittenSize(size_t size) {
+void HostPathEntry::SetSize(size_t size) {
   size_ = size;
   allocation_size_ = xe::round_up(size, device()->bytes_per_sector());
 }
@@ -217,6 +217,12 @@ void HostPathEntry::update() {
     allocation_size_ =
         xe::round_up(file_info->total_size, device()->bytes_per_sector());
   }
+}
+
+bool HostPathEntry::is_empty_folder() const {
+  std::error_code error;
+  const bool empty = std::filesystem::is_empty(host_path_, error);
+  return error ? Entry::is_empty_folder() : empty;
 }
 
 bool HostPathEntry::SetTimes(xe::filesystem::FileHandle& file_handle,

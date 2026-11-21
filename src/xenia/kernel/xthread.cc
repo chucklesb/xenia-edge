@@ -115,7 +115,7 @@ XThread::~XThread() {
   if (thread_state_) {
     delete thread_state_;
   }
-  kernel_state()->memory()->SystemHeapFree(tls_static_address_);
+  kernel_state()->memory()->SystemHeapFree(tls_dynamic_address_);
   kernel_state()->memory()->SystemHeapFree(pcr_address_);
   FreeStack();
 
@@ -246,8 +246,9 @@ void XThread::InitializeGuestObject() {
   guest_thread->stack_base = (this->stack_base_);
   guest_thread->stack_limit = (this->stack_limit_);
   guest_thread->stack_kernel = (this->stack_base_ - 240);
-  guest_thread->tls_address = (this->tls_dynamic_address_);
-  guest_thread->thread_state = KTHREAD_STATE_INITIALIZED;
+  // The TLS pointer, with the slots below it.
+  guest_thread->tls_address = (this->tls_static_address_);
+  guest_thread->thread_state = KTHREAD_STATE_READY;
   uint32_t process_info_block_address =
       creation_params_.guest_process ? creation_params_.guest_process
                                      : this->kernel_state_->GetTitleProcess();
@@ -378,18 +379,19 @@ X_STATUS XThread::Create() {
 
   // Allocate both the slots and the extended data.
   // Some TLS is compiled with the binary (declspec(thread)) vars. The game
-  // will directly access those through 0(r13).
+  // will directly access those through 0(r13). The slots sit just below them,
+  // slot 0 first, counting down.
   uint32_t tls_slot_size = tls_slots * 4;
   tls_total_size_ = tls_slot_size + tls_extended_size;
-  tls_static_address_ = memory()->SystemHeapAlloc(tls_total_size_);
-  tls_dynamic_address_ = tls_static_address_ + tls_extended_size;
-  if (!tls_static_address_) {
+  tls_dynamic_address_ = memory()->SystemHeapAlloc(tls_total_size_);
+  if (!tls_dynamic_address_) {
     XELOGW("Unable to allocate thread local storage block");
     return X_STATUS_NO_MEMORY;
   }
+  tls_static_address_ = tls_dynamic_address_ + tls_slot_size;
 
   // Zero all of TLS.
-  memory()->Fill(tls_static_address_, tls_total_size_, 0);
+  memory()->Fill(tls_dynamic_address_, tls_total_size_, 0);
   if (tls_extended_size) {
     // If game has extended data, copy in the default values.
     assert_not_zero(tls_header->raw_data_address);
@@ -577,8 +579,16 @@ X_STATUS XThread::Exit(int exit_code) {
   auto cpu_context = thread_state_->context();
   kthread->terminated = 1;
   kthread->thread_state = KTHREAD_STATE_TERMINATED;
+  kthread->exit_time = Clock::QueryGuestSystemTime();
   // Block any racing KeInsertQueueApc from another thread before we drain.
   kthread->may_queue_apcs = 0;
+
+  // DPCs this thread queued at a raised IRQL run once the IRQL drops, which it
+  // never would after the thread has gone, so it drops now.
+  auto kpcr = cpu_context->TranslateVirtualGPR<X_KPCR*>(cpu_context->r[13]);
+  if (!kpcr->prcb_data.dpc_active && kpcr->current_irql >= 2) {
+    xboxkrnl::xeKfLowerIrql(cpu_context, 0);
+  }
 
   // TODO(benvanik): dispatch events? waiters? etc?
   RundownAPCs();
@@ -670,6 +680,7 @@ X_STATUS XThread::Terminate(int exit_code) {
   thread->exit_status = exit_code;
   thread->terminated = 1;
   thread->thread_state = KTHREAD_STATE_TERMINATED;
+  thread->exit_time = Clock::QueryGuestSystemTime();
   thread->may_queue_apcs = 0;
   XMutant::AbandonAllOwnedByThread(kernel_state(), this);
 
@@ -1148,22 +1159,26 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
   }
 }
 
+uint32_t XThread::TLSSlotAddress(uint32_t slot) const {
+  return tls_static_address_ - (slot + 1) * 4;
+}
+
 bool XThread::GetTLSValue(uint32_t slot, uint32_t* value_out) {
-  if (slot * 4 > tls_total_size_) {
+  if (slot >= (tls_static_address_ - tls_dynamic_address_) / 4) {
     return false;
   }
 
-  auto mem = memory()->TranslateVirtual(tls_dynamic_address_ + slot * 4);
+  auto mem = memory()->TranslateVirtual(TLSSlotAddress(slot));
   *value_out = xe::load_and_swap<uint32_t>(mem);
   return true;
 }
 
 bool XThread::SetTLSValue(uint32_t slot, uint32_t value) {
-  if (slot * 4 >= tls_total_size_) {
+  if (slot >= (tls_static_address_ - tls_dynamic_address_) / 4) {
     return false;
   }
 
-  auto mem = memory()->TranslateVirtual(tls_dynamic_address_ + slot * 4);
+  auto mem = memory()->TranslateVirtual(TLSSlotAddress(slot));
   xe::store_and_swap<uint32_t>(mem, value);
   return true;
 }
@@ -1251,9 +1266,16 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
   if (fiber_) {
     // Bump the guest suspend count and let the dispatcher act on it, at our
     // next pick-up for a self-suspend or the target's next yield otherwise.
-    uint8_t previous =
-        reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count)
-            ->fetch_add(1);
+    // A count at the limit is left as it is.
+    auto* count =
+        reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count);
+    uint8_t previous = count->load();
+    do {
+      if (previous >= kMaxSuspendCount) {
+        return X_STATUS_SUSPEND_COUNT_EXCEEDED;
+      }
+    } while (!count->compare_exchange_weak(previous,
+                                           static_cast<uint8_t>(previous + 1)));
     if (out_suspend_count) {
       *out_suspend_count = previous;
     }
@@ -1286,20 +1308,21 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
 }
 
 #if !XE_PLATFORM_WIN32
-uint32_t XThread::SelfSuspend() {
+X_STATUS XThread::SelfSuspend(uint32_t* out_suspend_count) {
   auto guest_thread = guest_object<X_KTHREAD>();
   if (fiber_) {
     // Waiting on the condition variable would block the whole dispatch thread.
-    uint32_t previous = 0;
-    Suspend(&previous);
-    return previous;
+    return Suspend(out_suspend_count);
   }
   std::unique_lock<std::mutex> lock(suspend_mutex_);
   uint32_t previous = guest_thread->suspend_count;
   guest_thread->suspend_count++;
+  if (out_suspend_count) {
+    *out_suspend_count = previous;
+  }
   suspend_cv_.wait(
       lock, [guest_thread]() { return guest_thread->suspend_count == 0; });
-  return previous;
+  return X_STATUS_SUCCESS;
 }
 #endif  // !XE_PLATFORM_WIN32
 
