@@ -188,6 +188,7 @@ DECLARE_bool(debug);
 DECLARE_path(target);
 DECLARE_bool(in_process_title_relaunch);
 DECLARE_bool(discord);
+DECLARE_bool(fps_overlay);
 
 DECLARE_string(hid);
 DECLARE_string(gpu);
@@ -922,6 +923,7 @@ void EmulatorWindow::OnEmulatorInitialized() {
         app_context_.CallInUIThread(
             [this, title_id, name = std::string(title_name)]() {
               AddLaunchedTitleToLibrary(title_id, name);
+              StartFrameRateTimer();
               UpdateTitle();
               ApplyContentVisibility();
               NoteMissingTitleUpdate(title_id);
@@ -953,6 +955,9 @@ void EmulatorWindow::OnEmulatorInitialized() {
       compiling_shaders_ = false;
       if (compiling_shaders_hide_timer_) {
         compiling_shaders_hide_timer_->Stop();
+      }
+      if (frame_rate_timer_) {
+        frame_rate_timer_->Stop();
       }
       UpdateTitle();
     });
@@ -1940,6 +1945,12 @@ void EmulatorWindow::ToggleContextMenu(bool use_cursor_position) {
       std::string("Vibration: ") + (vibration_enabled ? "On" : "Off");
   context_menu->AddAction(vibration_text,
                           [this]() { ToggleControllerVibration(); });
+
+  context_menu->AddAction(
+      std::string("FPS Counter: ") + (cvars::fps_overlay ? "On" : "Off"), []() {
+        ui::Presenter::ToggleFrameRateOverlay();
+        config::SaveConfig();
+      });
 
   context_menu->AddAction(
       "Take Screenshot", [this]() { TakeScreenshot(); }, "F12");
@@ -3695,7 +3706,7 @@ void EmulatorWindow::UpdateTitle() {
         title_version = shown->version ? VersionToString(shown->version) : "";
       }
     }
-    sb.AppendFormat(" | [{:08X}", title_id);
+    sb.AppendFormat(" [{:08X}", title_id);
     if (!title_version.empty()) {
       sb.Append(" v");
       sb.Append(title_version);
@@ -3765,6 +3776,10 @@ void EmulatorWindow::UpdateTitle() {
     sb.Append(">");
   }
 
+  if (graphics_system && emulator()->is_title_open()) {
+    sb.AppendFormat(" {:.2f} FPS", graphics_system->GetFramesPerSecond());
+  }
+
   if (Clock::guest_time_scalar() != 1.0) {
     sb.AppendFormat(" (@{:.2f}x)", Clock::guest_time_scalar());
   }
@@ -3794,6 +3809,17 @@ void EmulatorWindow::SetInitializingShaderStorage(bool initializing) {
   }
   initializing_shader_storage_ = initializing;
   UpdateTitle();
+}
+
+void EmulatorWindow::StartFrameRateTimer() {
+  if (!frame_rate_timer_) {
+    frame_rate_timer_ = std::make_unique<wxTimer>();
+    frame_rate_timer_->Bind(wxEVT_TIMER,
+                            [this](wxTimerEvent&) { UpdateTitle(); });
+  }
+  // The frame rate is measured over half a second.
+  constexpr int kFrameRateUpdateMs = 500;
+  frame_rate_timer_->Start(kFrameRateUpdateMs);
 }
 
 void EmulatorWindow::SetCompilingShaders(bool compiling) {

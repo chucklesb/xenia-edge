@@ -546,56 +546,165 @@ dword_result_t NtQueryVirtualMemory_entry(
 }
 DECLARE_XBOXKRNL_EXPORT1(NtQueryVirtualMemory, kMemory, kImplemented);
 
-dword_result_t NtAllocateEncryptedMemory_entry(dword_t unk, dword_t region_size,
-                                               lpdword_t base_addr_ptr) {
-  if (!region_size) {
+// An encrypted memory region, 64 KB pages up to |end|.
+struct EncryptedRegion {
+  uint32_t start;
+  uint32_t end;
+  // The block an allocation tries the gap after first, 0 for none. Guarded by
+  // the global critical region, and taken as none once no block starts there.
+  uint32_t* hint;
+};
+constexpr uint32_t kEncryptedPageSize = 0x10000;
+// EncryptedRegion::hint of the title's and the system's region.
+static uint32_t encrypted_region_hints[2] = {};
+
+// The region a type names: 0 the caller's process, 1 the title's, 2 the
+// system's.
+static std::optional<EncryptedRegion> EncryptedRegionOf(uint32_t type,
+                                                        PPCContext* context) {
+  if (type == 0) {
+    type = xeKeGetCurrentProcessType(context) == X_PROCTYPE_TITLE ? 1 : 2;
+  }
+  switch (type) {
+    case 1:
+      return EncryptedRegion{0x8D000000, 0x8DFF0000,
+                             &encrypted_region_hints[0]};
+    case 2:
+      return EncryptedRegion{0x8C000000, 0x8CFF0000,
+                             &encrypted_region_hints[1]};
+    default:
+      return std::nullopt;
+  }
+}
+
+// The start of the first block at or after |address|, the region's end if
+// none. |address| is a block's end or the region's start.
+static uint32_t NextEncryptedBlock(BaseHeap* heap,
+                                   const EncryptedRegion& region,
+                                   uint32_t address) {
+  for (; address < region.end; address += kEncryptedPageSize) {
+    if (ReservationOf(heap, address)) {
+      return address;
+    }
+  }
+  return region.end;
+}
+
+// The start of the last block before |address|, 0 if none.
+static uint32_t PreviousEncryptedBlock(BaseHeap* heap,
+                                       const EncryptedRegion& region,
+                                       uint32_t address) {
+  while (address > region.start) {
+    address -= kEncryptedPageSize;
+    if (const auto base = ReservationOf(heap, address)) {
+      return *base;
+    }
+  }
+  return 0;
+}
+
+static uint32_t EncryptedBlockEnd(BaseHeap* heap, const EncryptedRegion& region,
+                                  uint32_t base) {
+  uint32_t end = base + kEncryptedPageSize;
+  while (end < region.end && ReservationOf(heap, end) == base) {
+    end += kEncryptedPageSize;
+  }
+  return end;
+}
+
+struct EncryptedPlacement {
+  uint32_t address;
+  // Whether the new block becomes the hint, else the hint clears.
+  bool hint;
+};
+
+// Next fit: the gap after the hint block, else the lowest gap after a block
+// that fits. The gap before the lowest block is taken only when larger than
+// |size|, and the hint then clears, as it does in an empty region.
+static std::optional<EncryptedPlacement> PlaceEncryptedBlock(
+    BaseHeap* heap, const EncryptedRegion& region, uint32_t size) {
+  const uint32_t hint = *region.hint;
+  if (hint && ReservationOf(heap, hint) == hint) {
+    const uint32_t after = EncryptedBlockEnd(heap, region, hint);
+    if (NextEncryptedBlock(heap, region, after) - after >= size) {
+      return EncryptedPlacement{after, true};
+    }
+  }
+  const uint32_t first = NextEncryptedBlock(heap, region, region.start);
+  if (first == region.end || first - region.start > size) {
+    return EncryptedPlacement{region.start, false};
+  }
+  for (uint32_t block = first; block < region.end;) {
+    const uint32_t after = EncryptedBlockEnd(heap, region, block);
+    const uint32_t next = NextEncryptedBlock(heap, region, after);
+    if (next - after >= size) {
+      return EncryptedPlacement{after, true};
+    }
+    block = next;
+  }
+  return std::nullopt;
+}
+
+dword_result_t NtAllocateEncryptedMemory_entry(dword_t region_type,
+                                               dword_t region_size,
+                                               lpdword_t base_addr_ptr,
+                                               const ppc_context_t& context) {
+  const auto region = EncryptedRegionOf(region_type, context);
+  if (!region) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  // Wraps to 0 for a size near 4 GB, which fails.
+  const uint32_t size =
+      xe::round_up(uint32_t(region_size), kEncryptedPageSize, false);
+  if (!size || size > region->end - region->start) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
-  const uint32_t region_size_adjusted =
-      xe::round_up(region_size, 64 * 1024, true);
-
-  if (region_size_adjusted > 16 * 1024 * 1024) {
-    return X_STATUS_INVALID_PARAMETER;
+  auto heap = kernel_memory()->LookupHeap(region->start);
+  auto global_lock = global_critical_region::AcquireDirect();
+  const auto placement = PlaceEncryptedBlock(heap, *region, size);
+  if (!placement ||
+      !heap->AllocFixed(placement->address, size, kEncryptedPageSize,
+                        MemoryAllocationFlag::kMemoryAllocationReserve |
+                            MemoryAllocationFlag::kMemoryAllocationCommit,
+                        MemoryProtectFlag::kMemoryProtectRead |
+                            MemoryProtectFlag::kMemoryProtectWrite)) {
+    return X_STATUS_NO_MEMORY;
   }
+  *region->hint = placement->hint ? placement->address : 0;
 
-  uint32_t out_address = 0;
-  auto heap = kernel_memory()->LookupHeap(0x8C000000);
-  const bool result =
-      heap->AllocRange(0x8C000000, 0x8FFFFFFF, region_size_adjusted, 64 * 1024,
-                       MemoryAllocationFlag::kMemoryAllocationCommit,
-                       MemoryProtectFlag::kMemoryProtectRead |
-                           MemoryProtectFlag::kMemoryProtectWrite,
-                       false, &out_address);
-
-  if (!result) {
-    return X_STATUS_UNSUCCESSFUL;
-  }
-
-  XELOGD("NtAllocateEncryptedMemory = {:08X}", out_address);
-  *base_addr_ptr = out_address;
+  XELOGD("NtAllocateEncryptedMemory = {:08X}", placement->address);
+  *base_addr_ptr = placement->address;
   return X_STATUS_SUCCESS;
 }
 DECLARE_XBOXKRNL_EXPORT1(NtAllocateEncryptedMemory, kMemory, kImplemented);
 
 dword_result_t NtFreeEncryptedMemory_entry(dword_t region_type,
-                                           lpdword_t base_address_ptr) {
-  if (!base_address_ptr) {
+                                           dword_t base_address,
+                                           const ppc_context_t& context) {
+  const auto region = EncryptedRegionOf(region_type, context);
+  const uint32_t address = base_address;
+  if (!region || address < region->start || address >= region->end) {
     return X_STATUS_INVALID_PARAMETER;
   }
-
-  auto heap = kernel_state()->memory()->LookupHeap(0x80000000);
-  const uint32_t encrypt_address =
-      heap->heap_base() + heap->page_size() * base_address_ptr.value();
-
-  auto encrypt_heap = kernel_state()->memory()->LookupHeap(encrypt_address);
-
-  if (encrypt_heap->heap_type() != HeapType::kGuestXex) {
+  auto heap = kernel_memory()->LookupHeap(region->start);
+  auto global_lock = global_critical_region::AcquireDirect();
+  // The 64 KB page the address rounds up to must start an allocation and hold
+  // the address in its first 4 KB, which leaves only the base.
+  const uint32_t page = xe::round_up(address, kEncryptedPageSize);
+  if (ReservationOf(heap, page) != page) {
     return X_STATUS_INVALID_PARAMETER;
   }
-
-  kernel_state()->memory()->SystemHeapFree(encrypt_address);
-
+  if (address >> 12 != page >> 12) {
+    return X_STATUS_FREE_VM_NOT_AT_BASE;
+  }
+  if (!heap->Release(page)) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  // Freeing the hint block hands the hint to the block before it.
+  if (*region->hint == page) {
+    *region->hint = PreviousEncryptedBlock(heap, *region, page);
+  }
   return X_STATUS_SUCCESS;
 }
 DECLARE_XBOXKRNL_EXPORT1(NtFreeEncryptedMemory, kMemory, kImplemented);
@@ -762,8 +871,10 @@ dword_result_t xeMmQueryStatistics(
 
   const uint32_t size = sizeof(X_MM_QUERY_STATISTICS_RESULT);
 
-  if (stats_ptr->size != size) {
-    return X_STATUS_BUFFER_TOO_SMALL;
+  // A larger structure is accepted and keeps the caller's length.
+  const uint32_t length = stats_ptr->size;
+  if (length < size) {
+    return X_STATUS_INVALID_PARAMETER;
   }
 
   // Zero out the struct.
@@ -773,7 +884,7 @@ dword_result_t xeMmQueryStatistics(
   // These numbers are mostly guessed. If the game is just checking for
   // memory, this should satisfy it. If it's actually verifying things
   // this won't work :/
-  stats_ptr->size = size;
+  stats_ptr->size = length;
 
   stats_ptr->total_physical_pages = 0x00020000;  // 512mb / 4kb pages
   stats_ptr->kernel_pages = 0x00000100;          // Previous value 0x300

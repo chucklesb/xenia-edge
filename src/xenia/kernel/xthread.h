@@ -473,9 +473,18 @@ class XThread : public XObject, public cpu::Thread {
   // cooperative scheduler's alertable waits to return USER_APC, the same way a
   // host alertable wait wakes on a queued APC.
   bool HasPendingUserApc();
-  // True if a kernel APC is queued that this thread can run now, below
-  // APC_LEVEL, outside a critical region and outside another kernel APC.
+  // True below APC_LEVEL, outside a critical region and outside another kernel
+  // APC, where a normal kernel APC can run.
+  bool KernelApcsUnmasked();
+  // True if a kernel APC is queued that this thread can run now.
   bool HasDeliverableKernelApc();
+  // True if this thread is suspended, unmasked as for a normal kernel APC and
+  // not terminating, and as the current fiber not holding the global critical
+  // region.
+  bool HasDeliverableSuspend();
+  // On the current fiber, stops for a deliverable suspend until resumed.
+  // Returns true if it stopped.
+  bool DeliverPendingSuspend();
 
   int32_t priority() const { return priority_; }
   int32_t QueryPriority();
@@ -615,16 +624,20 @@ class XThread : public XObject, public cpu::Thread {
     user_mode_ = std::move(user_mode);
   }
 
-  // A guest exception dispatch whose handler is running. One whose handler
-  // continued the thread elsewhere instead of returning stays here until the
-  // next dispatch on the thread finds it gone.
+  // Kernel code running guest code on the thread: an exception dispatch or an
+  // unwind calling a handler, or a handler calling a filter or finally block.
+  // One whose guest code continued the thread elsewhere instead of returning
+  // stays here until a later dispatch or unwind on the thread finds it gone.
   struct ExceptionDispatch {
-    // Where the handlers run, below the trap frame, and return to, which
-    // unwinding a handler's frame leads to.
+    enum class Kind : uint8_t { kDispatch, kUnwind, kCall };
+    // Where the guest code runs and returns to, which unwinding its frame
+    // leads to.
     uint32_t handler_sp;
     uint32_t handler_return;
-    // Its CONTEXT, EXCEPTION_RECORD and DISPATCHER_CONTEXT in the system heap.
+    // A dispatch's CONTEXT, EXCEPTION_RECORD and DISPATCHER_CONTEXT in the
+    // system heap, or an unwind's or a call's frame on the guest stack.
     uint32_t records;
+    Kind kind;
   };
   std::vector<ExceptionDispatch>& exception_dispatches() {
     return exception_dispatches_;
@@ -740,6 +753,15 @@ class XThread : public XObject, public cpu::Thread {
     uint64_t wait_deadline_ms = 0;  // absolute host uptime, 0 = none
     // Also re-poll on a deliverable kernel APC.
     bool wait_interruptible = true;
+    // Parked in a CooperativeWait, which a suspend unwinds while other parks
+    // stop in place.
+    bool object_wait = false;
+    // How a suspend landing on that park unwinds it, set under lock_.
+    // |suspend_poll_first|: a signal may have satisfied the wait first so it
+    // polls before stopping. |suspend_unwait|: it leaves without polling and
+    // waits again once resumed.
+    bool suspend_poll_first = false;
+    bool suspend_unwait = false;
     // What this fiber parked in and the guest handles it named. Handles, not
     // XObject pointers: safe to print if the object is released mid-dump, and
     // they key the signal ring. Without it a multi-object wait dumps obj=0x0.
