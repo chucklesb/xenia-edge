@@ -313,6 +313,11 @@ class X64Emitter : public Xbyak::CodeGenerator {
   // calling it. Returns false when the callee is not a GPR saverest helper.
   bool TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
                                     const GuestFunction* function);
+  bool InlinesPPCGprLrSaveRestore(const hir::Instr* instr,
+                                  const GuestFunction* function) const;
+  // Whether |instr| calls or branches to guest code, a saverest helper inlined
+  // in place aside, or calls host code, traps included.
+  bool MakesCall(const hir::Instr* instr) const;
   void CallIndirect(const hir::Instr* instr, const Xbyak::Reg64& reg);
   void CallExtern(const hir::Instr* instr, const Function* function);
   void CallNative(void* fn);
@@ -359,6 +364,25 @@ class X64Emitter : public Xbyak::CodeGenerator {
   // added, and a tail's callback may add tails of its own.
   Xbyak::Label& AddToTail(TailEmitCallback callback, uint32_t alignment = 0);
   Xbyak::Label& NewCachedLabel();
+
+  // A TO_SINGLE_KEEP_NAN reading the result of the F64 operation right before
+  // it leaves the NaN to that operation, which tests its result anyway: the
+  // operation's NaN exits hand the NaN to the TO_SINGLE's dest and jump to
+  // exit, past the conversion, where the TO_SINGLE binds it. Set by the
+  // operation, taken by the TO_SINGLE.
+  void MarkFusedToSingle(const hir::Instr* to_single, Xbyak::Label* exit) {
+    fused_to_single_ = to_single;
+    fused_to_single_exit_ = exit;
+  }
+  const hir::Instr* fused_to_single() const { return fused_to_single_; }
+  Xbyak::Label* fused_to_single_exit() const { return fused_to_single_exit_; }
+  Xbyak::Label* ConsumeFusedToSingle(const hir::Instr* to_single) {
+    if (!fused_to_single_ || fused_to_single_ != to_single) {
+      return nullptr;
+    }
+    fused_to_single_ = nullptr;
+    return fused_to_single_exit_;
+  }
 
   // Emits a cooperative-scheduler preemption safepoint: yields the fiber once
   // the context's preempt_requested flag is raised. Only valid at a block head.
@@ -496,6 +520,14 @@ class X64Emitter : public Xbyak::CodeGenerator {
       label_cache_;  // for creating labels that need to be referenced much
                      // later by tail emitters
   MXCSRMode mxcsr_mode_ = MXCSRMode::Unknown;
+  // Whether this function records a stackpoint. One that makes no call has no
+  // return sites, so no unwind ever restores its frame, and it is never below
+  // another frame, so a pseudo stack trace, taken from the frames that called
+  // out, has nothing to show for it either. Every tail branch, and so every
+  // dynamic one, leaves from a frame that has its record.
+  bool function_has_stackpoint_ = true;
+  const hir::Instr* fused_to_single_ = nullptr;
+  Xbyak::Label* fused_to_single_exit_ = nullptr;
 };
 
 }  // namespace x64
