@@ -3197,7 +3197,8 @@ void MetalCommandProcessor::ComputeDrawViewportInfo(
       true, kViewportBoundsMax, kViewportBoundsMax, false,
       normalized_depth_control, convert_z_to_float24, true,
       pixel_shader && pixel_shader->writes_depth(), false);
-  gviargs.SetupRegisterValues(regs, false);
+  gviargs.SetupRegisterValues(regs, false,
+                              /*raw_clipping_supported=*/true);
   if (gviargs == previous_viewport_info_args_) {
     viewport_info_out = previous_viewport_info_;
   } else {
@@ -6330,8 +6331,10 @@ void MetalCommandProcessor::ApplyRasterizerState(bool primitive_polygonal) {
                                         0.0f);
 
   current_render_encoder_->setDepthClipMode(
-      draw_util::IsDepthClampedAtZPlanes(regs) ? MTL::DepthClipModeClamp
-                                               : MTL::DepthClipModeClip);
+      draw_util::IsDepthClampedAtZPlanes(regs,
+                                         /*raw_clipping_supported=*/true)
+          ? MTL::DepthClipModeClamp
+          : MTL::DepthClipModeClip);
 }
 
 MTL::RenderPassDescriptor*
@@ -6528,6 +6531,19 @@ MetalCommandProcessor::GetCurrentSpirvVertexShaderModification(
   modification.vertex.user_clip_plane_count = xe::bit_count(user_clip_planes);
   modification.vertex.user_clip_plane_cull =
       uint32_t(user_clip_planes && pa_cl_clip_cntl.ucp_cull_only_ena);
+
+  if (draw_util::IsZClippedWithClipDistances(regs,
+                                             /*raw_clipping_supported=*/true)) {
+    modification.vertex.z_clip_distances = 1;
+    modification.vertex.z_clip_near_at_minus_w =
+        uint32_t(!pa_cl_clip_cntl.dx_clip_space_def);
+  }
+  modification.vertex.guard_band_clip_distances =
+      uint32_t(draw_util::IsGuardBandClippedWithClipDistances(
+          regs, /*raw_clipping_supported=*/true));
+  modification.vertex.discard_band_cull_distances =
+      uint32_t(draw_util::IsDiscardBandCulledWithCullDistances(
+          regs, /*cull_distances_supported=*/false));
 
   modification.vertex.output_point_parameters =
       uint32_t((shader.writes_point_size_edge_flag_kill_vertex() & 0b001) &&
@@ -7008,6 +7024,14 @@ void MetalCommandProcessor::UpdateSpirvSystemConstantValues(
     consts.ndc_scale[i] = viewport_info.ndc_scale[i];
     consts.ndc_offset[i] = viewport_info.ndc_offset[i];
   }
+  consts.guard_band_clip_adj[0] =
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_HORZ_CLIP_ADJ);
+  consts.guard_band_clip_adj[1] =
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_VERT_CLIP_ADJ);
+  consts.guard_band_discard_adj[0] =
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_HORZ_DISC_ADJ);
+  consts.guard_band_discard_adj[1] =
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_VERT_DISC_ADJ);
 
   // Point rendering (matching Vulkan backend).
   auto pa_su_point_size = regs.Get<reg::PA_SU_POINT_SIZE>();
