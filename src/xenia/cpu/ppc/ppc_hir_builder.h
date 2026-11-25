@@ -45,6 +45,8 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   GuestFunction* function() const { return function_; }
   // Whether the function is code the guest wrote at runtime.
   bool dynamic_code() const { return dynamic_code_; }
+  // Whether guest code can read the VSCR[SAT] saturating instructions set.
+  bool vscr_sat_observable() const { return vscr_sat_observable_; }
   Function* LookupFunction(uint32_t address);
   Label* LookupLabel(uint32_t address);
 
@@ -69,8 +71,8 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   // belongs to that operation alone. Only the recording forms pay for it.
   void BeginFPSCRUpdate(bool update_cr1);
   // Derives the summary from what the host raised, plus the invalid a
-  // signalling NaN operand always means. Rc=0 clears the exception bits as
-  // ClearFPSCRExceptions does.
+  // signalling NaN operand always means. Rc=0 does what ClearFPSCRExceptions
+  // does.
   // `suppress`, when given, is a condition that clears everything raised.
   void UpdateFPSCR(std::initializer_list<Value*> operands, bool update_cr1,
                    Value* suppress = nullptr);
@@ -126,6 +128,9 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   void MaybeBreakOnInstruction(uint32_t address);
   void AnnotateLabel(uint32_t address, Label* label);
   void StoreFPSCRSummary(Value* raised, bool update_cr1);
+  // Without accurate_fpscr_status, FX, VX and OX keep what the guest wrote,
+  // and a record form copies them to CR1.
+  bool SkipFPSCRStatus(bool update_cr1);
   Value* FpInvalidFromOperands(std::initializer_list<Value*> operands);
 
   PPCFrontend* frontend_;
@@ -137,6 +142,8 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   bool with_debug_info_;
   GuestFunction* function_;
   bool dynamic_code_;
+  bool vscr_sat_observable_;
+  bool track_fpscr_status_;
   uint64_t start_address_;
   uint64_t instr_count_;
   Instr** instr_offset_list_;
