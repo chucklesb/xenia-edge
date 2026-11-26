@@ -375,7 +375,9 @@ X_STATUS XThread::Create() {
   uint32_t tls_slots = kDefaultTlsSlotCount;
   uint32_t tls_extended_size = 0;
   if (tls_header && tls_header->slot_count) {
-    tls_slots = tls_header->slot_count;
+    // Padded like the process's slot bitmap, so every slot KeTlsAlloc hands
+    // out has storage.
+    tls_slots = (tls_header->slot_count + 3) & ~3u;
     tls_extended_size = tls_header->data_size;
   }
 
@@ -613,6 +615,8 @@ X_STATUS XThread::Exit(int exit_code) {
                                   old_irql);
 
   kernel_state()->OnThreadExit(this);
+  // A wait for the loader lock or in DllMain marked us running again.
+  kthread->thread_state = KTHREAD_STATE_TERMINATED;
 
   // Notify processor of our exit.
   emulator()->processor()->OnThreadExit(thread_id_);

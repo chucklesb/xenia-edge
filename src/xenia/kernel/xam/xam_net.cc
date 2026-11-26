@@ -500,9 +500,22 @@ dword_result_t NetDll_WSASendTo_entry(
     combined_buffer_offset += buffers[i].len;
   }
 
-  N_XSOCKADDR_IN native_to(to_ptr);
-  socket->SendTo(combined_buffer_mem.data(), combined_buffer_size, flags,
-                 &native_to, to_len);
+  // A NULL destination sends to the connected peer.
+  N_XSOCKADDR_IN native_to;
+  N_XSOCKADDR_IN* to = nullptr;
+  if (to_ptr) {
+    native_to = *to_ptr;
+    to = &native_to;
+  }
+  int ret = socket->SendTo(combined_buffer_mem.data(), combined_buffer_size,
+                           flags, to, to_len);
+  if (ret == -1) {
+    XThread::SetLastError(socket->GetLastWSAError());
+    return -1;
+  }
+  if (num_bytes_sent) {
+    *num_bytes_sent = static_cast<uint32_t>(ret);
+  }
 
   // TODO: Instantly complete overlapped
 
@@ -1364,10 +1377,30 @@ dword_result_t NetDll_accept_entry(dword_t caller, dword_t socket_handle,
 }
 DECLARE_XAM_EXPORT1(NetDll_accept, kNetworking, kImplemented);
 
+// The handles follow the count, 64 of them for the default FD_SETSIZE and
+// more for a title built with a larger one. The console reads the count's low
+// 16 bits.
 struct x_fd_set {
   xe::be<uint32_t> fd_count;
-  xe::be<uint32_t> fd_array[64];
+
+  uint32_t count() const { return fd_count & 0xFFFF; }
+  const xe::be<uint32_t>* fd_array() const {
+    return reinterpret_cast<const xe::be<uint32_t>*>(this + 1);
+  }
+  xe::be<uint32_t>* fd_array() {
+    return reinterpret_cast<xe::be<uint32_t>*>(this + 1);
+  }
 };
+
+// Whether a host socket can go in a host fd_set. A POSIX one is a bitmap of
+// FD_SETSIZE descriptors. A closed socket's handle is -1.
+static bool InHostSet(uint64_t handle) {
+#if XE_PLATFORM_WIN32
+  return handle != static_cast<uint64_t>(-1);
+#else
+  return handle < static_cast<uint64_t>(FD_SETSIZE);
+#endif  // XE_PLATFORM_WIN32
+}
 
 // Which select set a host_set is, since System Link sockets answer for
 // themselves.
@@ -1377,56 +1410,68 @@ struct host_set {
   explicit host_set(SelectSet which) : set(which) {}
 
   SelectSet set;
-  uint32_t count = 0;
-  object_ref<XSocket> sockets[64];
+  std::vector<object_ref<XSocket>> sockets;
 
   // False for a set holding a handle that isn't a socket's.
   bool Load(const x_fd_set* guest_set) {
-    assert_true(guest_set->fd_count < 64);
-    this->count = guest_set->fd_count;
-    for (uint32_t i = 0; i < this->count; ++i) {
+    const uint32_t count = guest_set->count();
+    sockets.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
       auto socket = kernel_state()->object_table()->LookupObject<XSocket>(
-          static_cast<X_HANDLE>(guest_set->fd_array[i]));
+          static_cast<X_HANDLE>(guest_set->fd_array()[i]));
       if (!socket) {
-        this->count = i;
         return false;
       }
-      this->sockets[i] = socket;
+      const auto handle = socket->native_handle();
+      if (!socket->system_link() && handle != static_cast<uint64_t>(-1) &&
+          !InHostSet(handle)) {
+        XELOGE("NetDll_select: host socket {} is past FD_SETSIZE", handle);
+      }
+      sockets.push_back(std::move(socket));
     }
     return true;
   }
 
-  void Store(x_fd_set* guest_set) {
-    guest_set->fd_count = 0;
-    for (uint32_t i = 0; i < this->count; ++i) {
-      auto socket = this->sockets[i];
-      guest_set->fd_array[guest_set->fd_count++] = socket->handle();
+  // Each ready handle goes back once, and no more than 64 of them, as on the
+  // console.
+  void Store(x_fd_set* guest_set) const {
+    auto* handles = guest_set->fd_array();
+    uint32_t count = 0;
+    for (const auto& socket : sockets) {
+      if (count == 64) {
+        break;
+      }
+      const uint32_t handle = socket->handle();
+      if (std::find(handles, handles + count, handle) == handles + count) {
+        handles[count++] = handle;
+      }
     }
+    guest_set->fd_count = count;
   }
 
   // Returns how many host handles it set, raising max_handle to the highest.
-  uint32_t Store(fd_set* native_set, int& max_handle) {
+  uint32_t Store(fd_set* native_set, int& max_handle) const {
     FD_ZERO(native_set);
     uint32_t stored = 0;
-    for (uint32_t i = 0; i < this->count; ++i) {
-      if (this->sockets[i]->system_link()) {
+    for (const auto& socket : sockets) {
+      if (socket->system_link()) {
         continue;
       }
       // Another guest thread can close a socket while select waits.
-      const auto handle = this->sockets[i]->native_handle();
-      if (handle != static_cast<uint64_t>(-1)) {
-        FD_SET(handle, native_set);
-        max_handle = std::max(max_handle, static_cast<int>(handle));
-        ++stored;
+      const auto handle = socket->native_handle();
+      if (!InHostSet(handle)) {
+        continue;
       }
+      FD_SET(handle, native_set);
+      max_handle = std::max(max_handle, static_cast<int>(handle));
+      ++stored;
     }
     return stored;
   }
 
   bool HasSystemLink() const {
-    return std::any_of(
-        this->sockets, this->sockets + this->count,
-        [](const auto& socket) { return socket->system_link(); });
+    return std::ranges::any_of(
+        sockets, [](const auto& socket) { return socket->system_link(); });
   }
 
   // A System Link socket answers for itself, a stream's failed connect is
@@ -1446,33 +1491,20 @@ struct host_set {
   }
 
   uint32_t CountSystemLinkReady() const {
-    uint32_t ready = 0;
-    for (uint32_t i = 0; i < this->count; ++i) {
-      if (this->sockets[i]->system_link() &&
-          SystemLinkReady(*this->sockets[i])) {
-        ++ready;
-      }
-    }
-    return ready;
+    return uint32_t(std::ranges::count_if(sockets, [&](const auto& socket) {
+      return socket->system_link() && SystemLinkReady(*socket);
+    }));
   }
 
+  // Keeps the ready sockets.
   void UpdateFrom(fd_set* native_set) {
-    uint32_t new_count = 0;
-    for (uint32_t i = 0; i < this->count; ++i) {
-      auto socket = this->sockets[i];
-      bool ready;
+    std::erase_if(sockets, [&](const object_ref<XSocket>& socket) {
       if (socket->system_link()) {
-        ready = SystemLinkReady(*socket);
-      } else {
-        const auto handle = socket->native_handle();
-        ready =
-            handle != static_cast<uint64_t>(-1) && FD_ISSET(handle, native_set);
+        return !SystemLinkReady(*socket);
       }
-      if (ready) {
-        this->sockets[new_count++] = socket;
-      }
-    }
-    this->count = new_count;
+      const auto handle = socket->native_handle();
+      return !InHostSet(handle) || !FD_ISSET(handle, native_set);
+    });
   }
 };
 
@@ -1496,7 +1528,8 @@ int_result_t NetDll_select_entry(dword_t caller, dword_t nfds,
     XThread::SetLastError(uint32_t(X_WSAError::X_WSAENOTSOCK));
     return -1;
   }
-  if (!host_readfds.count && !host_writefds.count && !host_exceptfds.count) {
+  if (host_readfds.sockets.empty() && host_writefds.sockets.empty() &&
+      host_exceptfds.sockets.empty()) {
     XThread::SetLastError(uint32_t(X_WSAError::X_WSAEINVAL));
     return -1;
   }
@@ -1506,8 +1539,7 @@ int_result_t NetDll_select_entry(dword_t caller, dword_t nfds,
   std::vector<object_ref<XSocket>> connects;
   bool failed_connect = false;
   for (const host_set* set : {&host_readfds, &host_writefds, &host_exceptfds}) {
-    for (uint32_t i = 0; i < set->count; ++i) {
-      const auto& socket = set->sockets[i];
+    for (const auto& socket : set->sockets) {
       if (socket->system_link() ||
           (!socket->connecting() && !socket->connect_failed()) ||
           std::any_of(connects.begin(), connects.end(), [&](const auto& known) {
@@ -1533,7 +1565,7 @@ int_result_t NetDll_select_entry(dword_t caller, dword_t nfds,
                    host_exceptfds.Store(&native_exceptfds, max_handle);
     for (const auto& socket : connects) {
       const auto handle = socket->native_handle();
-      if (socket->connecting() && handle != static_cast<uint64_t>(-1)) {
+      if (socket->connecting() && InHostSet(handle)) {
         FD_SET(handle, &native_exceptfds);
         max_handle = std::max(max_handle, static_cast<int>(handle));
       }
@@ -1606,7 +1638,7 @@ int_result_t NetDll_select_entry(dword_t caller, dword_t nfds,
   if (ret >= 0) {
     for (const auto& socket : connects) {
       const auto handle = socket->native_handle();
-      if (handle == static_cast<uint64_t>(-1)) {
+      if (!InHostSet(handle)) {
         continue;
       }
       if (socket->connecting() && (FD_ISSET(handle, &native_readfds) ||
@@ -1635,11 +1667,12 @@ int_result_t NetDll_select_entry(dword_t caller, dword_t nfds,
   }
 
   // The host's count includes connects watched in sets the guest didn't ask
-  // for.
+  // for. The console counts every ready entry, repeats and ones past 64
+  // included.
   if (ret >= 0) {
-    ret = int((readfds ? host_readfds.count : 0) +
-              (writefds ? host_writefds.count : 0) +
-              (exceptfds ? host_exceptfds.count : 0));
+    ret = int((readfds ? host_readfds.sockets.size() : 0) +
+              (writefds ? host_writefds.sockets.size() : 0) +
+              (exceptfds ? host_exceptfds.sockets.size() : 0));
   }
   return ret;
 }
@@ -1738,8 +1771,14 @@ dword_result_t NetDll_sendto_entry(dword_t caller, dword_t socket_handle,
     return -1;
   }
 
-  N_XSOCKADDR_IN native_to(to_ptr);
-  int ret = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  // A NULL destination sends to the connected peer.
+  N_XSOCKADDR_IN native_to;
+  N_XSOCKADDR_IN* to = nullptr;
+  if (to_ptr) {
+    native_to = *to_ptr;
+    to = &native_to;
+  }
+  int ret = socket->SendTo(buf_ptr, buf_len, flags, to, to_len);
   if (ret == -1) {
     XThread::SetLastError(socket->GetLastWSAError());
   }
@@ -1777,14 +1816,9 @@ DECLARE_XAM_EXPORT1(NetDll_WSAEventSelect, kNetworking, kImplemented);
 
 dword_result_t NetDll___WSAFDIsSet_entry(dword_t socket_handle,
                                          pointer_t<x_fd_set> fd_set) {
-  const uint8_t max_fd_count =
-      std::min((uint32_t)fd_set->fd_count, uint32_t(64));
-  for (uint8_t i = 0; i < max_fd_count; i++) {
-    if (fd_set->fd_array[i] == socket_handle) {
-      return 1;
-    }
-  }
-  return 0;
+  const auto* handles = fd_set->fd_array();
+  return std::find(handles, handles + fd_set->count(), socket_handle.value()) !=
+         handles + fd_set->count();
 }
 DECLARE_XAM_EXPORT1(NetDll___WSAFDIsSet, kNetworking, kImplemented);
 

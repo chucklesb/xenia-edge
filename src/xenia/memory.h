@@ -40,6 +40,10 @@ enum SystemHeapFlag : uint32_t {
   kSystemHeapDefault = kSystemHeapVirtual,
 };
 
+// The console's system partition is the first 32 MB of physical memory, the
+// title's is the rest.
+constexpr uint32_t kSystemPhysicalMemoryEnd = 0x02000000;
+
 enum class HeapType : uint8_t {
   kGuestVirtual,
   kGuestXex,
@@ -144,6 +148,10 @@ class BaseHeap {
 
   // Sum of unreserved pages in heap
   uint32_t unreserved_page_count() const { return unreserved_page_count_; }
+
+  // Unreserved pages between the pages holding the two addresses, inclusive.
+  uint32_t UnreservedPageCountInRange(uint32_t low_address,
+                                      uint32_t high_address) const;
 
   // Sum of reserved pages in heap
   uint32_t reserved_page_count() const {

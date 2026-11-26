@@ -341,10 +341,14 @@ dword_result_t XamGetCachedTitleName_entry(dword_t title_id,
   std::u16string title_name = xe::to_utf16(
       kernel_state()->emulator()->game_info_database()->GetTitleName());
 
-  xe::string_util::copy_and_swap_truncating(title_name_ptr, title_name,
-                                            title_name.size() + 1);
-
-  *title_name_length_ptr = title_name.size() + 1;
+  // The cache keeps 22 characters, and a longer name or a smaller buffer is
+  // cut short without an error.
+  constexpr uint32_t kCachedTitleNameCount = 23;
+  const uint32_t buffer_count =
+      std::min<uint32_t>(*title_name_length_ptr, kCachedTitleNameCount);
+  const size_t copied = xe::string_util::copy_and_swap_truncating(
+      title_name_ptr, title_name, buffer_count);
+  *title_name_length_ptr = static_cast<uint32_t>(copied + 1);
 
   return X_ERROR_SUCCESS;
 }
@@ -620,12 +624,8 @@ static void StartTitle(XamModule::LoaderData& loader_data,
       "launch_path={}",
       xe::strip_pii(xe::path_to_utf8(host_path)), package_path, launch_path);
 
-  // Handle title launch in-process via full Shutdown/Setup cycle. Disabled
-  // on macOS — pthread_cancel there doesn't run C++ destructors, so
-  // force-terminated guest threads leak locks and deadlock teardown; spawn a
-  // fresh process instead.
-#if !XE_PLATFORM_MAC
-  if (cvars::in_process_title_relaunch) {
+  // Handle title launch in-process via full Shutdown/Setup cycle.
+  if (Emulator::CanRelaunchInProcess()) {
     auto emulator = kernel_state()->emulator();
 
     XELOGI("XamLoaderLaunchTitle: in-process relaunch to '{}'",
@@ -655,7 +655,6 @@ static void StartTitle(XamModule::LoaderData& loader_data,
       GuestScheduler::SpinYield(std::chrono::seconds(1));
     }
   }
-#endif  // !XE_PLATFORM_MAC
 
   const std::string launch_data_hex =
       HexBytes(loader_data.launch_data, loader_data.launch_data.size());
@@ -1600,21 +1599,32 @@ DECLARE_XAM_EXPORT1(XamSetDvrStorage, kNone, kStub);
 // The guest address of a string in xam's common string table, or 0.
 static uint32_t LookupCommonString(uint32_t string_index) {
   static std::mutex lock;
-  std::lock_guard<std::mutex> guard(lock);
   auto& table = kernel_state()->xam_state()->common_string_table_;
+  std::unique_lock<std::mutex> guard(lock);
   if (!table) {
+    // The load can wait on the loader lock, which a guest thread mustn't do
+    // holding a host mutex. A caller that loses the race drops its reference.
+    guard.unlock();
     // They're in the xam section of the system UI skin.
     constexpr std::string_view kSkinPath = "\\SystemRoot\\huduiskin.xex";
     uint32_t loaded = 0;
     object_ref<XModule> skin;
-    if (xboxkrnl::xeXexLoadImage(kSkinPath)) {
+    const uint32_t hmodule = xboxkrnl::xeXexLoadImage(kSkinPath);
+    if (hmodule) {
       skin = kernel_state()->GetModule(kSkinPath, true);
     }
     if (!skin ||
         XFAILED(LoadXuiStringTable(*skin, "xam", "xamstrings.xus", &loaded))) {
       XELOGW("LookupCommonString: no xam string table to read");
     }
-    table = loaded;
+    guard.lock();
+    if (!table) {
+      table = loaded;
+    } else if (hmodule) {
+      guard.unlock();
+      xboxkrnl::xeXexUnloadImage(hmodule);
+      guard.lock();
+    }
   }
   return *table ? LookupXuiStringTable(*table, string_index) : 0;
 }
