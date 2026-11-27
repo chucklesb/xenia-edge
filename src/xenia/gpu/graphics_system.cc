@@ -11,7 +11,6 @@
 
 #include <charconv>
 
-#include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -206,59 +205,59 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
               // Read guest_display_refresh_cap cvar each frame to allow
               // runtime changes
               // true: Fire vblanks at fixed rate (50Hz PAL, 60Hz NTSC)
-              // false: Fire vblanks limited by framerate_limit or 1ms
+              // false: Fire vblanks every millisecond
               // Note: framerate_limit is handled separately at IssueSwap for
               // host presentation throttling
-              bool refresh_cap_enabled = cvars::guest_display_refresh_cap;
-
-              if (refresh_cap_enabled) {
-                const uint32_t vblank_hz = GetGuestVblankRateHz();
-                const uint64_t tick_freq = Clock::guest_tick_frequency();
-                const uint64_t target_duration_ticks = tick_freq / vblank_hz;
-                const uint64_t current_time = Clock::QueryGuestTickCount();
-                const uint64_t time_delta = current_time - last_frame_time;
-
-                if (time_delta >= target_duration_ticks) {
-                  // If we've fallen behind by more than 2 frames, reset
-                  if (time_delta > target_duration_ticks * 2) {
-                    last_frame_time = current_time;
-                  } else {
-                    last_frame_time += target_duration_ticks;
-                  }
-                  MarkVblank();
-#if XE_PLATFORM_WIN32 || XE_PLATFORM_MAC
-                  // Sleep for 90% of the period, spin for the rest.
-                  const uint64_t sleep_ns = static_cast<uint64_t>(
-                      900000000.0 / (vblank_hz * Clock::guest_time_scalar()));
+              const bool refresh_cap_enabled = cvars::guest_display_refresh_cap;
+              const uint32_t vblank_hz =
+                  refresh_cap_enabled ? GetGuestVblankRateHz() : 1000;
+              const uint64_t tick_freq = Clock::guest_tick_frequency();
+              const uint64_t target_duration_ticks = tick_freq / vblank_hz;
+              const uint64_t current_time = Clock::QueryGuestTickCount();
+              const uint64_t time_delta = current_time - last_frame_time;
 #if XE_PLATFORM_MAC
-                  threading::NanoSleepPrecise(sleep_ns);
+              // A capped period sleeps 90% and spins the rest.
+              const bool spin_to_deadline = refresh_cap_enabled;
 #else
-                  threading::NanoSleep(sleep_ns);
+              const bool spin_to_deadline = false;
 #endif
+#if XE_PLATFORM_WIN32
+              // A capped period spins its last millisecond because a sleep can
+              // end most of a millisecond late. An uncapped period is too
+              // short for that.
+              const int64_t spin_tail_ns = refresh_cap_enabled ? 1000000 : 0;
+#else
+              const int64_t spin_tail_ns = 0;
 #endif
+
+              if (time_delta >= target_duration_ticks) {
+                // If we've fallen behind by more than 2 frames, reset
+                if (time_delta > target_duration_ticks * 2) {
+                  last_frame_time = current_time;
+                } else {
+                  last_frame_time += target_duration_ticks;
                 }
-#if XE_PLATFORM_LINUX
-                else {
-                  // Sleep to the deadline, so a late wake-up shortens the
-                  // next sleep instead of stretching the period.
-                  threading::NanoSleep(static_cast<int64_t>(
-                      (target_duration_ticks - time_delta) * 1000000000.0 /
-                      (tick_freq * Clock::guest_time_scalar())));
-                }
-#endif
-              } else {
-                // Unlimited mode (guest_display_refresh_cap=false) - fire
-                // vblanks as fast as possible Host presentation is separately
-                // throttled by framerate_limit
                 MarkVblank();
-                threading::Sleep(std::chrono::milliseconds(1));
+                if (spin_to_deadline) {
+                  threading::NanoSleepPrecise(static_cast<int64_t>(
+                      900000000.0 / (vblank_hz * Clock::guest_time_scalar())));
+                }
+              } else if (!spin_to_deadline) {
+                // Sleep toward the deadline, so a late wake-up shortens the
+                // next sleep instead of stretching the period.
+                const int64_t sleep_ns =
+                    static_cast<int64_t>(
+                        (target_duration_ticks - time_delta) * 1000000000.0 /
+                        (tick_freq * Clock::guest_time_scalar())) -
+                    spin_tail_ns;
+                if (sleep_ns > 0) {
+                  threading::NanoSleep(sleep_ns);
+                }
               }
             }
             return 0;
           },
           kernel_state->GetIdleProcess()));
-  // As we run vblank interrupts the debugger must be able to suspend us.
-  frame_limiter_worker_thread_->set_can_debugger_suspend(true);
   frame_limiter_worker_thread_->set_name("GPU Frame limiter");
   frame_limiter_worker_thread_->Create();
   // Linux only sleeps, so kLowest (nice 15) would just add wake-up latency.
@@ -515,29 +514,19 @@ void GraphicsSystem::InitializeShaderStorage(
     return;
   }
   if (blocking) {
-    if (command_processor_->is_paused()) {
-      // Safe to run on any thread while the command processor is paused, no
-      // race condition.
-      if (started_callback) {
-        started_callback();
-      }
-      command_processor_->InitializeShaderStorage(
-          cache_root, title_id, true, std::move(completion_callback));
-    } else {
-      xe::threading::Fence fence;
-      command_processor_->CallInThread(
-          [this, cache_root, title_id, &fence,
-           started_callback = std::move(started_callback),
-           completion_callback = std::move(completion_callback)]() mutable {
-            if (started_callback) {
-              started_callback();
-            }
-            command_processor_->InitializeShaderStorage(
-                cache_root, title_id, true, std::move(completion_callback));
-            fence.Signal();
-          });
-      fence.Wait();
-    }
+    xe::threading::Fence fence;
+    command_processor_->CallInThread(
+        [this, cache_root, title_id, &fence,
+         started_callback = std::move(started_callback),
+         completion_callback = std::move(completion_callback)]() mutable {
+          if (started_callback) {
+            started_callback();
+          }
+          command_processor_->InitializeShaderStorage(
+              cache_root, title_id, true, std::move(completion_callback));
+          fence.Signal();
+        });
+    fence.Wait();
   } else {
     command_processor_->CallInThread(
         [this, cache_root, title_id,
@@ -576,32 +565,6 @@ void GraphicsSystem::RequestEndTracing() {
 
 bool GraphicsSystem::is_tracing_stream() const {
   return command_processor_->is_tracing_stream();
-}
-
-void GraphicsSystem::Pause() {
-  paused_ = true;
-
-  command_processor_->Pause();
-}
-
-void GraphicsSystem::Resume() {
-  paused_ = false;
-
-  command_processor_->Resume();
-}
-
-bool GraphicsSystem::Save(ByteStream* stream) {
-  stream->Write<uint32_t>(interrupt_callback_);
-  stream->Write<uint32_t>(interrupt_callback_data_);
-
-  return command_processor_->Save(stream);
-}
-
-bool GraphicsSystem::Restore(ByteStream* stream) {
-  interrupt_callback_ = stream->Read<uint32_t>();
-  interrupt_callback_data_ = stream->Read<uint32_t>();
-
-  return command_processor_->Restore(stream);
 }
 
 std::pair<uint16_t, uint16_t> GraphicsSystem::GetInternalDisplayResolution() {

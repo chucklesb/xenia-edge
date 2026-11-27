@@ -287,30 +287,12 @@ dword_result_t NtSuspendThread_entry(dword_t handle,
     if (thread->type() == XObject::Type::Thread) {
       auto current_pcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
 
-#if XE_PLATFORM_WIN32
       if (current_pcr->prcb_data.current_thread == thread->guest_object() ||
           !thread->guest_object<X_KTHREAD>()->terminated) {
         result = thread->Suspend(&suspend_count);
       } else {
         return X_STATUS_THREAD_IS_TERMINATING;
       }
-#else
-      // Handle self-suspension specially to avoid deadlock.
-      if (!thread->guest_object<X_KTHREAD>()->terminated) {
-        bool is_self_suspend =
-            (current_pcr->prcb_data.current_thread == thread->guest_object());
-
-        if (is_self_suspend) {
-          XELOGD("Thread {:X} self-suspending", thread->handle());
-          result = thread->SelfSuspend(&suspend_count);
-          XELOGD("Thread {:X} resumed", thread->handle());
-        } else {
-          result = thread->Suspend(&suspend_count);
-        }
-      } else {
-        return X_STATUS_THREAD_IS_TERMINATING;
-      }
-#endif
     } else {
       return X_STATUS_OBJECT_TYPE_MISMATCH;
     }
@@ -522,7 +504,7 @@ DECLARE_XBOXKRNL_EXPORT3(KeDelayExecutionThread, kThreading, kImplemented,
 dword_result_t NtYieldExecution_entry() {
   SCOPE_profile_cpu_i("guestsync", "NtYieldExecution");
   xeProcessKernelApcs(nullptr);
-  if (GuestScheduler::enabled() && XThread::GetCurrentFiberThread()) {
+  if (XThread::GetCurrentFiberThread()) {
     // NT reports whether anything else ran. Guests fall back to an alertable
     // sleep on no-yield, which is where their pending APCs get pumped.
     if (!kernel_state()->guest_scheduler()->YieldExecution(true)) {
@@ -1239,11 +1221,10 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
   // Lock.
   while (
       !xe::atomic_cas(0, xe::byte_swap(our_pcr), &lock->prcb_of_owner.value)) {
-    // Under the cooperative scheduler the holder may be a fiber queued behind
-    // us on this dispatch thread, so it can only run if we yield the fiber. A
-    // holder on another dispatch thread runs there. Like the console at
-    // DISPATCH_LEVEL, this spins until it releases and yields only the host
-    // thread.
+    // The holder may be a fiber queued behind us on this dispatch thread, so
+    // it can only run if we yield the fiber. A holder on another dispatch
+    // thread runs there. Like the console at DISPATCH_LEVEL, this spins until
+    // it releases and yields only the host thread.
     if (XThread::GetCurrentFiberThread()) {
       uint32_t owner_pcr_be = lock->prcb_of_owner.value;
       if (!owner_pcr_be) {
@@ -1269,26 +1250,7 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
       GuestScheduler::SpinYield();
       continue;
     }
-    // On real hardware, threads sharing a Xenon HW thread are serialized by
-    // the kernel scheduler — the spinner would be preempted within one
-    // timeslice (~1ms) so the holder can make progress.  In the naive
-    // host-thread model both threads run truly in parallel, so the spinner
-    // can burn its entire host quantum without giving the holder a chance.
-    //
-    // Check whether the lock holder is assigned to the same guest CPU as us.
-    // If so, yield the host thread aggressively (Sleep(0)) to force a host
-    // context switch and give the holder a chance to run and release.
-    // The relationship is stable — affinity doesn't change while a thread
-    // holds a spinlock — so one check per contention episode is sufficient.
-    uint32_t owner_pcr_be = lock->prcb_of_owner.value;
-    if (owner_pcr_be) {
-      uint32_t owner_pcr = xe::byte_swap(owner_pcr_be);
-      auto* owner_kpcr = ctx->TranslateVirtual<X_KPCR*>(owner_pcr);
-      if (owner_kpcr->prcb_data.current_cpu == our_cpu) {
-        xe::threading::Sleep(std::chrono::milliseconds(0));
-        continue;
-      }
-    }
+    // A host-routine thread never shares its host thread with the holder.
     xe::threading::MaybeYield();
   }
 
@@ -1468,14 +1430,9 @@ uint32_t xeInsertQueueApcAndWake(XThread* thread, XAPC* apc, uint32_t arg1,
   if (!xeKeInsertQueueApc(apc, arg1, arg2, 0, context)) {
     return 0;
   }
-  // Awaken a sleeping alertable thread to process real apcs. A host thread gets
-  // a no-op user callback to break its wait, a fiber gets a scheduler poke so
-  // its alertable poll re-runs.
-  if (thread->thread()) {
-    thread->thread()->QueueUserCallback([]() {});
-  } else {
-    context->kernel_state->guest_scheduler()->WakeAll();
-  }
+  // Pokes the scheduler so an alertable fiber's poll re-runs. A host-routine
+  // thread takes the APC at its next wait.
+  context->kernel_state->guest_scheduler()->WakeAll();
   return 1;
 }
 dword_result_t NtQueueApcThread_entry(dword_t thread_handle,
@@ -1887,8 +1844,7 @@ dword_result_t KeInsertQueueDpc_entry(pointer_t<XDPC> dpc, dword_t arg1,
   // stand in for it.
   auto thread = XThread::GetCurrentThread();
   const uint8_t desired_cpu = dpc->desired_cpu_number;
-  if (dpc->routine && thread && desired_cpu && desired_cpu <= 6 &&
-      GuestScheduler::enabled()) {
+  if (dpc->routine && thread && desired_cpu && desired_cpu <= 6) {
     auto ppc_context = thread->thread_state()->context();
     auto kpcr = ppc_context->TranslateVirtualGPR<X_KPCR*>(ppc_context->r[13]);
     if (desired_cpu - 1 != kpcr->prcb_data.current_cpu ||

@@ -15,7 +15,6 @@
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/stb/stb_image_write.h"
-#include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
@@ -559,7 +558,7 @@ void CommandProcessor::WorkerThreadMain() {
         // If we spin around too much, revert to a "low-power" state.
         if (loop_count > 500) {
           constexpr int wait_time_ms = 2;
-          xe::threading::Wait(write_ptr_index_event_.get(), true,
+          xe::threading::Wait(write_ptr_index_event_.get(),
                               std::chrono::milliseconds(wait_time_ms));
           // Strict ZPD may still owe the guest a report it's spinning on with
           // nothing left in the ring.
@@ -604,56 +603,6 @@ void CommandProcessor::WorkerThreadMain() {
   // The guest they are for is going away.
   held_guest_signals_.clear();
   ShutdownContext();
-}
-
-void CommandProcessor::Pause() {
-  if (paused_) {
-    return;
-  }
-  paused_ = true;
-
-  threading::Fence fence;
-  CallInThread([&fence]() {
-    fence.Signal();
-    threading::Thread::GetCurrentThread()->Suspend();
-  });
-
-  fence.Wait();
-}
-
-void CommandProcessor::Resume() {
-  if (!paused_) {
-    return;
-  }
-  paused_ = false;
-
-  worker_thread_->thread()->Resume();
-}
-
-bool CommandProcessor::Save(ByteStream* stream) {
-  assert_true(paused_);
-
-  stream->Write<uint32_t>(primary_buffer_ptr_);
-  stream->Write<uint32_t>(primary_buffer_size_);
-  stream->Write<uint32_t>(read_ptr_index_);
-  stream->Write<uint32_t>(read_ptr_update_freq_);
-  stream->Write<uint32_t>(read_ptr_writeback_ptr_);
-  stream->Write<uint32_t>(write_ptr_index_.load());
-
-  return true;
-}
-
-bool CommandProcessor::Restore(ByteStream* stream) {
-  assert_true(paused_);
-
-  primary_buffer_ptr_ = stream->Read<uint32_t>();
-  primary_buffer_size_ = stream->Read<uint32_t>();
-  read_ptr_index_ = stream->Read<uint32_t>();
-  read_ptr_update_freq_ = stream->Read<uint32_t>();
-  read_ptr_writeback_ptr_ = stream->Read<uint32_t>();
-  write_ptr_index_.store(stream->Read<uint32_t>());
-
-  return true;
 }
 
 bool CommandProcessor::SetupContext() {
