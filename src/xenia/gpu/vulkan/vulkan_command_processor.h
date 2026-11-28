@@ -181,6 +181,12 @@ class VulkanCommandProcessor final : public CommandProcessor {
     assert_true(submission_open_);
     return deferred_command_buffer_;
   }
+  // Returns the command list executed ahead of deferred_command_buffer() in the
+  // currently open submission, outside any render pass.
+  DeferredCommandBuffer& early_upload_command_buffer() {
+    assert_true(submission_open_);
+    return early_upload_command_buffer_;
+  }
 
   bool submission_open() const { return submission_open_; }
   uint64_t GetCurrentSubmission() const {
@@ -315,9 +321,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
   std::string MakeTitleStateSuffix() const override;
   XE_FORCEINLINE
   void WriteRegister(uint32_t index, uint32_t value) override;
-  XE_FORCEINLINE
-  virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
-                                     uint32_t num_registers) override;
+
+#include "../register_write_command_processor_declare.h"
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
@@ -743,6 +748,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
+  DeferredCommandBuffer early_upload_command_buffer_;
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;
